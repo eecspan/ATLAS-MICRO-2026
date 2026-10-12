@@ -1,0 +1,31 @@
+architecture:
+  core:
+    buffer:
+      area: 1.3
+      buffer_size: 128
+      power: 1.3
+      read_bw: 1024
+      write_bw: 1024
+    controller:
+      area: 1.0
+      power: 1.0
+    matrix:
+      area: 1.1
+      mac_num: 8192
+      power: 1.1
+    vector:
+      area: 1.2
+      power: 1.2
+      vec_num: 512
+  core_num: 16
+  dram:
+    area: 1.4
+    config_path: configs/architecture/chip/near_mem/balanced/dram.yaml
+    power: 1.4
+  frequency: 1000
+  noc:
+    area: 1.5
+    config_path: configs/architecture/chip/near_mem/balanced/mesh
+    flit_size: 256
+    power: 1.5
+    topology: mesh

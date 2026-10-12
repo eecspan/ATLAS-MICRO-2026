@@ -1,0 +1,25 @@
+Frontend:
+  clock_ratio: 1
+  impl: HBFrontend
+MemorySystem:
+  AddrMapper:
+    channel_lowest_bit: 0
+    impl: OneLevelInterleave
+  Controller:
+    RefreshManager:
+      impl: AllBank
+    RowPolicy:
+      impl: OpenRowPolicy
+    Scheduler:
+      impl: FRFCFS
+    impl: Generic
+    plugins: null
+  DRAM:
+    impl: HBDRAM
+    org:
+      channel: 1
+      preset: HBDRAM_4Gb_1024pin
+    timing:
+      preset: HBDRAM_500Mbps
+  clock_ratio: 1
+  impl: GenericDRAM
