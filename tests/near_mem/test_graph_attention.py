@@ -116,7 +116,7 @@ def test_fused_attention_mac_coverage_bounds_and_no_history_write(chip,tmp_path,
     graph = Graph(chip); p = Attention(2,queries,context,4,2,8)
     layout = KVLayout(p,4); cache = layout.allocate(graph)
     graph.tensor(0,'Q',[p.batch*queries,p.hidden]); q = [Region(0,'Q',0,0,p.batch*queries,p.hidden)]
-    plan = AttentionPlan(query_parts,1)
+    plan = AttentionPlan(query_parts,1,1)
     out = compile_attention(graph,layout,plan,q,cache)
     info = graph.operations[-1]['metadata']
     scores = p.batch*p.query_heads*sum(range(context-queries+1,context+1))
@@ -147,7 +147,7 @@ def test_native_and_full_space_transformer_graphs_execute(chip,tmp_path,queries,
     workload = Workload(1,queries,context,2,1,16,64,layers)
     native = {name:Gemm(p,Plan((1,2,2),(min(4,queries),8,min(16,p.k//2))),True,int(name=='expand'),name=='expand')
               for name,p in workload.problems.items()}
-    baseline = configuration(native,AttentionPlan(1,1))
+    baseline = configuration(native,AttentionPlan(1,1,1))
     configs = [baseline]
     if queries % 4 == 0:
         extended = deepcopy(baseline)

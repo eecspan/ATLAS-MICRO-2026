@@ -146,19 +146,29 @@ class KVLayout:
 
 @dataclass(frozen=True)
 class AttentionPlan:
+    """``query_parts × context_parts`` spatial split of one head's fused
+    attention inside its core group. ``query_parts`` rotates a shared KV
+    tile across query groups; ``context_parts`` splits the context into
+    per-core flash-attention segments that merge softmax state + PV
+    partials once (a context split-K reduction)."""
     query_parts: int = 1
+    context_parts: int = 1
     query_tile: int = 1
 
     def sram_bytes(self, problem):
-        r = min(self.query_tile, ceil(problem.queries/self.query_parts))*problem.group
+        qrows = min(self.query_tile, ceil(problem.queries/self.query_parts))*problem.group
         d = problem.head_dim
-        return 14*r*d + 16*r
+        # Q + online-softmax state + one streamed KV tile per context stage.
+        kvrows = ceil(problem.context/(self.query_parts*self.context_parts))
+        return 14*qrows*d + 16*qrows + 2*kvrows*d
 
     def validate(self, layout, sram):
-        if min(self.query_parts, self.query_tile) < 1:
+        if min(self.query_parts, self.context_parts, self.query_tile) < 1:
             raise ValueError('Attention tile/partition sizes must be positive')
-        if self.query_parts > layout.problem.queries or layout.group_cores % self.query_parts:
-            raise ValueError('Query partition must divide the per-head core count and query length')
+        if self.query_parts*self.context_parts > layout.group_cores:
+            raise ValueError('query_parts*context_parts must fit inside the per-head core group')
+        if self.query_parts > layout.problem.queries:
+            raise ValueError('Query partition must not exceed the query length')
         if self.sram_bytes(layout.problem) > sram:
             raise ValueError('Fused attention live SRAM exceeds capacity')
 
@@ -168,12 +178,13 @@ def plans(layout, sram, rotation=True):
     for pq in divisors(layout.group_cores) if rotation else (1,):
         if pq > p.queries:
             continue
-        local = ceil(p.queries/pq)
-        tiles = sorted({min(local, x) for x in (1, 4, 8, 16, 32, 64, 128)})
-        for tq in tiles:
-            plan = AttentionPlan(pq, tq)
-            if plan.sram_bytes(p) <= sram:
-                yield plan
+        for pc in divisors(layout.group_cores//pq):
+            local = ceil(p.queries/pq)
+            tiles = sorted({min(local, x) for x in (1, 4, 8, 16, 32, 64, 128)})
+            for tq in tiles:
+                plan = AttentionPlan(pq, pc, tq)
+                if plan.sram_bytes(p) <= sram:
+                    yield plan
 
 
 def compile_attention(graph, layout, plan, query, cache, name='attention'):
@@ -186,103 +197,155 @@ def compile_attention(graph, layout, plan, query, cache, name='attention'):
     p = layout.problem
     plan.validate(layout, graph.sram)
     pq = plan.query_parts
+    pc = plan.context_parts
     g = p.group
     d = p.head_dim
     groups = ceil(p.queries/pq)
 
-    # Distribute query rows inside each head's core group: ``pq`` contiguous
-    # query chunks of one (request, head) are spread across the head's
-    # ``group_cores`` so heads run as independent parallel operators.
+    # Distribute query rows across the head group's ``pq*pc`` cores: the
+    # ``pq`` query chunks of one (request, head) are replicated on ``pc``
+    # context-segment cores, each of which keeps a local flash-attention
+    # output before the split-K merge.
     inputs = []
     outputs = []
+    partials = {}
     query_views = {}
     for head in range(p.kv_heads):
         hstart, _ = layout.head_group(head)
         for request in range(p.batch):
             for s in range(pq):
-                core = hstart + (request*pq+s) % layout.group_cores
                 rows = min(groups, p.queries-s*groups)
                 if rows <= 0:
                     continue
-                qname = f'{name}_q_h{head}_b{request}_s{s}'
-                expected = Region(core, qname, request*p.queries+s*groups,
-                                  head*g*d, rows, g*d)
-                local = next((x for r in query if r.core == core and
-                              (x := r.intersect(expected)) is not None
-                              and x.area == expected.area), None)
-                if local is None:
-                    graph.tensor(core, qname, [expected.rows, g*d])
-                    local = expected
-                inputs.append(local)
-                query_views[head, request, s] = local
-                oname = f'{name}_o_h{head}_b{request}_s{s}'
-                graph.tensor(core, oname, [expected.rows, g*d])
-                outputs.append(Region(core, oname, expected.row, head*g*d,
-                                      expected.rows, g*d))
+                for c in range(pc):
+                    core = hstart + ((request*pq+s)*pc + c) % layout.group_cores
+                    qname = f'{name}_q_h{head}_b{request}_s{s}_c{c}'
+                    expected = Region(core, qname, request*p.queries+s*groups,
+                                      head*g*d, rows, g*d)
+                    local = next((x for r in query if r.core == core and
+                                  (x := r.intersect(expected)) is not None
+                                  and x.area == expected.area), None)
+                    if local is None:
+                        graph.tensor(core, qname, [rows, g*d])
+                        local = expected
+                    inputs.append(local)
+                    query_views[head, request, s, c] = local
+                    pname = f'{name}_p_h{head}_b{request}_s{s}_c{c}'
+                    if c == pc-1:
+                        # Last context segment also becomes the merged output.
+                        oname = f'{name}_o_h{head}_b{request}_s{s}'
+                        graph.tensor(core, oname, [rows, g*d])
+                        outputs.append(Region(core, oname, expected.row, head*g*d,
+                                              rows, g*d))
+                    else:
+                        graph.tensor(core, pname, [rows, g*d])
+                    partials[head, request, s, c] = Region(
+                        core, oname if c == pc-1 else pname,
+                        expected.row, head*g*d, rows, g*d)
     graph.convert(name+'_query_layout', query, inputs)
 
-    timeline = graph.timeline()
-    t = 0
+    # Per-core pipelines. Within one (request, head) task, the ``pc`` context
+    # segments are a spatial split over the group's cores; each segment
+    # streams only its own KV shard and computes a local flash-attention.
+    # A KV tile owned by one segment core is rotated once to the other
+    # ``pq-1`` query-group cores of the same segment before advancing.
+    times = [0]*graph.cores
     coverage = 0
     tiles = 0
+    timeline = graph.timeline()
     for head in range(p.kv_heads):
+        hstart, _ = layout.head_group(head)
+        seg = ceil(p.context/pc)
         for request in range(p.batch):
-            kv_regions = sorted(
-                (r for r in cache if head*2*d <= r.col < (head+1)*2*d
-                 and request*p.context <= r.row < (request+1)*p.context),
-                key=lambda r: (r.core, r.row))
-            for region in kv_regions:
-                timeline.memory(t, region)
-                # The owner keeps its streamed tile; other group owners pull
-                # it through the NoC in the same wave.
-                hstart, _ = layout.head_group(head)
-                owners = {hstart + (request*pq+s) % layout.group_cores for s in range(pq)
-                          if (head, request, s) in query_views}
-                for core in owners - {region.core}:
-                    timeline.send(t+1, core, region.core, 1, credit=True)
-                    timeline.send(t+1, region.core, core, region.area*2)
-                for s in range(pq):
-                    if (head, request, s) not in query_views:
-                        continue
-                    core = hstart + (request*pq+s) % layout.group_cores
-                    q = query_views[head, request, s]
-                    for first in range(0, q.rows, plan.query_tile):
-                        count = min(plan.query_tile, q.rows-first)
-                        global_first = q.row+first-request*p.queries
-                        end = p.context-p.queries+global_first+count if p.causal else p.context
-                        tokens = max(0, min(region.rows, request*p.context+end-region.row))
-                        if not tokens:
+            for c in range(pc):
+                cstart = request*p.context + c*seg
+                cend = min(request*p.context+p.context, cstart+seg)
+                kv_regions = sorted(
+                    (r for r in cache if head*2*d <= r.col < (head+1)*2*d
+                     and cstart <= r.row < cend),
+                    key=lambda r: (r.core, r.row))
+                for region in kv_regions:
+                    # Cores of this segment across the pq query groups.
+                    segcores = [hstart + ((request*pq+s)*pc + c) % layout.group_cores
+                                for s in range(pq) if (head, request, s, c) in query_views]
+                    slot = min(times[x] for x in {region.core, *segcores})
+                    timeline.memory(slot, region)
+                    for s in range(pq):
+                        if (head, request, s, c) not in query_views:
                             continue
-                        rows = count*g
-                        scores = rows*tokens
-                        output = rows*d
-                        timeline.work(core, t+2, macs=output*tokens,
-                                      read=(output+tokens*d)*2, write=scores*4)
-                        timeline.work(core, t+3, vectors=9*scores,
-                                      read=9*scores*4, write=scores*4)
-                        timeline.work(core, t+4, macs=output*tokens,
-                                      read=scores*4+tokens*d*2, write=output*4)
-                        timeline.work(core, t+5, vectors=3*output,
-                                      read=output*8, write=output*4)
-                        coverage += scores
-                        tiles += 1
-                t += 6
+                        core = hstart + ((request*pq+s)*pc + c) % layout.group_cores
+                        if core != region.core:
+                            timeline.send(slot+1, core, region.core, 1, credit=True)
+                            timeline.send(slot+1, region.core, core, region.area*2)
+                        q = query_views[head, request, s, c]
+                        for first in range(0, q.rows, plan.query_tile):
+                            count = min(plan.query_tile, q.rows-first)
+                            global_first = q.row+first-request*p.queries
+                            end = p.context-p.queries+global_first+count if p.causal else p.context
+                            tokens = max(0, min(region.rows,
+                                                request*p.context+end-region.row))
+                            if tokens <= 0:
+                                continue
+                            rows = count*g
+                            scores = rows*tokens
+                            output = rows*d
+                            base = times[core] if core != region.core else slot
+                            timeline.work(core, base+2, macs=output*tokens,
+                                          read=(output+tokens*d)*2, write=scores*4)
+                            timeline.work(core, base+3, vectors=9*scores,
+                                          read=9*scores*4, write=scores*4)
+                            timeline.work(core, base+4, macs=output*tokens,
+                                          read=scores*4+tokens*d*2, write=output*4)
+                            timeline.work(core, base+5, vectors=3*output,
+                                          read=output*8, write=output*4)
+                            coverage += scores
+                            tiles += 1
+                            times[core] = base+6
+                    times[region.core] = max(times[region.core], slot+2)
+            # Split-K merge: each query group's partials from the pc context
+            # segments reduce onto the last segment's core. The merge carries
+            # softmax rescale state plus the PV partial, then finalizes.
+            for s in range(pq):
+                if pc == 1 or (head, request, s, pc-1) not in partials:
+                    continue
+                dst = partials[head, request, s, pc-1]
+                for c in range(pc-1):
+                    if (head, request, s, c) not in partials:
+                        continue
+                    src = partials[head, request, s, c]
+                    size = src.area*4 + src.rows*8  # PV partial + (m,l) state
+                    t = max(times[src.core], times[dst.core])
+                    timeline.send(t, src.core, dst.core, size)
+                    times[src.core] = t+1
+                    times[dst.core] = t+1
+                    timeline.work(dst.core, t+2, vectors=6*src.area+3*src.rows,
+                                  read=size*2, write=size)
+                    times[dst.core] = t+3
+    # Finalize each merged output: normalize by l and write to DRAM.
     for head in range(p.kv_heads):
         hstart, _ = layout.head_group(head)
         for request in range(p.batch):
             for s in range(pq):
-                if (head, request, s) not in query_views:
-                    continue
-                core = hstart + (request*pq+s) % layout.group_cores
-                region = next(r for r in outputs if r.core == core
-                              and r.name == f'{name}_o_h{head}_b{request}_s{s}')
+                if pc == 1:
+                    if (head, request, s, 0) not in partials:
+                        continue
+                    region = partials[head, request, s, 0]
+                    core = region.core
+                else:
+                    if (head, request, s, pc-1) not in partials:
+                        continue
+                    region = partials[head, request, s, pc-1]
+                    core = region.core
+                t = times[core]
                 timeline.work(core, t, vectors=region.area, read=region.area*4,
                               write=region.area*2)
                 timeline.memory(t+1, region, True)
+                times[core] = t+2
     graph.add_timeline(name, timeline, category='attention',
                        sram_bytes=plan.sram_bytes(p),
                        score_elements_issued=coverage, compute_tiles=tiles,
                        score_dram_bytes=0, historical_kv_write_bytes=0,
-                       query_parts=pq, query_tile=plan.query_tile)
+                       query_parts=pq, context_parts=pc,
+                       query_tile=plan.query_tile)
     graph.release(inputs, keep=query)
     return outputs

@@ -126,7 +126,7 @@ def run(workload,chip,out,budget=4,workers=4,tile_min=16,passes=2):
             if family == 'joint':
                 configs = []
                 for plan in attention_plans(layout,arch['core']['buffer']['buffer_size']*1024,True):
-                    if plan.query_parts == 1:
+                    if plan.query_parts == 1 and plan.context_parts == 1:
                         continue
                     cfg = deepcopy(best['configuration']); cfg['attention'] = asdict(plan); configs.append(cfg)
                 rows = exp.measure_many(configs,f'{family}_{sweep}_attention',workers)
@@ -148,6 +148,7 @@ def run(workload,chip,out,budget=4,workers=4,tile_min=16,passes=2):
             rotated.append(name)
             value['plan'] = asdict(replace(plan,a=(1,1),b=(1,1),c=(1,1),group=(1,1,1),layer_order=(),panel=None))
     control_config['attention']['query_parts'] = 1
+    control_config['attention']['context_parts'] = 1
     matched = None
     try:
         matched = exp.measure(control_config,'matched_local')
