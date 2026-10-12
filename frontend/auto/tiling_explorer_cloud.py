@@ -87,6 +87,71 @@ def set_shape(
             operator.M = per_ffn_token_num * per_device_ffn_num
 
 
+def make_gemm_description(operator, element_size, tiling_factor_combination,
+                          input_name, output_name, weight_name):
+    """Build the native MNK kernel, shared by tuning and compiler extensions.
+
+    Buffer accounting, prefetch and writeback iterations follow upstream.
+    Address strides count actual accesses, not compute iterations; this also
+    fixes upstream's C stride for split-K tiles and A stride when nK=1.
+    """
+    tM, tK, tN = tiling_factor_combination
+    nM = math.ceil(operator.M / tM)
+    nK = math.ceil(operator.K / tK)
+    nN = math.ceil(operator.N / tN)
+    from frontend.auto.gemm_schedule import gemm_work
+
+    comp_description = {
+        "operator": [{
+            "name": operator.name,
+            "type": str(SimulatorOperatorType.GEMM),
+            "iteration": nM*nK*nN,
+            "execution": {
+                **gemm_work((tM, tN, tK), element_size),
+                "dram": [
+                    make_dram_task(
+                        name=input_name,
+                        is_write=False,
+                        access_base=[0, 0],
+                        access_extent=[tM, tK],
+                        access_stride_add=[nK * nN if nK > 1 else 1, 1],
+                        access_offset_add=[tM, tK],
+                        init_iter=0,
+                        # In output stationary, when nK=1, all nN tiles in the same nM rows
+                        # can share the same input tile.
+                        stride_iter=1 if nK > 1 else nN,
+                        total_iter=nM * nK * nN if nK > 1 else nM,
+                    ),
+                    make_dram_task(
+                        name=weight_name,
+                        is_write=False,
+                        access_base=[0, 0],
+                        access_extent=[tK, tN],
+                        access_stride_add=[1, nK],
+                        access_offset_add=[tK, tN],
+                        init_iter=0,
+                        # In output stationary, when nK*nN=1, we only need to load the full weight for one time
+                        stride_iter=1,
+                        total_iter=nM * nK * nN if nK * nN > 1 else 1,
+                    ),
+                    make_dram_task(
+                        name=output_name,
+                        is_write=True,
+                        access_base=[0, 0],
+                        access_extent=[tM, tN],
+                        access_stride_add=[nN, 1],
+                        access_offset_add=[tM, tN],
+                        init_iter=nK + 1,
+                        stride_iter=nK,
+                        total_iter=nM * nN,
+                    ),
+                ]
+            }
+        }]
+    }
+    return comp_description["operator"][0]
+
+
 def explore_gemm_comp_worker(
     # Tensor description
     input_placement: Dict[str, Any],
@@ -125,100 +190,9 @@ def explore_gemm_comp_worker(
     opt_latency = float('inf')
     comp_description_path = os.path.join(cur_worker_dir, "comp_description.yaml")
     for tiling_factor_combination in tiling_factor_combination_list:
-        tM, tK, tN = tiling_factor_combination
-        nM = math.ceil(operator.M / tM)
-        nK = math.ceil(operator.K / tK)
-        nN = math.ceil(operator.N / tN)
-        mac_count = tM*tN*tK
-        mac_buffer_load_count = element_size * (tM*tK + tK*tN)
-        mac_buffer_store_count = element_size * (tM*tN)
-        vec_count = tM*tN
-        vec_buffer_load_count = element_size * (tM*tN)
-        vec_buffer_store_count = element_size * (tM*tN)
-
-        comp_description = {
-            "operator": [{
-                "name": operator.name,
-                "type": str(SimulatorOperatorType.GEMM),
-                "iteration": nM*nK*nN,
-                "execution": {
-                    "matrix": [
-                        {
-                            "name": "gemm_tile",
-                            "mac_count": mac_count,
-                        }
-                    ],
-                    "vector": [
-                        {
-                            "name": "gemm_tile_accumulation",
-                            "vec_count": vec_count,
-                        }
-                    ],
-                    "buffer_load": [
-                        {
-                            "name": "gemm_tile_load",
-                            "byte_count": mac_buffer_load_count,
-                            "is_write": False,
-                        },
-                        {
-                            "name": "gemm_tile_accumulation_load",
-                            "byte_count": vec_buffer_load_count,
-                            "is_write": False,
-                        }
-                    ],
-                    "buffer_store": [
-                        {
-                            "name": "gemm_tile_store",
-                            "byte_count": mac_buffer_store_count,
-                            "is_write": True,
-                        },
-                        {
-                            "name": "gemm_tile_accumulation_store",
-                            "byte_count": vec_buffer_store_count,
-                            "is_write": True,
-                        }
-                    ],
-                    "dram": [
-                        make_dram_task(
-                            name=input_name,
-                            is_write=False,
-                            access_base=[0, 0],
-                            access_extent=[tM, tK],
-                            access_stride_add=[nK * nN, 1],
-                            access_offset_add=[tM, tK],
-                            init_iter=0,
-                            # In output stationary, when nK=1, all nN tiles in the same nM rows
-                            # can share the same input tile.
-                            stride_iter=1 if nK > 1 else nN,
-                            total_iter=nM * nK * nN if nK > 1 else nM,
-                        ),
-                        make_dram_task(
-                            name=weight_name,
-                            is_write=False,
-                            access_base=[0, 0],
-                            access_extent=[tK, tN],
-                            access_stride_add=[1, nK],
-                            access_offset_add=[tK, tN],
-                            init_iter=0,
-                            # In output stationary, when nK*nN=1, we only need to load the full weight for one time
-                            stride_iter=1,
-                            total_iter=nM * nK * nN if nK * nN > 1 else 1,
-                        ),
-                        make_dram_task(
-                            name=output_name,
-                            is_write=True,
-                            access_base=[0, 0],
-                            access_extent=[tM, tN],
-                            access_stride_add=[nK * nN, nK],
-                            access_offset_add=[tM, tN],
-                            init_iter=nK + 1,
-                            stride_iter=nK,
-                            total_iter=nM * nN,
-                        ),
-                    ]
-                }
-            }]
-        }
+        comp_description = {"operator": [make_gemm_description(
+            operator, element_size, tiling_factor_combination,
+            input_name, output_name, weight_name)]}
         with open(comp_description_path, "w") as f:
             yaml.dump(comp_description, f)
         
@@ -235,7 +209,7 @@ def explore_gemm_comp_worker(
         latency = performance.e2e_stats.e2e_cycles
         if latency < opt_latency:
             opt_latency = latency
-            opt_comp_description = (comp_description, (tM, tK, tN))
+            opt_comp_description = (comp_description, tuple(tiling_factor_combination))
 
     all_bacth_comp_description = []
     if opt_comp_description[0] is not None:
@@ -398,9 +372,11 @@ def generate_q_proj_comm(
     flit_size: int, core_flit_index_list: List[int],
     # Intermediate result directory
     intermediate_result_dir: str,
+    *, build_only: bool = False,
 ):
     cur_op_dir = os.path.join(intermediate_result_dir, name+"_comm_q")
-    os.makedirs(cur_op_dir, exist_ok=True)
+    if not build_only:
+        os.makedirs(cur_op_dir, exist_ok=True)
 
     ############################################
     #         Part 1: X-axis All Reduce        #
@@ -785,6 +761,10 @@ def generate_q_proj_comm(
     #         Get Communication Latency        #
     ############################################
 
+    if build_only:
+        return ('communication', [(all_reduce_description, per_core_all_reduce_description),
+                                   (all_gather_description, per_core_all_gather_description)], None)
+
     data_placement_config = {
         "tensor": [
             input_placement,
@@ -858,12 +838,14 @@ def generate_kv_proj_comm(
     last_block_mapping: List[List[List[int]]], # List[List[]] indicates 2D core array, List[int] indicates slot id to write
     # Intermediate results storing configs
     intermediate_result_dir: str = "",
+    *, build_only: bool = False,
 ):
     assert total_slot_num * num_kv_heads == tensor_dim(kv_cache_placement, 0, expected_rank=2)
     assert kv_length * core_array_size == tensor_dim(kv_cache_placement, 1, expected_rank=2) * num_kv_heads
     initial_flit_index_list = copy.deepcopy(core_flit_index_list)
     cur_op_dir = os.path.join(intermediate_result_dir, name+"_comm_kv")
-    os.makedirs(cur_op_dir, exist_ok=True)
+    if not build_only:
+        os.makedirs(cur_op_dir, exist_ok=True)
 
     iter_count_per_stage = math.ceil(core_array_size / 2)
     kv_comm_description = {
@@ -1238,32 +1220,33 @@ def generate_kv_proj_comm(
                         # Update flit count
                         core_flit_index_list[src_core_id] += math.ceil(core_array_size * send_req_num * kv_length * element_size / flit_size)
 
-            # Store full kv vector to DRAM
-            if t == iter_count_per_stage-2:
-                for j in range(core_array_size):
-                    src_core_id = i*core_array_size + j
-                    cur_block_mapping = last_block_mapping[i][j]
-                    for h in range(num_kv_heads):
-                        for slot_id in cur_block_mapping:
-                            slot_offset = h*total_slot_num + slot_id
-                            per_core_kv_comm_description[src_core_id]["communication"]["dram"].append(
-                                make_dram_task(
-                                    name=kv_cache_placement["name"],
-                                    is_write=True,
-                                    access_base=[slot_offset, 0],
-                                    access_extent=[1, tensor_dim(kv_cache_placement, 1, expected_rank=2)],
-                                    access_stride_add=[1, 1],
-                                    access_offset_add=[1, tensor_dim(kv_cache_placement, 1, expected_rank=2)],
-                                    init_iter=init_iter + t + 1,
-                                    stride_iter=1,
-                                    total_iter=1,
-                                )
-                            )
+    # Always commit the completed vector, including a 2x2 mesh whose final
+    # scatter stage has zero hops. Slot IDs are local to the destination core.
+    for i in range(core_array_size):
+        for j in range(core_array_size):
+            for h in range(num_kv_heads):
+                for slot_id in last_block_mapping[i][j]:
+                    if not 0 <= slot_id < total_slot_num:
+                        raise ValueError("KV destination slot is outside the cache")
+                    per_core_kv_comm_description[i*core_array_size+j]["communication"]["dram"].append(
+                        make_dram_task(
+                            name=kv_cache_placement["name"], is_write=True,
+                            access_base=[h*total_slot_num+slot_id, 0],
+                            access_extent=[1, tensor_dim(kv_cache_placement, 1, expected_rank=2)],
+                            access_stride_add=[1, 1],
+                            access_offset_add=[1, tensor_dim(kv_cache_placement, 1, expected_rank=2)],
+                            init_iter=kv_comm_description["iteration"] + 1,
+                            stride_iter=1, total_iter=1,
+                        )
+                    )
     # print("------kv comm y-axis scatter-----")
 
     ############################################
     #        Return Generated Description      #
     ############################################
+
+    if build_only:
+        return ('communication', [(kv_comm_description, per_core_kv_comm_description)], None)
 
     data_placement_config = {
         "tensor": [
@@ -1339,255 +1322,19 @@ def generate_1d_allreduce_comm(
     flit_size: int, core_flit_index_list: List[int],
     # Intermediate result directory
     intermediate_result_dir: str,
+    gated: bool = False,
 ):
     cur_op_dir = os.path.join(intermediate_result_dir, name+"_comm_1d_all_reduce")
     os.makedirs(cur_op_dir, exist_ok=True)
 
-    all_reduce_iteration = 2 * (core_array_size - 1)
-    all_reduce_description = {
-        "name": name+"_comm_1d_all_reduce",
-        "type": str(SimulatorOperatorType.Communication),
-        "iteration": all_reduce_iteration,
-        "core_num": core_num,
-        "file_prefix": name+"_comm_1d_all_reduce/", # Need to join root directory storing full computation description
-    }
-    per_core_all_reduce_description = [{
-        "communication": {
-            "on_chip": [{
-                "tx": {
-                    "buffer_load": [],
-                    "noc": [],
-                },
-                "rx": {
-                    "buffer_load": [],
-                    "buffer_store": [],
-                    "vector": [],
-                    "noc": [],
-                }
-            } for _ in range(all_reduce_iteration)],
-            "dram": [],
-        }
-    } for _ in range(core_num)]
-
-    # per_iter_input_chunk_length = math.ceil(input_column_length / core_array_size)
-    # per_iter_chunk_length = math.ceil(tensor_dim(output_placement, 1, expected_rank=2) / core_array_size)
-    per_iter_chunk_length = math.ceil(input_column_length / core_array_size)
-    per_iter_chunk_byte = row_num * per_iter_chunk_length * element_size
-    per_iter_flit_num = math.ceil(per_iter_chunk_byte / flit_size)
-    per_iter_vec_op_count = row_num * per_iter_chunk_length * op_num_per_element
-    
-    ############################################
-    #          Part 1: Reduce Scatter          #
-    ############################################
-
-    # Reduce scatter in all reduce
-    init_iter = 1
-    chunk_loaded = [[False for _ in range(core_array_size)] for _ in range(core_num)]
-    # print("------rs in ar-----")
-    # On-chip communication description
-    for t in range(core_array_size-1):
-        # Parallel core columns/rows
-        for i in range(core_array_size):
-            # Each column/row conducting reduce scatter
-            for j in range(core_array_size):
-                src_core_id = j*core_array_size + i if reduce_direction == 0 else i*core_array_size + j
-                dst_info_list = []
-                if j <= t:
-                    dst_core_id = (j+1)*core_array_size + i if reduce_direction == 0 else i*core_array_size + j+1
-                    chunk_id = abs(j-t)
-                    dst_info_list.append((j+1, dst_core_id, chunk_id))
-                if j >= core_array_size-1-t:
-                    dst_core_id = (j-1)*core_array_size + i if reduce_direction == 0 else i*core_array_size + j-1
-                    chunk_id = core_array_size-1 - abs(j+t-(core_array_size-1))
-                    dst_info_list.append((j-1, dst_core_id, chunk_id))
-                # print(f"{t} {i} {j} {src_core_id} {dst_info_list}")
-                
-                for dst_idx, dst_core_id, chunk_id in dst_info_list:
-                    if dst_idx>=0 and dst_idx<=core_array_size-1:
-                        # Src noc tx description
-                        cur_iter_cur_src_tx = per_core_all_reduce_description[src_core_id]["communication"]["on_chip"][init_iter+t-1]["tx"]
-                        cur_iter_cur_src_tx["buffer_load"].append({
-                            "name": f"noc_tx{dst_core_id}_load",
-                            "byte_count": per_iter_chunk_byte,
-                            "is_write": False,
-                        })
-                        cur_iter_cur_src_tx["noc"].append({
-                            "name": f"noc_tx{dst_core_id}",
-                            "is_send": True,
-                            "src": src_core_id,
-                            "dst": dst_core_id,
-                            "flit_num": per_iter_flit_num,
-                            "init_flit_id": core_flit_index_list[src_core_id],
-                        })
-
-                        # Dst noc rx description
-                        cur_iter_cur_dst_rx = per_core_all_reduce_description[dst_core_id]["communication"]["on_chip"][init_iter+t-1]["rx"]
-                        cur_iter_cur_dst_rx["buffer_load"].append({
-                            "name": f"reduce{src_core_id}_load",
-                            "byte_count": per_iter_chunk_byte * 2,
-                            "is_write": False,
-                        })
-                        cur_iter_cur_dst_rx["buffer_store"].append({
-                            "name": f"noc_rx{src_core_id}_store",
-                            "byte_count": per_iter_chunk_byte,
-                            "is_write": True,
-                        })
-                        cur_iter_cur_dst_rx["buffer_store"].append({
-                            "name": f"reduce{src_core_id}_store",
-                            "byte_count": per_iter_chunk_byte,
-                            "is_write": True,
-                        })
-                        cur_iter_cur_dst_rx["vector"].append({
-                            "name": f"reduce{src_core_id}",
-                            "vec_count": per_iter_vec_op_count,
-                        })
-                        cur_iter_cur_dst_rx["noc"].append({
-                            "name": f"noc_rx{src_core_id}",
-                            "is_send": False,
-                            "src": src_core_id,
-                            "dst": dst_core_id,
-                            "flit_num": per_iter_flit_num,
-                            "init_flit_id": core_flit_index_list[src_core_id],
-                        })
-
-                        # Update flit count
-                        core_flit_index_list[src_core_id] += per_iter_flit_num
-
-                    # Src DRAM access description
-                    if not chunk_loaded[src_core_id][chunk_id]:
-                        chunk_loaded[src_core_id][chunk_id] = True
-                        per_core_all_reduce_description[src_core_id]["communication"]["dram"].append(
-                            make_dram_task(
-                                name=input_placement["name"],
-                                is_write=False,
-                                access_base=[0, input_column_offset + chunk_id * per_iter_chunk_length],
-                                access_extent=[row_num, per_iter_chunk_length],
-                                access_stride_add=[1, 1],
-                                access_offset_add=[tensor_dim(input_placement, 0, expected_rank=2), per_iter_chunk_length],
-                                init_iter=init_iter + t - 1,
-                                stride_iter=1,
-                                total_iter=1,
-                            )
-                        )
-                    
-                    # Dst DRAM access description
-                    if dst_idx>=0 and dst_idx<=core_array_size-1 and not chunk_loaded[dst_core_id][chunk_id]:
-                        chunk_loaded[dst_core_id][chunk_id] = True
-                        per_core_all_reduce_description[dst_core_id]["communication"]["dram"].append(
-                            make_dram_task(
-                                name=input_placement["name"],
-                                is_write=False,
-                                access_base=[0, input_column_offset + chunk_id * per_iter_chunk_length],
-                                access_extent=[row_num, per_iter_chunk_length],
-                                access_stride_add=[1, 1],
-                                access_offset_add=[tensor_dim(input_placement, 0, expected_rank=2), per_iter_chunk_length],
-                                init_iter=init_iter + t - 1,
-                                stride_iter=1,
-                                total_iter=1,
-                            )
-                        )
-    # print("------rs in ar-----")
-
-    ############################################
-    #           Part 2: All Gather             #
-    ############################################
-
-    # All gather in all reduce
-    init_iter = core_array_size
-    chunk_stored = [[False for _ in range(core_array_size)] for _ in range(core_num)]
-    # print("------ag in ar-----")
-    # On-chip communication description
-    for t in range(core_array_size-1):
-        # Parallel core columns/rows
-        for i in range(core_array_size):
-            # Each column/row conducting all gather
-            for j in range(core_array_size):
-                src_core_id = j*core_array_size + i if reduce_direction == 0 else i*core_array_size + j
-                dst_info_list = []
-                if j >= t:
-                    dst_core_id = (j+1)*core_array_size + i if reduce_direction == 0 else i*core_array_size + j+1
-                    chunk_id = core_array_size-1-abs(j-t)
-                    dst_info_list.append((j+1, dst_core_id, chunk_id))
-                if j <= core_array_size-1-t:
-                    dst_core_id = (j-1)*core_array_size + i if reduce_direction == 0 else i*core_array_size + j-1
-                    chunk_id = abs(j+t-(core_array_size-1))
-                    dst_info_list.append((j-1, dst_core_id, chunk_id))
-                # print(f"{t} {i} {j} {src_core_id} {dst_info_list}")
-                for dst_idx, dst_core_id, chunk_id in dst_info_list:
-                    if dst_idx>=0 and dst_idx<=core_array_size-1:
-                        # Src noc tx description
-                        cur_iter_cur_src_tx = per_core_all_reduce_description[src_core_id]["communication"]["on_chip"][init_iter+t-1]["tx"]
-                        cur_iter_cur_src_tx["buffer_load"].append({
-                            "name": f"noc_tx{dst_core_id}_load",
-                            "byte_count": per_iter_chunk_byte,
-                            "is_write": False,
-                        })
-                        cur_iter_cur_src_tx["noc"].append({
-                            "name": f"noc_tx{dst_core_id}",
-                            "is_send": True,
-                            "src": src_core_id,
-                            "dst": dst_core_id,
-                            "flit_num": per_iter_flit_num,
-                            "init_flit_id": core_flit_index_list[src_core_id],
-                        })
-
-                        # Dst noc rx description
-                        cur_iter_cur_dst_rx = per_core_all_reduce_description[dst_core_id]["communication"]["on_chip"][init_iter+t-1]["rx"]
-                        cur_iter_cur_dst_rx["buffer_store"].append({
-                            "name": f"noc_rx{src_core_id}_store",
-                            "byte_count": per_iter_chunk_byte,
-                            "is_write": True,
-                        })
-                        cur_iter_cur_dst_rx["noc"].append({
-                            "name": f"noc_rx{src_core_id}",
-                            "is_send": False,
-                            "src": src_core_id,
-                            "dst": dst_core_id,
-                            "flit_num": per_iter_flit_num,
-                            "init_flit_id": core_flit_index_list[src_core_id],
-                        })
-
-                        # Update flit count
-                        core_flit_index_list[src_core_id] += per_iter_flit_num
-
-                    # Src DRAM access description
-                    if not chunk_stored[src_core_id][chunk_id]:
-                        chunk_stored[src_core_id][chunk_id] = True
-                        per_core_all_reduce_description[src_core_id]["communication"]["dram"].append(
-                            make_dram_task(
-                                name=output_placement["name"],
-                                is_write=True,
-                                access_base=[0, chunk_id * per_iter_chunk_length],
-                                access_extent=[row_num, per_iter_chunk_length],
-                                access_stride_add=[1, 1],
-                                access_offset_add=[tensor_dim(output_placement, 0, expected_rank=2), per_iter_chunk_length],
-                                init_iter=init_iter + t,
-                                stride_iter=1,
-                                total_iter=1,
-                            )
-                        )
-                    
-                    # Dst DRAM access description
-                    if dst_idx>=0 and dst_idx<=core_array_size-1 and not chunk_stored[dst_core_id][chunk_id]:
-                        chunk_stored[dst_core_id][chunk_id] = True
-                        per_core_all_reduce_description[dst_core_id]["communication"]["dram"].append(
-                            make_dram_task(
-                                name=output_placement["name"],
-                                is_write=True,
-                                access_base=[0, chunk_id * per_iter_chunk_length],
-                                access_extent=[row_num, per_iter_chunk_length],
-                                access_stride_add=[1, 1],
-                                access_offset_add=[tensor_dim(output_placement, 0, expected_rank=2), per_iter_chunk_length],
-                                init_iter=init_iter + t,
-                                stride_iter=1,
-                                total_iter=1,
-                            )
-                        )
-    # print("------ag in ar-----")
-
-    ############################################
-    #         Get Communication Latency        #
-    ############################################
+    from frontend.auto.collectives import allreduce_tasks
+    if core_num != core_array_size**2:
+        raise ValueError("Collective core count does not match the mesh")
+    all_reduce_description, per_core_all_reduce_description = allreduce_tasks(
+        input_placement, output_placement, name, row_num, input_column_offset,
+        input_column_length, element_size, op_num_per_element, reduce_direction,
+        core_array_size, flit_size, core_flit_index_list, gated=gated,
+    )
 
     data_placement_config = {
         "tensor": [
@@ -2632,10 +2379,10 @@ def explore_cloud_tiling(
                         input_column_offset=0,
                         input_column_length=tensor_dim(output_placement, 1, expected_rank=2),
                         element_size=element_size,
-                        # extra 2 ops for activation function (worst case in SiLU)
-                        # Considering when adopting SiLU, transfer vector length is 2 * hidden dim,
-                        # here we set 1 + 2 / 2 = 2 ops (SiLU only apply on hidden dim)
-                        op_num_per_element=2, 
+                        # Gated nonlinearity executes after reduce-scatter, once
+                        # per output element, before gathering the smaller result.
+                        op_num_per_element=1 if model_config.mlp_gated_linear_units else 2,
+                        gated=model_config.mlp_gated_linear_units,
                         reduce_direction=1 if not model_config.is_deepseek else 0,
                         # Chip config
                         chip_config_path=cloud_config.chip_config_path,
