@@ -55,7 +55,7 @@ def small_configuration():
     workload = Workload(1,4,4,2,1,16,64,1,4)
     kernels = {name:Gemm(p,Plan((1,2,2),(4,8,16)),True,int(name=='expand'),name=='expand')
                for name,p in workload.problems.items()}
-    return workload,configuration(kernels,AttentionPlan(1,1))
+    return workload,configuration(kernels,AttentionPlan(1,1,1))
 
 
 def test_configuration_dictionary_order_does_not_change_physical_placement(tmp_path):
