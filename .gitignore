@@ -42,3 +42,6 @@ TODO*
 scratch
 tmp*
 */temp*
+
+# near-memory extension experiment outputs
+results/near_mem/
