@@ -268,17 +268,21 @@ def generate_context_slot_mapping(
     # per-core workloads first, each time to the least-loaded cores.
     core_slot_counts = [0] * core_num
     req_core_assignments: List[List[int]] = [[] for _ in range(batch_size)]
+    req_core_slot_counts: List[Dict[int, int]] = [{} for _ in range(batch_size)]
 
     order = sorted(range(batch_size),
                    key=lambda i: per_req_valid_slots_per_core[i], reverse=True)
     for i in order:
         n = num_cores_per_req[i]
-        pv = per_req_valid_slots_per_core[i]
         sorted_cores = sorted(range(core_num), key=lambda core_idx: core_slot_counts[core_idx])
         assigned = sorted_cores[:n]
         req_core_assignments[i] = assigned
-        for core_idx in assigned:
-            core_slot_counts[core_idx] += pv
+        quotient, remainder = divmod(context_length_list[i], n)
+        for rank, core_idx in enumerate(assigned):
+            # ceil(c/n) on every core silently creates extra valid KV tokens.
+            count = quotient + int(rank < remainder)
+            req_core_slot_counts[i][core_idx] = count
+            core_slot_counts[core_idx] += count
 
     # Per-core slot assignment: each core's slots start from 0 and increment
     # in request-ID order.
@@ -289,7 +293,7 @@ def generate_context_slot_mapping(
         )
         cur_slot = 0
         for req_id in reqs_on_core:
-            num_slots = per_req_valid_slots_per_core[req_id]
+            num_slots = req_core_slot_counts[req_id][core_id]
             context_slot_mapping[core_id][req_id] = list(range(cur_slot, cur_slot + num_slots))
             cur_slot += num_slots
 

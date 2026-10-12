@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <numeric>
+#include <stdexcept>
 // atlasim include
 #include "core/core.h"
 #include "common/input.h"
@@ -362,6 +363,7 @@ void Core::pre_simulate(std::shared_ptr<OperatorTask> task) {
         //// Simulate each sub-operation individually
 
         // (1) QK matrix
+        components[matrix_name]->reset_op_count();
         ComponentInput qk_matrix_input = make_component_input({});
         qk_matrix_input->emplace_back(make_component_input_item({
             {"mac_count", computation_task->matrix_tasks[0].mac_count},
@@ -370,6 +372,7 @@ void Core::pre_simulate(std::shared_ptr<OperatorTask> task) {
         double qk_matrix_op_count = components[matrix_name]->get_cur_op_count();
 
         // (2) SV matrix
+        components[matrix_name]->reset_op_count();
         ComponentInput sv_matrix_input = make_component_input({});
         sv_matrix_input->emplace_back(make_component_input_item({
             {"mac_count", computation_task->matrix_tasks[1].mac_count},
@@ -378,6 +381,7 @@ void Core::pre_simulate(std::shared_ptr<OperatorTask> task) {
         double sv_matrix_op_count = components[matrix_name]->get_cur_op_count();
 
         // (3) Softmax vector
+        components[vector_name]->reset_op_count();
         ComponentInput softmax_vector_input = make_component_input({});
         softmax_vector_input->emplace_back(make_component_input_item({
             {"vec_count", computation_task->vector_tasks[0].vec_count}
@@ -386,6 +390,7 @@ void Core::pre_simulate(std::shared_ptr<OperatorTask> task) {
         double softmax_vector_op_count = components[vector_name]->get_cur_op_count();
 
         // (4) Accumulation vector
+        components[vector_name]->reset_op_count();
         ComponentInput accum_vector_input = make_component_input({});
         accum_vector_input->emplace_back(make_component_input_item({
             {"vec_count", computation_task->vector_tasks[1].vec_count}
@@ -483,11 +488,27 @@ void Core::pre_simulate(std::shared_ptr<OperatorTask> task) {
         require_decode_attention_rank2_dim1_contiguous(kv_cache, "kv_cache");
         int num_requests = (int)cur_core_input.request_indices.size();
 
-        // (i) Load all query vectors in the first stage
-        std::vector<int64_t> input_access_base(input.rank(), 0);
-        std::vector<int64_t> input_access_extent = input.shape;
-        input_access_extent[0] = num_requests;
-        append_dram_access_item(dram_inputs[0], input, false, input_access_base, input_access_extent);
+        // Q/output tensors retain global batch row IDs after redistribution.
+        // A core owning requests {2, 7} must not access the prefix rows {0, 1}.
+        // Coalesce adjacent rows to preserve the native contiguous-batch traffic.
+        auto access_request_rows = [&](ComponentInput target, const TensorPlacement& tensor, bool write) {
+            auto requests = cur_core_input.request_indices;
+            std::sort(requests.begin(), requests.end());
+            for(size_t start = 0; start < requests.size();) {
+                size_t end = start + 1;
+                while(end < requests.size() && requests[end] == requests[end - 1] + 1) ++end;
+                if(requests[start] < 0 || requests[end - 1] >= tensor.shape[0] ||
+                   (start > 0 && requests[start] == requests[start - 1])) {
+                    throw std::invalid_argument("DecodeAttention request rows are invalid or duplicated");
+                }
+                std::vector<int64_t> base(tensor.rank(), 0), extent = tensor.shape;
+                base[0] = requests[start];
+                extent[0] = end - start;
+                append_dram_access_item(target, tensor, write, base, extent);
+                start = end;
+            }
+        };
+        access_request_rows(dram_inputs[0], input, false);
 
         // (ii) Load KV vectors for each tile
         int flat_tile_idx = 0;
@@ -514,10 +535,7 @@ void Core::pre_simulate(std::shared_ptr<OperatorTask> task) {
 
         // (iii) Store all output in the last stage
         int last_dram_iter = cur_task_iteration_count - 1;
-        std::vector<int64_t> output_access_base(output.rank(), 0);
-        std::vector<int64_t> output_access_extent = output.shape;
-        output_access_extent[0] = num_requests;
-        append_dram_access_item(dram_inputs[last_dram_iter], output, true, output_access_base, output_access_extent);
+        access_request_rows(dram_inputs[last_dram_iter], output, true);
 
         // Simulate DRAM for each iteration
         for(int i=0; i<cur_task_iteration_count; ++i) {
