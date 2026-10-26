@@ -301,7 +301,6 @@ def compile_attention(graph, layout, plan, query, cache, name='attention'):
                             continue
                         core = hstart + ((request*pq+s)*pc + c) % layout.group_cores
                         if core != region.core:
-                            timeline.send(slot+1, core, region.core, 1, credit=True)
                             timeline.send(slot+1, region.core, core, region.area*2)
                         q = query_views[head, request, s, c]
                         for first in range(0, q.rows, plan.query_tile):

@@ -28,7 +28,7 @@ def lower_tasks(program, flit_size, final_ops=None):
     if min(slots)<0:raise ValueError('Program starts before its operands can arrive')
     length=max(slots)+1
     raw=[[{k:[] for k in KEYS} for _ in range(length)] for _ in range(p.cores)]
-    fid=macs=vectors=reads=writes=credits=0
+    fid=macs=vectors=reads=writes=0
     def buffer(core,i,count,write):
         raw[core][i]['buffer_store' if write else 'buffer_load'].append(dict(name='sram',byte_count=count,is_write=write))
     for i,row in enumerate(phases,-1):
@@ -55,19 +55,18 @@ def lower_tasks(program, flit_size, final_ops=None):
                     count=a['byte_count']//dtype;vectors+=count
                     raw[core][i]['vector'].append(dict(name='split_k_add',vec_count=count))
                     buffer(core,i,a['byte_count']*2,False);buffer(core,i,a['byte_count'],True)
-                elif op in ('send','credit'):
-                    count=1 if op=='credit' else a['byte_count'];flits=(count+flit_size-1)//flit_size
+                elif op=='send':
+                    count=a['byte_count'];flits=(count+flit_size-1)//flit_size
                     task=dict(name=a['tensor'],src=core,dst=a['dst'],flit_num=flits,init_flit_id=fid)
                     raw[core][i]['noc_tx'].append(dict(task,is_send=True))
                     raw[a['dst']][i]['noc_rx'].append(dict(task,is_send=False));fid+=flits
-                    if op=='send':buffer(core,i,count,False);buffer(a['dst'],i,count,True)
-                    else:credits+=flits*flit_size
+                    buffer(core,i,count,False);buffer(a['dst'],i,count,True)
                 elif op not in ('clear','zero','drop'):raise ValueError(f'Unknown IR operation: {op}')
     assert macs==prod(program.problem.shape)
     if fid>=2**31:raise ValueError('Native flit identifiers would overflow')
     manifest = dict(problem=asdict(program.problem),plan=asdict(p),sram_bytes=program.sram_bytes,
                 macs=macs,vector_ops=vectors,logical_dram_read_bytes=reads,logical_dram_write_bytes=writes,
-                noc_bytes=fid*flit_size,noc_credit_bytes=credits,phases=len(program.phases),
+                noc_bytes=fid*flit_size,phases=len(program.phases),
                 accounting='native ATLAS compute/NoC SRAM accesses; DRAM staging not charged twice',
                 scope='single GEMM, explicit full-resident panels and final reduction; preplaced shards')
 
@@ -102,18 +101,13 @@ def simulate(problem,plan,chip,out,timeout=300,overlap=True,provenance=None):
     return dict(manifest=manifest,result=result)
 
 
-def measure(problem,plan,chip,cache,provenance):
+def measure(problem,plan,chip,folder,provenance):
     """ATLAS cycles of one plan, including the single-copy input distribution."""
-    signature=dict(problem=asdict(problem),plan=asdict(plan),backend=provenance,overlap=True,inputs='single-copy')
-    key=hashlib.sha256(json.dumps(signature,sort_keys=True).encode()).hexdigest()[:24]
-    out=Path(cache)/key
-    if (out/'result.json').exists() and (out/'signature.json').exists():
-        if json.loads((out/'signature.json').read_text())==json.loads(json.dumps(signature)):
-            return dict(key=key,plan=asdict(plan),result=json.loads((out/'result.json').read_text()),path=str(out))
+    key=hashlib.sha256(json.dumps(asdict(plan),sort_keys=True).encode()).hexdigest()[:24]
+    out=Path(folder)/key
     run=simulate(problem,plan,chip,out,provenance=provenance)
     result=charge(run['result'],distribute(problem,plan,chip,out/'distribution'))
     (out/'result.json').write_text(json.dumps(result,indent=2))
-    (out/'signature.json').write_text(json.dumps(signature,sort_keys=True))
     return dict(key=key,plan=asdict(plan),result=result,path=str(out))
 
 

@@ -171,9 +171,9 @@ class Proxy:
         dram=(reads_a+reads_b+c)/self.dram_bw
         noc=volume/self.arch['noc']['flit_size'];serial/=self.arch['noc']['flit_size']
         # Native tasks cannot issue fractional micro-iterations. Count their
-        # phase overhead and the credit/data phases of residual reduction.
+        # phase overhead and one phase per shift or reduction step.
         # This is a ranking heuristic, never a safe latency lower bound.
-        return max(mac,dram,noc)+serial+micro_steps+2*events
+        return max(mac,dram,noc)+serial+micro_steps+events
 
 
     def lower(self,problem,p):
@@ -202,7 +202,7 @@ class Proxy:
         events=prod(l.radix for l in p.layers)-1+rows*ceil(log2(residual))
         dram=(lm*lk/prod(p.a)+lk*ln/prod(p.b)+lm*ln/prod(p.c)*(1+2*(residual>1)))*dtype/self.dram_bw
         flit=self.arch['noc']['flit_size']
-        return max(mac,dram,volume/flit)+serial/flit+micro_steps+2*events
+        return max(mac,dram,volume/flit)+serial/flit+micro_steps+events
 
 
 def family(p):

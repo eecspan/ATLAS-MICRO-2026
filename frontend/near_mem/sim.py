@@ -54,8 +54,6 @@ def fingerprint(chip):
     _,_,paths=hardware(chip)
     paths += sorted((ROOT/'frontend/near_mem').rglob('*.py'))
     paths += [ROOT/'frontend/auto'/name for name in ('tiling_explorer_cloud.py', 'generalize.py', 'gemm_schedule.py', 'collectives.py')]
-    # Content keyed: unrelated output directory paths in chip configs may reduce
-    # reuse but can never produce an unsafe cross-hardware cache hit.
     hashes={str(p):hashlib.sha256(p.read_bytes()).hexdigest() for p in paths}
     hashes['atlas']=revision(ROOT)
     for folder in ('dram/ramulator2','noc/booksim2'):

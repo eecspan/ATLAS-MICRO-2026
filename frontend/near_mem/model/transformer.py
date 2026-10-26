@@ -7,15 +7,12 @@ and explicit layout edges. Measurement and search live in ``experiment.py``.
 from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from math import isqrt
-from pathlib import Path
-
-import yaml
 
 from .attention import Attention, AttentionPlan, KVLayout, compile_attention, endpoints
 from ..sim import hardware
 from ..tasks import Graph, Region
 from .kernels import Gemm, pointwise, residual, rmsnorm
-from ..gemm.native import matrix_placement, tuning_cache
+from ..gemm.native import best_tile
 from ..gemm.plan import Plan, Problem
 
 
@@ -157,29 +154,15 @@ def build(workload, chip, config):
 
 
 def tune_native(workload, chip, out, workers=4):
-    from frontend.auto.tiling_explorer_cloud import explore_gemm_comp
-    from frontend.hardware_parser import load_chip_config_from_yaml
-    from frontend.model_parser import Operator, OperatorType
-    arch,capacity,_ = hardware(chip); side = isqrt(arch['core_num'])
+    """Native K/N-grid kernels with the best native tile of each local shape."""
+    arch,_,_ = hardware(chip); side = isqrt(arch['core_num'])
     if side*side != arch['core_num'] or side % 2:
         raise ValueError('Native cloud baseline needs an even square mesh')
-    cfg = yaml.safe_load(Path(chip).read_text()); single = deepcopy(cfg)
-    single['architecture']['core_num'] = 1; single['architecture'].pop('noc',None)
-    out.mkdir(parents=True,exist_ok=True)
-    tuning = out/'single.yaml'; tuning.write_text(yaml.safe_dump(single))
     kernels = {}
     for name,problem in workload.problems.items():
         m,n,k = problem.shape
         if n % side or k % side:
             raise ValueError('Native K/N shape must divide mesh side')
-        local = (m,n//side,k//side)
-        a,b,c = matrix_placement(local,2,capacity)['tensor']
-        # Named by local shape, so standalone GEMM tuning shares the cache.
-        op = Operator(name='gemm_{}_{}_{}'.format(*local),op_type=OperatorType.GEMM,B=1,M=m,N=local[1],K=local[2])
-        best = explore_gemm_comp(a,c,[b],op,2,load_chip_config_from_yaml(cfg),str(tuning),
-                                8,512,8,workers,str(out/name),str(tuning_cache(chip)))
-        if best is None:
-            raise ValueError('Native tile domain has no SRAM-feasible point')
-        tm,tk,tn = best['tiling_factors']
+        tm,tk,tn = best_tile((m,n//side,k//side),chip,out/name,workers)['tiling_factors']
         kernels[name] = Gemm(problem,Plan((1,side,side),(tm,tn,tk)),True,int(name=='expand'),name=='expand')
     return kernels

@@ -154,7 +154,7 @@ class Timeline:
         self.flit_size = flit_size
         self.fid = 0
         self.counts = dict(macs=0, vector_ops=0, dram_read_bytes=0, dram_write_bytes=0,
-                           noc_data_bytes=0, noc_credit_bytes=0)
+                           noc_data_bytes=0)
 
     def add(self, core, time, key, task):
         slot = time if key == 'dram' and not task['is_write'] else time-2 if key == 'dram' else time-1
@@ -187,19 +187,18 @@ class Timeline:
         self.buffer(core, time, read)
         self.buffer(core, time, write, True)
 
-    def send(self, time, src, dst, size, credit=False):
+    def send(self, time, src, dst, size):
+        """Data arrival synchronises neighbours, as in native ATLAS collectives."""
         if src == dst or not size:
             return
         flits = (size+self.flit_size-1)//self.flit_size
-        packet = dict(name='credit' if credit else 'data', src=src, dst=dst,
-                      flit_num=flits, init_flit_id=self.fid)
+        packet = dict(name='data', src=src, dst=dst, flit_num=flits, init_flit_id=self.fid)
         self.fid += flits
         self.add(src, time, 'noc_tx', dict(packet, is_send=True))
         self.add(dst, time, 'noc_rx', dict(packet, is_send=False))
-        self.counts['noc_credit_bytes' if credit else 'noc_data_bytes'] += flits*self.flit_size
-        if not credit:
-            self.buffer(src, time, size)
-            self.buffer(dst, time, size, True)
+        self.counts['noc_data_bytes'] += flits*self.flit_size
+        self.buffer(src, time, size)
+        self.buffer(dst, time, size, True)
 
     def finish(self):
         length = max(1, *(len(x) for x in self.raw))
@@ -366,7 +365,7 @@ class Graph:
         self.edges.append(record)
         return target
 
-    def simulate(self, out, cache=None, config_key=None, timeout=7200):
+    def simulate(self, out, timeout=7200):
         out = Path(out).resolve(); out.mkdir(parents=True, exist_ok=True)
         operators = []
         for i, entry in enumerate(self.operations):
@@ -384,15 +383,5 @@ class Graph:
         (out/'graph.json').write_text(json.dumps(manifest, indent=2))
         placement = dict(core_tensor=[dict(core_id=i, tensor=list(t.values())) for i,t in enumerate(self.tensors)])
         dump(out/'operators.yaml',dict(operator=operators)); dump(out/'placement.yaml',placement)
-        if cache is None:
-            result = execute(self.chip,out,dict(operator=operators),placement,timeout)
-        else:
-            from .cache import task_digest
-            digest = task_digest(out,self.cores)
-            result,source = cache.get(digest,config_key)
-            if result is None:
-                result = execute(self.chip,out,dict(operator=operators),placement,timeout)
-            else:
-                dump(out/'result.json',result)
-            cache.put(digest,out,source)
+        result = execute(self.chip,out,dict(operator=operators),placement,timeout)
         return dict(result=result, graph=manifest)

@@ -25,7 +25,6 @@ from math import isqrt
 from pathlib import Path
 import time
 
-from ..cache import ExecutionCache, configuration_key
 from ..gemm.plan import Plan
 from ..gemm.space import Proxy, structure
 from ..methods import METHODS, propose, target, union
@@ -42,25 +41,19 @@ cycles = lambda row: row['result']['e2e_cycles']
 
 
 class Experiment:
-    """Measures whole-graph configurations once each, reusing identical task sets."""
+    """Measures each distinct whole-graph configuration once per run."""
     def __init__(self, workload, chip, out):
         self.workload = workload; self.chip = Path(chip).resolve(); self.out = Path(out).resolve()
         self.out.mkdir(parents=True, exist_ok=True)
-        self.provenance = fingerprint(chip); self.rows = []
-        self.cache = ExecutionCache(chip, self.out/'runs', self.provenance)
+        self.provenance = fingerprint(chip); self.rows = []; self.seen = {}
 
     def measure(self, config, label, record=True):
-        signature = dict(workload=asdict(self.workload), configuration=config, sha256=self.provenance)
-        key = hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()[:20]
-        folder = self.out/'runs'/key; sigfile = folder/'signature.json'
-        if (sigfile.exists() and (folder/'result.json').exists() and (folder/'graph.json').exists()
-                and json.loads(sigfile.read_text()) == json.loads(json.dumps(signature))):
-            result = json.loads((folder/'result.json').read_text())
-            manifest = json.loads((folder/'graph.json').read_text())
-        else:
-            run = build(self.workload, self.chip, config).simulate(folder, self.cache, configuration_key(signature))
-            result, manifest = run['result'], run['graph']
-            dump(sigfile, signature)
+        key = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()[:20]
+        if key not in self.seen:
+            folder = self.out/'runs'/key
+            run = build(self.workload, self.chip, config).simulate(folder)
+            self.seen[key] = (run['result'], run['graph'], folder)
+        result, manifest, folder = self.seen[key]
         row = dict(label=label, key=key, configuration=config, result=result,
                    peak_dram_bytes=max(manifest['peak_dram_bytes']), path=str(folder),
                    layout_noc_bytes=sum(e['noc_data_bytes'] for e in manifest['edges']),
@@ -141,10 +134,8 @@ class Chain:
         if name == 'attention':
             return standalone_attention.measure(w.attention, self.exp.chip, self.exp.out/'attention',
                                                 choice, placed=True)['result']['e2e_cycles']
-        key = hashlib.sha256(json.dumps([name, choice, self.exp.provenance], sort_keys=True).encode()).hexdigest()[:20]
+        key = hashlib.sha256(json.dumps([name, choice], sort_keys=True).encode()).hexdigest()[:20]
         folder = self.exp.out/'operators'/key
-        if (folder/'result.json').exists():
-            return json.loads((folder/'result.json').read_text())['e2e_cycles']
         graph = Graph(self.exp.chip); kernel = self.kernel(name, choice).prepare(graph, name)
         regions, tensors = kernel.input_layout(graph.cores)
         for core, t in enumerate(tensors):

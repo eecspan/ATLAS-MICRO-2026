@@ -4,8 +4,8 @@
 
 | 目录/文件 | 职责 |
 |---|---|
-| `sim.py`、`tasks.py`、`cache.py` | ATLAS 边界：硬件解析与指纹、独立进程执行；物理区域、Timeline、布局转换与线性 all-gather；整图缓存 |
-| `gemm/` | GEMM 编译器：`plan`/`ownership`（Ps/Pt 空间与代数）、`compiler`/`program`/`lower`（调度、回放、降为原生任务）、`space`（候选枚举与 proxy）、`native`（原生 ATLAS 调优）、`distribution`（单份输入的复制计费） |
+| `sim.py`、`tasks.py` | ATLAS 边界：硬件解析与指纹、独立进程执行；物理区域、Timeline、布局转换与线性 all-gather |
+| `gemm/` | GEMM 编译器：`plan`/`ownership`（Ps/Pt 空间与代数）、`compiler`/`program`/`lower`（调度、回放、降为原生任务）、`space`（候选枚举与 proxy）、`native`（原生 ATLAS 编译：同一 proxy 选 tile 候选再模拟）、`distribution`（单份输入的复制计费） |
 | `model/` | 模型算子：`attention`（静态 KV 与 fused attention）、`kernels`（GEMM 图接口及 norm/gate/residual）、`transformer`（建图、算子边界布局、原生 tile 调优） |
 | `search.py` | 通用搜索：`shortlist`、`diverse`（均支持下界剪枝）、`beam`、`anneal`、`measure_all` |
 | `methods.py` | 方法注册表：`local`、`ours`；新增 baseline 在此加一项 |

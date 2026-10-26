@@ -369,10 +369,9 @@ def rmsnorm(graph, name, source, rows, width):
                 for i in range(0,len(active),2*stride):
                     if i+stride < len(active):
                         dst,src = active[i],active[i+stride]
-                        timeline.send(t,dst,src,1,credit=True)
-                        timeline.send(t+1,src,dst,count*4)
-                        timeline.work(dst,t+2,vectors=count,read=count*8,write=count*4)
-                t += 3; stride *= 2
+                        timeline.send(t,src,dst,count*4)
+                        timeline.work(dst,t+1,vectors=count,read=count*8,write=count*4)
+                t += 2; stride *= 2
             root = active[0]
             timeline.work(root,t,vectors=count*3,read=count*4,write=count*4); t += 1
             for r in source:
@@ -383,9 +382,8 @@ def rmsnorm(graph, name, source, rows, width):
             while remaining:
                 batch = remaining[:len(ready)]; remaining = remaining[len(ready):]
                 for src,dst in zip(ready,batch):
-                    timeline.send(t,dst,src,1,credit=True)
-                    timeline.send(t+1,src,dst,count*4)
-                ready += batch; t += 2
+                    timeline.send(t,src,dst,count*4)
+                ready += batch; t += 1
             for src,dst,gamma in zip(source,output,weights):
                 a = src.intersect(box)
                 if a is None:

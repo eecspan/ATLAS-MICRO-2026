@@ -80,12 +80,13 @@ def compile_plan(problem, plan, sram_bytes, dram_bytes, overlap=True):
             else:row[core].append(access(core,v,key))
 
     def exchange(layer_id, tensors, direction=-1):
-        credits=phase();data=phase()
+        # Like native ATLAS collectives, the arrival of a step's data is the
+        # neighbour synchronisation; no separate ready-credit phase is issued.
+        data=phase()
         for v in tensors:
             old=[dict(c) for c in cache]
             for src in range(core_count):
                 dst=own.neighbor(src,layer_id,v,direction)
-                credits[dst].append(dict(op='credit',dst=src,tensor=v))
                 data[src].append(dict(op='send',dst=dst,tensor=v,byte_count=len(old[src][v])*tile_bytes[v]))
                 cache[dst][v]=old[src][v]
 
@@ -170,10 +171,9 @@ def compile_plan(problem, plan, sram_bytes, dram_bytes, overlap=True):
         for core in cores:prepare(loads,core,'C',[key])
         stride=1
         while stride<len(cores):
-            credits=phase();data=phase();adds=phase()
+            data=phase();adds=phase()
             for index in range(stride,len(cores),2*stride):
                 src,dst=cores[index],cores[index-stride]
-                credits[dst].append(dict(op='credit',dst=src,tensor='C'))
                 data[src].append(dict(op='send',dst=dst,tensor='C',target='partial',byte_count=tile_bytes['C']))
                 adds[dst].append(dict(op='add',byte_count=tile_bytes['C']))
             stride*=2
@@ -221,8 +221,8 @@ def pipeline(phases):
             following=phases[i+1]
             if only(following,{'clear','load'}) and all(a.get('tensor') in ('A','B') for ops in following for a in ops):
                 out.append([a+b for a,b in zip(row,following)]);i+=2;continue
-            if i+2<len(phases) and only(following,{'credit'}) and only(phases[i+2],{'send'}) and all(a['tensor'] in ('A','B') for ops in phases[i+2] for a in ops):
-                out.extend([following,[a+b for a,b in zip(row,phases[i+2])]]);i+=3;continue
+            if only(following,{'send'}) and all(a['tensor'] in ('A','B') for ops in following for a in ops):
+                out.append([a+b for a,b in zip(row,following)]);i+=2;continue
         out.append(row);i+=1
     # When A rotates into its second bank, the independent second B bank can
     # still prefetch the next B tile (and conversely). Do not overwrite a bank

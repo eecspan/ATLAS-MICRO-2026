@@ -53,7 +53,7 @@ def run(problem, chip, out, budget=16, workers=4, tile_min=16, tile_policy='powe
     pick = lambda space: shortlist(space, lambda p: proxy(problem, p), budget, family, bound, families)
     ranked, generated = propose(problem, hw, pick)
     spaces = {name: union(ranked, name, seed=[native_plan]) for name in ranked}
-    evaluate = partial(measure, problem, chip=chip, cache=out/'cache', provenance=provenance)
+    evaluate = partial(measure, problem, chip=chip, folder=out/'runs', provenance=provenance)
     rows = measure_all(spaces['ours'], evaluate, workers, processes=True)
     rotating = [r for r in rows if as_plan(r['plan']).layers]
     if rotating:

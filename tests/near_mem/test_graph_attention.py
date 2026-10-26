@@ -31,13 +31,11 @@ def replay_copy(raw, arrays):
     for s, _ in enumerate(raw[0]):
         for core, phases in enumerate(raw):
             for task in phases[s]['noc_tx']:
-                if task['name'] != 'credit':
-                    packets[task['src'],task['init_flit_id']] = read[core,s]
+                packets[task['src'],task['init_flit_id']] = read[core,s]
     for s, _ in enumerate(raw[0]):
         for core, phases in enumerate(raw):
             for task in phases[s]['noc_rx']:
-                if task['name'] != 'credit':
-                    received[core,s] = packets[task['src'],task['init_flit_id']]
+                received[core,s] = packets[task['src'],task['init_flit_id']]
     for s, _ in enumerate(raw[0]):
         for core, phases in enumerate(raw):
             for task in phases[s]['dram']:
