@@ -3,11 +3,12 @@ from copy import deepcopy
 from dataclasses import dataclass, replace
 from math import isqrt
 
-from .backend import lower_tasks
-from .compiler import compile_plan
-from .graph import Region, transfers, unique, window
-from .ownership import Ownership
-from .plan import DEPENDENCIES, Problem
+from ..gemm.lower import lower_tasks
+from ..gemm.compiler import compile_plan
+from ..tasks import Region, transfers, unique, window
+from ..gemm.ownership import Ownership
+from ..gemm.plan import DEPENDENCIES, Problem
+from ..sim import strides
 
 
 def coalesce(regions):
@@ -81,30 +82,61 @@ class Gemm:
     direction: int = 0
     gated: bool = False
 
-    def prepare(self, graph, name):
-        """Allocate persistent weights before any activation scratch."""
+    def bind(self, cores, sram, capacity):
+        """Compile the mapping for a chip; touches no graph state."""
         if self.gated and self.problem.n % 2:
             raise ValueError('Gated projection needs equal gate/up widths')
-        self.name = name
         if self.native:
-            self.side = isqrt(graph.cores)
-            if self.side*self.side != graph.cores or self.side < 2:
+            self.side = isqrt(cores)
+            if self.side*self.side != cores or self.side < 2:
                 raise ValueError('The original ATLAS collective requires an even square mesh')
             m,n,k = self.problem.shape
             if n % self.side or k % self.side or (self.gated and n % (2*self.side)):
                 raise ValueError('Native K/N partitions require exact divisibility')
-            shape = [k//self.side, n//self.side]
-            for core in range(graph.cores):
-                graph.tensor(core, name+'_B', shape, [1, shape[0]])
         else:
-            self.program = compile_plan(self.problem, self.plan, graph.sram, graph.capacity)
+            self.program = compile_plan(self.problem, self.plan, sram, capacity)
             # Static parameter packing: each even N tile contains corresponding
             # gate/up halves. All partial sums retain the ordinary GEMM layout.
             self.fused_gate = self.gated and self.plan.tile[1] % 2 == 0
+        return self
+
+    def prepare(self, graph, name):
+        """Allocate persistent weights before any activation scratch."""
+        self.bind(graph.cores, graph.sram, graph.capacity); self.name = name
+        if self.native:
+            m,n,k = self.problem.shape; shape = [k//self.side, n//self.side]
+            for core in range(graph.cores):
+                graph.tensor(core, name+'_B', shape, column=True)
+        else:
             for core, placement in enumerate(self.program.placements):
                 b = next(t for t in placement['tensor'] if t['name'] == 'B')
                 graph.tensor(core, name+'_B', b['shape'], b['strides'])
         return self
+
+    def input_layout(self, cores):
+        """A regions this kernel reads in place, and the per-core A tensors."""
+        if not self.native:
+            p = self.program
+            return program_regions(p, 'A'), [next(t for t in c['tensor'] if t['name'] == 'A') for c in p.placements]
+        m,_,k = self.problem.shape; local_k = k//self.side; regions = []
+        for core in range(cores):
+            row,col = divmod(core, self.side)
+            kc = row if self.direction == 0 else col
+            regions.append(Region(core, 'A', 0, kc*local_k, m, local_k))
+        return regions, [dict(shape=[m,local_k], strides=strides([m,local_k]))]*cores
+
+    def output_layout(self, cores):
+        """Final output regions (after any gate), as returned by ``compile``."""
+        m,n,_ = self.problem.shape
+        if self.native:
+            width = n//self.side//(2 if self.gated else 1)
+            return [Region(core, 'C', 0, (core % self.side if self.direction == 0 else core//self.side)*width, m, width)
+                    for core in range(cores)]
+        regions = program_regions(self.program, 'C')
+        if self.fused_gate:
+            return [replace(r, col=r.col//2, cols=r.cols//2, local_col=r.local_col//2) for r in regions]
+        # An unfused gate pairs values at the owners of the gate half.
+        return unique(window(regions, 0, 0, m, n//2)) if self.gated else regions
 
     def compile(self, graph, source, rope_width=0):
         if self.native:
@@ -112,8 +144,7 @@ class Gemm:
         p = self.program
         if rope_width and (rope_width % 2 or p.plan.tile[1] % 2):
             raise ValueError('Fused RoPE requires complete even-sized Q column tiles')
-        tensors = [next(t for t in c['tensor'] if t['name'] == 'A') for c in p.placements]
-        inputs, names = bind_input(graph, self.name+'_A', source, program_regions(p, 'A'), tensors)
+        inputs, names = bind_input(graph, self.name+'_A', source, *self.input_layout(graph.cores))
         outputs = program_regions(p, 'C')
         active = {r.core for r in outputs}
         for core, placement in enumerate(p.placements):
@@ -137,15 +168,13 @@ class Gemm:
                     task['name'] = names[core] if task['name'] == 'A' else self.name+'_'+task['name']
         graph.add(self.name, raw, dict(manifest, category='gemm', native=False,
                   fused_gate=self.fused_gate,weight_columns='gate/up halves per N tile' if self.fused_gate else 'logical'))
-        outputs = [replace(r,name=self.name+'_G',col=r.col//2,cols=r.cols//2,local_col=r.local_col//2)
-                   if self.fused_gate else replace(r,name=self.name+'_C') for r in outputs]
         for core in range(graph.cores):
             if self.fused_gate or core not in active:
                 graph.live[core].pop(self.name+'_C',None)
         graph.release(inputs, keep=source)
         if self.gated and not self.fused_gate:
-            return gate(graph, outputs, self.problem.m, self.problem.n//2, self.name+'_gate')
-        return outputs
+            return gate(graph, [replace(r,name=self.name+'_C') for r in outputs], self.problem.m, self.problem.n//2, self.name+'_gate')
+        return [replace(r,name=self.name+('_G' if self.fused_gate else '_C')) for r in self.output_layout(graph.cores)]
 
     def _native(self, graph, source, reduce=True):
         from frontend.auto.tiling_explorer_cloud import make_gemm_description
@@ -154,13 +183,7 @@ class Gemm:
         from frontend.model_parser import Operator, OperatorType
         m,n,k = self.problem.shape; side = self.side
         local_k, local_n = k//side, n//side
-        regions = []; tensors = []
-        for core in range(graph.cores):
-            row,col = divmod(core, side)
-            kc,nc = (row,col) if self.direction == 0 else (col,row)
-            regions.append(Region(core, self.name+'_A', 0, kc*local_k, m, local_k))
-            tensors.append(dict(shape=[m,local_k], strides=[local_k,1]))
-        inputs, names = bind_input(graph, self.name+'_A', source, regions, tensors)
+        inputs, names = bind_input(graph, self.name+'_A', source, *self.input_layout(graph.cores))
         raw = []; outputs = []
         for core in range(graph.cores):
             partial = graph.tensor(core, self.name+'_partial', [m,local_n])
@@ -169,8 +192,11 @@ class Gemm:
             tm,tn,tk = self.plan.tile
             native = make_gemm_description(op, 2, (tm,tk,tn), names[core], partial['name'], self.name+'_B')
             raw.append(expand_gemm(native, list(graph.tensors[core].values()))['execution'])
-            nc = core % side if self.direction == 0 else core//side
-            outputs.append(Region(core, result['name'], 0, nc*result['shape'][1], *result['shape']))
+            if not reduce:
+                nc = core % side if self.direction == 0 else core//side
+                outputs.append(Region(core, partial['name'], 0, nc*local_n, m, local_n))
+        if reduce:
+            outputs = [replace(r, name=result['name']) for r in self.output_layout(graph.cores)]
         graph.add(self.name, raw, dict(category='gemm', native=True, tile=self.plan.tile))
         if not reduce:
             graph.release(inputs, keep=source)

@@ -6,9 +6,9 @@ import pytest
 
 from frontend.auto.generalize import expand_gemm
 from frontend.auto.tiling_explorer_cloud import make_gemm_description
-from frontend.near_mem.cloud_compare import execute, replacement
-from frontend.near_mem.plan import Plan
-from frontend.near_mem.run import make_hardware
+from frontend.near_mem.sim import execute
+from frontend.near_mem.gemm.plan import Plan
+from frontend.near_mem.sim import make_hardware
 
 
 @pytest.mark.parametrize('tile', [(8, 16, 12), (4, 16, 12), (8, 8, 12), (8, 16, 4),
@@ -30,12 +30,6 @@ def test_native_gemm_and_general_tasks_execute_identically(tmp_path, tile, cores
     native = execute(chip, tmp_path/'native', dict(operator=[operator]), dict(tensor=tensors))
     expanded = execute(chip, tmp_path/'general', dict(operator=[general]), dict(tensor=tensors))
     assert expanded == native
-    tm, tk, tn = tile
-    adapted, manifest = replacement(operator, dict(tensor=tensors), Plan((1, 1, 1), (tm, tn, tk)),
-                                    chip, tmp_path/'adapter_tasks')
-    assert manifest['generator'] == 'shared_native_mnk'
-    assert manifest['sram_bytes'] == 4*(tm*tk+tk*tn+2*tm*tn)
-    assert execute(chip, tmp_path/'adapter', dict(operator=[adapted]), dict(tensor=tensors)) == native
 
 
 def test_generalizer_rejects_unsupported_template():
@@ -59,9 +53,9 @@ def test_upstream_worker_still_searches_after_emitter_extraction(tmp_path):
 
 @pytest.mark.parametrize('tile',[(4,4,8),(8,4,16),(4,4,16),(8,12,16)])
 def test_general_mapping_compiler_reproduces_native_mnk_without_rotation(tmp_path,tile):
-    from frontend.near_mem.compiler import compile_plan
-    from frontend.near_mem.backend import lower
-    from frontend.near_mem.plan import Problem
+    from frontend.near_mem.gemm.compiler import compile_plan
+    from frontend.near_mem.gemm.lower import lower
+    from frontend.near_mem.gemm.plan import Problem
     problem=Problem(8,12,16);plan=Plan((1,1,1),tile)
     program=compile_plan(problem,plan,131072,1<<29)
     out=tmp_path/'general';lower(program,out,64)

@@ -3,9 +3,9 @@ import json
 
 import pytest
 
-from frontend.near_mem.cloud_compare import execute
-from frontend.near_mem.backend import KEYS
-from frontend.near_mem.run import make_hardware
+from frontend.near_mem.sim import execute
+from frontend.near_mem.sim import KEYS
+from frontend.near_mem.sim import make_hardware
 
 
 @pytest.mark.parametrize('rank',[2,4])

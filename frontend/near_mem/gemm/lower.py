@@ -4,52 +4,15 @@ import hashlib
 import json
 from math import prod
 from pathlib import Path
-import re
 import subprocess
 import sys
 
-import yaml
 from frontend.auto.gemm_schedule import gemm_work
 
 from .compiler import compile_plan
+from .distribution import charge, distribute
 from .plan import Problem, Plan
-from .run import ROOT, revision
-
-
-KEYS=('matrix','vector','buffer_load','buffer_store','dram','noc_tx','noc_rx')
-
-
-def hardware(chip):
-    chip=Path(chip).resolve()
-    arch=yaml.safe_load(chip.read_text())['architecture']
-    paths=[chip]
-    for name in ('dram','noc'):
-        path=Path(arch[name]['config_path'])
-        paths.append(path if path.is_absolute() else ROOT/path)
-    org=yaml.safe_load(paths[1].read_text())['MemorySystem']['DRAM']['org']
-    density=re.match(r'HBDRAM_(\d+)(Gb|Mb)_',org['preset'])
-    if density is None:raise ValueError('An explicit HBDRAM density preset is required')
-    capacity=int(density[1])*(1024**3 if density[2]=='Gb' else 1024**2)//8*org['channel']
-    return arch,capacity,paths
-
-
-def fingerprint(chip):
-    _,_,paths=hardware(chip)
-    paths += sorted((ROOT/'frontend/near_mem').glob('*.py'))
-    paths += [ROOT/'frontend/auto'/name for name in ('tiling_explorer_cloud.py', 'generalize.py', 'gemm_schedule.py', 'collectives.py')]
-    # Content keyed: unrelated output directory paths in chip configs may reduce
-    # reuse but can never produce an unsafe cross-hardware cache hit.
-    hashes={str(p):hashlib.sha256(p.read_bytes()).hexdigest() for p in paths}
-    hashes['atlas']=revision(ROOT)
-    for folder in ('dram/ramulator2','noc/booksim2'):
-        hashes[folder]=revision(ROOT/'simulator/src'/folder)
-    for library in sorted((ROOT/'simulator/build/lib').glob('*.so')):
-        digest=hashlib.sha256(library.read_bytes()).hexdigest()
-        hashes['binary:'+library.name]=digest
-        installed=ROOT/'simulator/atlasim'/library.name
-        if installed.exists() and hashlib.sha256(installed.read_bytes()).hexdigest()!=digest:
-            raise ValueError(f'Package/build backend libraries differ: {library.name}; synchronize the build first')
-    return hashes
+from ..sim import ROOT, KEYS, hardware, fingerprint
 
 
 def lower_tasks(program, flit_size, final_ops=None):
@@ -132,11 +95,26 @@ def simulate(problem,plan,chip,out,timeout=300,overlap=True,provenance=None):
     (out/'manifest.json').write_text(json.dumps(manifest,indent=2))
     (out/'result.json').unlink(missing_ok=True)
     with (out/'simulator.log').open('w') as log:
-        subprocess.run([sys.executable,'-m','frontend.near_mem.run','--worker','--chip',str(chip),'--output',str(out)],
+        subprocess.run([sys.executable,'-m','frontend.near_mem.sim','--worker','--chip',str(chip),'--output',str(out)],
                        cwd=ROOT,stdout=log,stderr=subprocess.STDOUT,check=True,timeout=timeout)
     result=json.loads((out/'result.json').read_text())
     assert result['flop_count']==2*manifest['macs']+manifest['vector_ops']
     return dict(manifest=manifest,result=result)
+
+
+def measure(problem,plan,chip,cache,provenance):
+    """ATLAS cycles of one plan, including the single-copy input distribution."""
+    signature=dict(problem=asdict(problem),plan=asdict(plan),backend=provenance,overlap=True,inputs='single-copy')
+    key=hashlib.sha256(json.dumps(signature,sort_keys=True).encode()).hexdigest()[:24]
+    out=Path(cache)/key
+    if (out/'result.json').exists() and (out/'signature.json').exists():
+        if json.loads((out/'signature.json').read_text())==json.loads(json.dumps(signature)):
+            return dict(key=key,plan=asdict(plan),result=json.loads((out/'result.json').read_text()),path=str(out))
+    run=simulate(problem,plan,chip,out,provenance=provenance)
+    result=charge(run['result'],distribute(problem,plan,chip,out/'distribution'))
+    (out/'result.json').write_text(json.dumps(result,indent=2))
+    (out/'signature.json').write_text(json.dumps(signature,sort_keys=True))
+    return dict(key=key,plan=asdict(plan),result=result,path=str(out))
 
 
 if __name__=='__main__':

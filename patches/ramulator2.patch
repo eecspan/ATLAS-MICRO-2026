@@ -1,7 +1,7 @@
-From 6321a76d20f69e0bb974f67cbbc524a7eca26ece Mon Sep 17 00:00:00 2001
+From fee8c15d6821b2d811dd49898c894635bc2804fe Mon Sep 17 00:00:00 2001
 From: leesou <leesou@pku.edu.cn>
 Date: Thu, 9 Jul 2026 16:30:17 +0000
-Subject: [PATCH] Initial commit
+Subject: [PATCH 1/2] Initial commit
 
 ---
  CMakeLists.txt                                |  36 +-
@@ -1450,5 +1450,53 @@ index beaf83c..56d5c3b 100644
 
 base-commit: e442c64b2c0db7afd9d23173925d636ea2895a36
 -- 
-2.43.0
+2.54.0
+
+
+From b38da114e78decd38f7626d7c1165d5f03798822 Mon Sep 17 00:00:00 2001
+From: yudong <yudong@minimax.com>
+Date: Mon, 26 Oct 2026 11:27:14 +0800
+Subject: [PATCH 2/2] Count DRAM requests from the aligned start of each
+ contiguous line
+
+---
+ src/frontend/impl/hb_frontend.cpp | 14 ++++++--------
+ 1 file changed, 6 insertions(+), 8 deletions(-)
+
+diff --git a/src/frontend/impl/hb_frontend.cpp b/src/frontend/impl/hb_frontend.cpp
+index 845977e..037f561 100644
+--- a/src/frontend/impl/hb_frontend.cpp
++++ b/src/frontend/impl/hb_frontend.cpp
+@@ -158,15 +158,13 @@ public:
+             }
+ 
+             std::unordered_set<Addr_t> request_addr_set;
+-            auto emit_legacy_contiguous_line = [&](Addr_t line_start_element_offset, Addr_t line_element_count) {
++            auto emit_contiguous_line = [&](Addr_t line_start_element_offset, Addr_t line_element_count) {
++                if(line_element_count <= 0) return;
+                 Addr_t byte_addr = tile.at("base_addr") + line_start_element_offset * tile.at("element_size");
+                 Addr_t line_byte_count = line_element_count * tile.at("element_size");
+-                Addr_t aligned_addr = byte_addr;
+-                Addr_t req_count = static_cast<Addr_t>(std::ceil(line_byte_count * 1.0 / tx_bytes));
+-                if(byte_addr % tx_bytes != 0) {
+-                    aligned_addr = byte_addr - (byte_addr % tx_bytes);
+-                    req_count = 1 + static_cast<Addr_t>(std::ceil(line_byte_count * 1.0 / tx_bytes));
+-                }
++                Addr_t aligned_addr = byte_addr - (byte_addr % tx_bytes);
++                Addr_t covered_bytes = (byte_addr - aligned_addr) + line_byte_count;
++                Addr_t req_count = (covered_bytes + tx_bytes - 1) / tx_bytes;
+                 for(Addr_t idx = 0; idx < req_count; ++idx) {
+                     request_addr_set.insert(aligned_addr + idx * tx_bytes);
+                 }
+@@ -184,7 +182,7 @@ public:
+                 std::function<void(int64_t, Addr_t)> emit_line_requests =
+                     [&](int64_t dim, Addr_t element_offset) {
+                         if(dim == layout_rank) {
+-                            emit_legacy_contiguous_line(element_offset, access_extent[contiguous_dim]);
++                            emit_contiguous_line(element_offset, access_extent[contiguous_dim]);
+                             return;
+                         }
+                         if(dim == contiguous_dim) {
+-- 
+2.54.0
 

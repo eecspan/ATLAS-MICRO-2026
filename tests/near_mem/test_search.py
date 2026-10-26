@@ -1,8 +1,9 @@
 from dataclasses import replace
 
-from frontend.near_mem.plan import Plan,Problem
-from frontend.near_mem.compiler import compile_plan
-from frontend.near_mem.search import candidates,groups,resident_bytes,shortlist
+from frontend.near_mem.gemm.plan import Plan,Problem
+from frontend.near_mem.gemm.compiler import compile_plan
+from frontend.near_mem.gemm.space import candidates,family,groups,resident_bytes
+from frontend.near_mem.search import shortlist
 
 
 def test_enumerated_space_is_legal_and_keeps_major_families():
@@ -30,9 +31,27 @@ def test_no_shift_group_canonicalization_preserves_exact_ir():
 def test_shortlist_is_reproducible_and_preserves_distinct_families():
     problem=Problem(8,8,8)
     plans=list(candidates(problem,4,8192,4,'all','all'))
-    score=lambda problem,p:sum(p.tile)
-    first,count=shortlist(problem,iter(plans),score,8)
-    second,_=shortlist(problem,iter(plans),score,8)
+    score=lambda p:sum(p.tile)
+    first,count=shortlist(lambda skip:iter(plans),score,8,family)
+    second,_=shortlist(lambda skip:iter(plans),score,8,family)
     assert first==second and count==702
     assert len(first)>8  # Family retention is an explicit extra budget.
     assert any(p.c!=(1,1) for p,_ in first)
+
+
+def test_proxy_bound_pruning_is_exact(tmp_path):
+    from frontend.near_mem.gemm.space import Proxy,families,structure
+    from frontend.near_mem.methods import METHODS
+    from frontend.near_mem.search import diverse
+    from frontend.near_mem.sim import make_hardware
+    proxy=Proxy(make_hardware(tmp_path/'hw',4,64));problem=Problem(64,64,128);hw=dict(cores=4,sram=64*1024,dram=2**30,tile_min=8)
+    for m in METHODS.values():
+        space=lambda skip=None:m.space(problem,skip=skip,**hw)
+        for p in space():
+            k=proxy.kernel(problem,p)
+            assert proxy.lower(problem,p)<=k*(1+1e-9) and proxy.lower(problem,replace(p,tile=None))<=k*(1+1e-9)
+        score=lambda p:proxy(problem,p);bound=lambda q:proxy.lower(problem,q)+proxy.distribution(problem,q)
+        assert shortlist(space,score,3,family)[0]==shortlist(space,score,3,family,bound,families)[0]
+        pair=lambda p:(k:=proxy.kernel(problem,p),k+proxy.distribution(problem,p))
+        low=lambda q:(k:=proxy.lower(problem,q),k+proxy.distribution(problem,q))
+        assert diverse(space,pair,2,structure,2)[0]==diverse(space,pair,2,structure,2,low)[0]

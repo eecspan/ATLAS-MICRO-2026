@@ -7,39 +7,43 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from frontend.near_mem.attention import Attention, AttentionPlan, KVLayout, compile_attention
-from frontend.near_mem.graph import Graph, Region, transfers, unique
-from frontend.near_mem.kernels import Gemm, program_regions
-from frontend.near_mem.llm import Workload, build, configuration
-from frontend.near_mem.plan import Plan, Problem
-from frontend.near_mem.run import make_hardware
+from frontend.near_mem.model.attention import Attention, AttentionPlan, KVLayout, compile_attention
+from frontend.near_mem.tasks import Graph, Region, transfers, unique
+from frontend.near_mem.model.kernels import Gemm, program_regions
+from frontend.near_mem.model.transformer import Workload, build, configuration
+from frontend.near_mem.gemm.plan import Plan, Problem
+from frontend.near_mem.sim import make_hardware
 
 
 def replay_copy(raw, arrays):
-    """Replay emitted DRAM/NoC events at their actual native pipeline offsets."""
-    banks = {}; packets = {}; length = max(map(len,raw))
-    for time in range(length+2):
-        for core,phases in enumerate(raw):
-            if time < len(phases):
-                for task in phases[time]['dram']:
-                    if not task['is_write']:
-                        r,c = task['access_base']; h,w = task['access_extent']
-                        banks[core] = arrays[core,task['name']][r:r+h,c:c+w].copy()
-        if 0 <= time-1 < length:
-            for core,phases in enumerate(raw):
-                for task in phases[time-1]['noc_tx']:
-                    if task['name'] != 'credit':
-                        packets[task['src'],task['init_flit_id']] = banks[core].copy()
-            for core,phases in enumerate(raw):
-                for task in phases[time-1]['noc_rx']:
-                    if task['name'] != 'credit':
-                        banks[core] = packets[task['src'],task['init_flit_id']].copy()
-        if 0 <= time-2 < length:
-            for core,phases in enumerate(raw):
-                for task in phases[time-2]['dram']:
-                    if task['is_write']:
-                        r,c = task['access_base']; h,w = task['access_extent']
-                        arrays[core,task['name']][r:r+h,c:c+w] = banks[core]
+    """Replay emitted DRAM/NoC events with native slot semantics.
+
+    Slot ``s`` reads DRAM, sends/receives one stage later and writes DRAM two
+    stages later; each slot owns its read and receive buffers (pipelining).
+    """
+    read = {}; received = {}; packets = {}
+    for s, _ in enumerate(raw[0]):
+        for core, phases in enumerate(raw):
+            for task in phases[s]['dram']:
+                if not task['is_write']:
+                    r,c = task['access_base']; h,w = task['access_extent']
+                    read[core,s] = arrays[core,task['name']][r:r+h,c:c+w].copy()
+    for s, _ in enumerate(raw[0]):
+        for core, phases in enumerate(raw):
+            for task in phases[s]['noc_tx']:
+                if task['name'] != 'credit':
+                    packets[task['src'],task['init_flit_id']] = read[core,s]
+    for s, _ in enumerate(raw[0]):
+        for core, phases in enumerate(raw):
+            for task in phases[s]['noc_rx']:
+                if task['name'] != 'credit':
+                    received[core,s] = packets[task['src'],task['init_flit_id']]
+    for s, _ in enumerate(raw[0]):
+        for core, phases in enumerate(raw):
+            for task in phases[s]['dram']:
+                if task['is_write']:
+                    r,c = task['access_base']; h,w = task['access_extent']
+                    arrays[core,task['name']][r:r+h,c:c+w] = received.get((core,s), read.get((core,s)))
 
 
 @pytest.fixture
@@ -63,7 +67,8 @@ def test_actual_conversion_tasks_preserve_values_and_create_replicas(chip,source
     for r in target:
         np.testing.assert_array_equal(arrays[r.core,r.name],full[:,r.col:r.col+r.cols])
     assert graph.edges[0]['dram_write_bytes'] == sum(r.area for r in target)*2
-    assert graph.edges[0]['dram_read_bytes'] == full.size*2
+    # Every unicast reads its own panel; SRAM keeps no panel across steps.
+    assert graph.edges[0]['dram_read_bytes'] == graph.edges[0]['dram_write_bytes']
 
 
 def test_missing_producer_data_is_rejected():
@@ -111,12 +116,12 @@ def test_append_emitted_addresses_match_future_attention_reads(chip,queries,cont
     assert graph.edges[-1]['dram_write_bytes'] == 2*p.batch*queries*p.kv_heads*p.head_dim*2
 
 
-@pytest.mark.parametrize('queries,context,query_parts',[(1,19,1),(8,8,1),(8,8,2),(5,17,2)])
-def test_fused_attention_mac_coverage_bounds_and_no_history_write(chip,tmp_path,queries,context,query_parts):
+@pytest.mark.parametrize('queries,context,query_parts,kv_tile',[(1,19,1,0),(8,8,1,0),(8,8,2,0),(5,17,2,0),(5,17,1,4)])
+def test_fused_attention_mac_coverage_bounds_and_no_history_write(chip,tmp_path,queries,context,query_parts,kv_tile):
     graph = Graph(chip); p = Attention(2,queries,context,4,2,8)
     layout = KVLayout(p,4); cache = layout.allocate(graph)
     graph.tensor(0,'Q',[p.batch*queries,p.hidden]); q = [Region(0,'Q',0,0,p.batch*queries,p.hidden)]
-    plan = AttentionPlan(query_parts,1,1)
+    plan = AttentionPlan(query_parts,1,1,kv_tile)
     out = compile_attention(graph,layout,plan,q,cache)
     info = graph.operations[-1]['metadata']
     scores = p.batch*p.query_heads*sum(range(context-queries+1,context+1))
@@ -270,3 +275,32 @@ def test_incomplete_fused_pairs_are_rejected(chip):
     graph = Graph(chip)
     with pytest.raises(ValueError,match='gate/up'):
         Gemm(Problem(4,15,16),Plan((1,1,4),(2,3,4)),gated=True).prepare(graph,'invalid')
+
+
+@pytest.mark.parametrize('layers',[1,2])
+def test_edge_traffic_model_matches_built_graph(tmp_path,layers):
+    """The search's layout-edge traffic equals the DRAM writes the graph emits."""
+    from frontend.near_mem.model.transformer import decode_configuration, edge_regions, edges, port
+    from frontend.near_mem.tasks import traffic
+    chip = make_hardware(tmp_path/'hardware',16,64)
+    w = Workload(2,32,32,4,2,16,64,layers); m = w.batch*w.queries
+    names = {('row','qkv.A'):'l0_qkv_A_layout',('contract.C','qkv.A'):'l1_qkv_A_layout',
+             ('qkv.C','kv'):'l0_qkv_kv_append',('qkv.C','attention.Q'):'l0_attention_query_layout',
+             ('attention.O','output.A'):'l0_output_A_layout',('row','output.C'):'l0_attention_residual_layout',
+             ('contract.C','output.C'):'l1_attention_residual_layout',('output.C','expand.A'):'l0_expand_A_layout',
+             ('expand.C','contract.A'):'l0_contract_A_layout',('output.C','contract.C'):'l0_ffn_residual_layout',
+             ('contract.C','row'):'output_layout'}
+    for plans,attention in [({},AttentionPlan(1,1,1)),
+                            ({'qkv':Plan((16,1,1),(m//16,16,16)),'contract':Plan((4,4,1),(m//4,16,16)),
+                              'expand':Plan((2,8,1),(m//2,16,64))},AttentionPlan(2,1,4)),
+                            ({'qkv':Plan((1,16,1),(m,8,16)),'output':Plan((4,4,1),(m//4,4,16))},AttentionPlan(1,2,1))]:
+        kernels = {n:Gemm(p,plans.get(n,Plan((1,4,4),(16,16,16))),n not in plans,int(n=='expand'),n=='expand')
+                   for n,p in w.problems.items()}
+        graph = build(w,chip,configuration(kernels,attention))
+        written = {e['name']:e['dram_write_bytes'] for e in graph.edges}
+        bound,_ = decode_configuration(w,configuration(kernels,attention))
+        choice = {k:v.bind(16,graph.sram,graph.capacity) for k,v in bound.items()}; choice['attention'] = attention
+        for src,dst,alias,_ in edges(w):
+            regions = edge_regions(w,16,dst,port(w,16,src,choice.get(src.split('.')[0])),
+                                   port(w,16,dst,choice.get(dst.split('.')[0])))
+            assert 2*sum(x[1] for x in traffic(*regions,alias).values()) == written[names[src,dst]]

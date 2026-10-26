@@ -4,8 +4,8 @@ from itertools import permutations
 import numpy as np
 import pytest
 
-from frontend.near_mem.plan import Plan, Problem
-from frontend.near_mem.compiler import compile_plan
+from frontend.near_mem.gemm.plan import Plan, Problem
+from frontend.near_mem.gemm.compiler import compile_plan
 
 
 PLANS=[Plan((1,1,1),(2,2,2)),Plan((1,2,3),(2,2,2)),
@@ -49,8 +49,8 @@ def test_buffer_constraints_and_spill_endpoint_fail_closed():
 @pytest.mark.parametrize('plan',[Plan((1,4,4),(4,4,4),a=(2,2),c=(2,2)),
                                 Plan((2,4,2),(4,4,4),a=(1,4),b=(2,1),c=(2,1),loop='knm')])
 def test_general_native_backend(tmp_path,plan):
-    from frontend.near_mem.backend import simulate
-    from frontend.near_mem.run import ROOT,make_hardware
+    from frontend.near_mem.gemm.lower import simulate
+    from frontend.near_mem.sim import ROOT,make_hardware
     if not list((ROOT/'simulator/build/lib').glob('atlasim.*.so')):pytest.skip('Build ATLAS first')
     problem=Problem(16,32,32)
     chip=make_hardware(tmp_path/'hardware',16)

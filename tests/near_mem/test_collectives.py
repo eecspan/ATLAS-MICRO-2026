@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from frontend.auto.collectives import allreduce_tasks
-from frontend.near_mem.run import execute, make_hardware
+from frontend.near_mem.sim import execute, make_hardware
 
 
 def build(side, width, gated, direction):

@@ -4,14 +4,15 @@ A Region names actual per-core DRAM storage. Replication is represented by
 multiple regions, never an implicit broadcast. The allocator reuses dead
 activations; all weights and KV allocations remain live through the graph.
 """
+from collections import Counter, defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, replace
 import json
-from math import prod
+from math import isqrt, prod
 from pathlib import Path
 
-from .backend import KEYS, hardware
-from .run import execute, dump
+from .sim import KEYS, hardware, span, strides as layout
+from .sim import execute, dump
 
 
 @dataclass(frozen=True)
@@ -90,6 +91,62 @@ def transfers(source, target):
     return result
 
 
+def traffic(source, target, alias='bind', side=None):
+    """Per-core element counts ``convert`` moves: dram read/write, NoC sent/received.
+
+    With the mesh ``side``, each directed link's load is added under
+    ``('link', (a, b))`` in the sent slot, since links, not only ports, bound
+    a relayout's NoC time.
+
+    Each moved piece is read where it is sent, as ``convert`` does. Same-core pieces
+    are free when ``alias`` is ``'cover'`` and one local source region covers
+    the whole target region (the consumer reads it in place), or ``'bind'``
+    and a core's whole target comes from one local tensor at the same offsets
+    (the consumer reuses it, as ``bind_input`` does); otherwise they are a
+    local DRAM copy.
+    """
+    if alias == 'cover':
+        target = [t for t in target if not any(r.core == t.core and (x := r.intersect(t)) is not None
+                                               and x.area == t.area for r in source)]
+    pairs = transfers(source, target); load = defaultdict(lambda: [0, 0, 0, 0]); links = Counter()
+    aliased = set()
+    if alias == 'bind':
+        names = defaultdict(set)
+        for src, dst in pairs:
+            same = src.core == dst.core and (src.local_row, src.local_col) == (dst.local_row, dst.local_col)
+            names[dst.core].add(src.name if same else None)
+        aliased = {core for core, n in names.items() if len(n) == 1 and None not in n}
+    for src, dst in pairs:
+        if src.core == dst.core and dst.core in aliased:
+            continue
+        load[src.core][0] += src.area; load[dst.core][1] += src.area
+        if src.core != dst.core:
+            load[src.core][2] += src.area; load[dst.core][3] += src.area
+            for link in (route(src.core, dst.core, side) if side else ()):
+                links[link] += src.area
+    for link, area in links.items():
+        load.setdefault(('link', link), [0, 0, 0, 0])[2] = area
+    return dict(load)
+
+
+def route(src, dst, side):
+    """Directed mesh links of BookSim's X-then-Y route."""
+    (sy, sx), (dy, dx) = divmod(src, side), divmod(dst, side)
+    path = []
+    while sx != dx:
+        nx = sx+(1 if dx > sx else -1); path.append((sy*side+sx, sy*side+nx)); sx = nx
+    while sy != dy:
+        ny = sy+(1 if dy > sy else -1); path.append((sy*side+sx, ny*side+sx)); sy = ny
+    return path
+
+
+def panelize(box, limit):
+    """Split a (row, col, rows, cols) box into panels of at most limit elements."""
+    row, col, rows, cols = box; width = min(cols, limit); height = max(1, limit//width)
+    return [(row+y, col+x, min(height, rows-y), min(width, cols-x))
+            for x in range(0, cols, width) for y in range(0, rows, height)]
+
+
 class Timeline:
     """Use simulator times, hiding the native read/compute/write slot offsets."""
     def __init__(self, cores, flit_size):
@@ -165,10 +222,11 @@ class Graph:
         self.edges = []
         self.next_flit = 0
 
-    def tensor(self, core, name, shape, strides=None, dtype=2, persistent=False):
+    def tensor(self, core, name, shape, strides=None, dtype=2, persistent=False, column=False):
         if name in self.tensors[core]:
             raise ValueError(f'Duplicate physical tensor {core}/{name}')
-        size = prod(shape)*dtype
+        strides = strides or layout(shape, dtype, column)
+        size = span(shape, strides, dtype)
         address = (self.peak[core]+127)//128*128 if persistent else 0
         for start, end in sorted(self.live[core].values()):
             if address+size <= start:
@@ -176,7 +234,7 @@ class Graph:
             address = max(address, (end+127)//128*128)
         if address+size > self.capacity:
             raise ValueError(f'Per-core DRAM capacity exceeded on core {core}')
-        tensor = dict(name=name, shape=list(shape), strides=strides or [shape[1], 1],
+        tensor = dict(name=name, shape=list(shape), strides=list(strides),
                       element_size=dtype, base_addr=address)
         self.tensors[core][name] = tensor
         self.live[core][name] = (address, address+size)
@@ -193,23 +251,24 @@ class Graph:
         return Timeline(self.cores, self.flit)
 
     def add(self, name, raw, metadata=None, kind='mpmd-general', operator=None):
-        # Core/src is part of BookSim's identity; still use disjoint ranges
-        # across operators, including native collectives and extended kernels.
-        raw = deepcopy(raw)
-        largest = -1
-        def packets(obj):
+        """Append one operator, renumbering its flits into a graph-unique range.
+
+        Core/src is part of BookSim's identity; operators, including native
+        collectives and extended kernels, still use disjoint ranges. Only
+        packet dictionaries are copied; other tasks are shared, read-only.
+        """
+        largest = -1; offset = self.next_flit
+        def copy(obj):
+            nonlocal largest
             if isinstance(obj, dict):
                 if 'init_flit_id' in obj:
-                    yield obj
-                else:
-                    for value in obj.values():
-                        yield from packets(value)
-            elif isinstance(obj, list):
-                for value in obj:
-                    yield from packets(value)
-        for packet in packets(raw):
-            largest = max(largest, packet['init_flit_id']+packet['flit_num']-1)
-            packet['init_flit_id'] += self.next_flit
+                    largest = max(largest, obj['init_flit_id']+obj['flit_num']-1)
+                    return dict(obj, init_flit_id=obj['init_flit_id']+offset)
+                return {k: copy(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [copy(v) for v in obj]
+            return obj
+        raw = copy(raw)
         self.next_flit += largest+1
         if self.next_flit >= 2**31:
             raise ValueError('Native flit identifier overflow')
@@ -218,49 +277,96 @@ class Graph:
     def add_timeline(self, name, timeline, **metadata):
         self.add(name, timeline.finish(), dict(timeline.counts, **metadata))
 
+    def allgather(self, name, groups):
+        """ATLAS-style linear all-gather: first along mesh rows, then columns.
+
+        Each group lists the replicas of one block on a mesh sub-grid. Replica
+        (r, c) initially owns slab r*C+c of the block. As in ATLAS's Q
+        all-gather, slabs move hop by hop in both directions, one per link and
+        step; each step is cut into SRAM-bounded panels. All groups run together.
+        """
+        side = isqrt(self.cores); timeline = self.timeline()
+        load = Counter(r.core for g in groups for r in g)
+        limit = max(1, self.sram//(16*max(load.values(), default=1)))
+        phases = ([], [])
+        for group in groups:
+            grid = {divmod(r.core, side): r for r in group}
+            rows = sorted({y for y, _ in grid}); cols = sorted({x for _, x in grid})
+            if len(grid) != len(group) or len(grid) != len(rows)*len(cols):
+                raise ValueError('Replica group is not a mesh sub-grid')
+            first = group[0]; axis = int(first.rows < first.cols)
+            length = (first.rows, first.cols)[axis]; n, width = len(group), len(cols)
+            bound = [length*i//n for i in range(n+1)]
+            def slab(lo, hi):
+                return ((first.row+lo, first.col, hi-lo, first.cols) if axis == 0 else
+                        (first.row, first.col+lo, first.rows, hi-lo))
+            for i, y in enumerate(rows):
+                phases[0].append(([grid[y, x] for x in cols],
+                                  [slab(bound[i*width+j], bound[i*width+j+1]) for j in range(width)]))
+            # A one-column group has no row phase; let its column lines start at once.
+            for j, x in enumerate(cols):
+                phases[int(width > 1)].append(([grid[y, x] for y in rows],
+                                  [slab(bound[i*width], bound[(i+1)*width]) for i in range(len(rows))]))
+        start = 0
+        for lines in phases:
+            end = start
+            for members, slabs in lines:
+                if len(members) < 2:
+                    continue
+                panels = [panelize(box, limit) for box in slabs]
+                count = max(map(len, panels))
+                for origin, src in enumerate(members):
+                    for q, box in enumerate(panels[origin]):
+                        timeline.memory(start+q, src.crop(*box))
+                        for direction in (1, -1):
+                            prev = src
+                            for hop in range(1, len(members)):
+                                j = origin+direction*hop
+                                if not 0 <= j < len(members):
+                                    break
+                                t = start+1+(hop-1)*count+q
+                                timeline.send(t, prev.core, members[j].core, box[2]*box[3]*2)
+                                timeline.memory(t+1, members[j].crop(*box), True)
+                                prev = members[j]; end = max(end, t+2)
+            start = end
+        self.add_timeline(name, timeline, category='distribution', groups=len(groups))
+        self.edges.append(dict(name=name, **timeline.counts, aliased=False))
+
     def convert(self, name, source, target):
+        """Relayout: every target element is read once from its nearest source copy.
+
+        Transfers are cut into SRAM-bounded panels and pipelined like the
+        linear all-gather: read, send and write of successive panels overlap,
+        and each core sends at most one and receives at most one panel per
+        step, so a step costs one panel on every port. Each unicast is placed
+        at the earliest step where both ends are free and reads its panel
+        from DRAM itself (DRAM is far faster than one NoC port; SRAM keeps no
+        panel across steps).
+        """
         pairs = transfers(source, target)
-        timeline = self.timeline()
-        pending = []
+        timeline = self.timeline(); limit = max(1, self.sram//16)
+        moves = []
         for src, dst in pairs:
             if src.core == dst.core and src.name == dst.name and (src.local_row, src.local_col) == (dst.local_row, dst.local_col):
                 continue
-            # One send/receive panel per endpoint; bound even very wide rows.
-            max_elements = self.sram//8
-            for c in range(0, src.cols, max_elements):
-                width = min(max_elements, src.cols-c)
-                height = max(1, max_elements//width)
-                for r in range(0, src.rows, height):
-                    box = (src.row+r, src.col+c, min(height, src.rows-r), width)
-                    pending.append((src.crop(*box), dst.crop(*box)))
-        # Multicast through ordinary unicasts: retain one source panel and read
-        # DRAM once when several consumers need the identical physical window.
-        groups = {}
-        for src,dst in pending:
-            groups.setdefault(src,[]).append(dst)
-        pending = list(groups.items())
-        step = 0
-        while pending:
-            used = set(); rest = []
-            for src,destinations in pending:
-                endpoints = {src.core, *(dst.core for dst in destinations)}
-                if used & endpoints:
-                    rest.append((src,destinations)); continue
-                used.update(endpoints)
-                timeline.memory(step,src)
-                for dst in destinations:
-                    if src.core != dst.core:
-                        timeline.send(step+1,dst.core,src.core,1,credit=True)
-                        timeline.send(step+2,src.core,dst.core,src.area*2)
-                    timeline.memory(step+3,dst,True)
-            pending = rest; step += 4
-        if step:
+            for box in panelize((src.row, src.col, src.rows, src.cols), limit):
+                moves.append((src.crop(*box), dst.crop(*box)))
+        sending = defaultdict(set); receiving = defaultdict(set)
+        for src, dst in moves:
+            step = 0
+            while step in sending[src.core] or step in receiving[dst.core]:
+                step += 1
+            sending[src.core].add(step); receiving[dst.core].add(step)
+            timeline.memory(step, src)
+            timeline.send(step+1, src.core, dst.core, src.area*2)
+            timeline.memory(step+2, dst, True)
+        if moves:
             self.add_timeline(name, timeline, category='layout', regions=len(pairs))
-        record = dict(name=name, **timeline.counts, aliased=not step)
+        record = dict(name=name, **timeline.counts, aliased=not moves)
         self.edges.append(record)
         return target
 
-    def simulate(self, out, cache=None, config_key=None):
+    def simulate(self, out, cache=None, config_key=None, timeout=7200):
         out = Path(out).resolve(); out.mkdir(parents=True, exist_ok=True)
         operators = []
         for i, entry in enumerate(self.operations):
@@ -279,13 +385,13 @@ class Graph:
         placement = dict(core_tensor=[dict(core_id=i, tensor=list(t.values())) for i,t in enumerate(self.tensors)])
         dump(out/'operators.yaml',dict(operator=operators)); dump(out/'placement.yaml',placement)
         if cache is None:
-            result = execute(self.chip,out,dict(operator=operators),placement)
+            result = execute(self.chip,out,dict(operator=operators),placement,timeout)
         else:
-            from .execution import task_digest
+            from .cache import task_digest
             digest = task_digest(out,self.cores)
             result,source = cache.get(digest,config_key)
             if result is None:
-                result = execute(self.chip,out,dict(operator=operators),placement)
+                result = execute(self.chip,out,dict(operator=operators),placement,timeout)
             else:
                 dump(out/'result.json',result)
             cache.put(digest,out,source)

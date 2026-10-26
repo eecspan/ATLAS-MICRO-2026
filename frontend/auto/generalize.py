@@ -5,8 +5,6 @@ iteration overlap, including DRAM request order; it does not add transfers,
 barriers, output materialization or timing formulas. New schedules should be
 checked against this reference before attributing differences to search space.
 """
-from copy import deepcopy
-
 
 COMPONENTS = ('matrix', 'vector', 'buffer_load', 'buffer_store', 'dram', 'noc_tx', 'noc_rx')
 
@@ -20,7 +18,9 @@ def expand_gemm(operator, tensors):
     execution = operator['execution']
     if set(execution) - set(COMPONENTS) or execution.get('noc_tx') or execution.get('noc_rx'):
         raise ValueError('Unexpected native component or communication task')
-    raw = [{key: deepcopy(execution.get(key, [])) if key not in ('dram', 'noc_tx', 'noc_rx') else []
+    # Matrix/vector/buffer tasks are identical every iteration and never
+    # mutated downstream; iterations share them (lists are per iteration).
+    raw = [{key: list(execution.get(key, [])) if key not in ('dram', 'noc_tx', 'noc_rx') else []
             for key in COMPONENTS} for _ in range(count)]
     by_name = {t['name']: t for t in tensors}
     # The native C++ GEMM path inserts matrix/vector/buffer at sim iter r+1.
@@ -33,8 +33,7 @@ def expand_gemm(operator, tensors):
             slot = iteration - (2 if task['is_write'] else 0)
             if not 0 <= slot < count:
                 raise ValueError('DRAM event cannot be represented at the same native iteration')
-            item = deepcopy(task)
-            item.update(access_base=list(base), access_stride_add=[1]*len(base),
+            item = dict(task, access_base=list(base), access_stride_add=[1]*len(base),
                         access_offset_add=[0]*len(base), init_iter=0, stride_iter=1, total_iter=1)
             raw[slot]['dram'].append(item)
             accesses += 1

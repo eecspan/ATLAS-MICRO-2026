@@ -4,8 +4,8 @@ import json
 from pathlib import Path
 from threading import Lock
 
-from .backend import hardware
-from .run import ROOT, dump
+from .sim import hardware
+from .sim import ROOT, dump
 
 
 def configuration_key(signature):

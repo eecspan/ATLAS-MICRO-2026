@@ -4,8 +4,8 @@ from itertools import permutations, product
 import numpy as np
 import pytest
 
-from frontend.near_mem.plan import Plan, Problem
-from frontend.near_mem.ownership import Ownership
+from frontend.near_mem.gemm.plan import Plan, Problem
+from frontend.near_mem.gemm.ownership import Ownership
 
 
 def pairs(n):

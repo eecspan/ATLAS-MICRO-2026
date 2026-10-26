@@ -11,6 +11,7 @@ from copy import deepcopy
 from .ownership import Ownership
 from .plan import DEPENDENCIES
 from .program import Program
+from ..sim import span, strides
 
 
 def compile_plan(problem, plan, sram_bytes, dram_bytes, overlap=True):
@@ -44,8 +45,8 @@ def compile_plan(problem, plan, sram_bytes, dram_bytes, overlap=True):
             shape_order=[shape[i] for i in order];tile_order=[tile_shapes[v][i] for i in order]
             addr=(addr+127)//128*128
             t=dict(name=v,base_addr=addr,element_size=problem.dtype_bytes)
-            t.update(shape=shape,strides=([1,shape[0]] if v=='B' else [shape[1],1]))
-            tensors.append(t);addr+=prod(shape)*problem.dtype_bytes
+            t.update(shape=shape,strides=strides(shape,problem.dtype_bytes,v=='B'))
+            tensors.append(t);addr+=span(shape,t['strides'],problem.dtype_bytes)
             maps[v]=(axis_blocks,shape,order)
         if addr>dram_bytes:raise ValueError('Aligned DRAM placement exceeds capacity')
         placements.append(dict(core_id=core,tensor=tensors));address_maps.append(maps)

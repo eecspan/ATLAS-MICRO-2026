@@ -3,15 +3,15 @@ from copy import deepcopy
 from dataclasses import asdict
 import json
 
-from frontend.near_mem.attention import AttentionPlan
-from frontend.near_mem.backend import fingerprint
-from frontend.near_mem.execution import ExecutionCache, configuration_key, task_digest
-from frontend.near_mem.graph import Graph, Region
-from frontend.near_mem.kernels import Gemm
-from frontend.near_mem.experiment import Experiment
-from frontend.near_mem.llm import Workload, build, configuration
-from frontend.near_mem.plan import Plan
-from frontend.near_mem.run import make_hardware
+from frontend.near_mem.model.attention import AttentionPlan
+from frontend.near_mem.sim import fingerprint
+from frontend.near_mem.cache import ExecutionCache, configuration_key, task_digest
+from frontend.near_mem.tasks import Graph, Region
+from frontend.near_mem.model.kernels import Gemm
+from frontend.near_mem.experiments.transformer import Experiment
+from frontend.near_mem.model.transformer import Workload, build, configuration
+from frontend.near_mem.gemm.plan import Plan
+from frontend.near_mem.sim import make_hardware
 
 
 def copy_graph(chip, extra=0):
@@ -25,7 +25,7 @@ def copy_graph(chip, extra=0):
 
 
 def test_cache_checks_generated_tasks_and_backend_not_only_source(tmp_path,monkeypatch):
-    import frontend.near_mem.graph as graph_module
+    import frontend.near_mem.tasks as graph_module
     chip = make_hardware(tmp_path/'hardware',4)
     provenance = fingerprint(chip)
     signature = dict(workload={},configuration={},sha256=provenance)

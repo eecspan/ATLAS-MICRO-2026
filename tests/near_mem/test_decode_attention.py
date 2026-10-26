@@ -7,7 +7,7 @@ import pytest
 from frontend.auto.system import _build_dattn_input_payload
 from frontend.auto.tiling_explorer_cloud import generate_attention_comp, generate_kv_proj_comm, generate_q_proj_comm
 from frontend.model_parser import Operator, OperatorType
-from frontend.near_mem.run import execute, make_hardware
+from frontend.near_mem.sim import execute, make_hardware
 from frontend.util import generate_context_slot_mapping
 
 

@@ -11,12 +11,12 @@ from pathlib import Path
 
 import yaml
 
-from .attention import Attention, AttentionPlan, KVLayout, compile_attention
-from .backend import hardware
-from .graph import Graph, Region
+from .attention import Attention, AttentionPlan, KVLayout, compile_attention, endpoints
+from ..sim import hardware
+from ..tasks import Graph, Region
 from .kernels import Gemm, pointwise, residual, rmsnorm
-from .native import matrix_placement
-from .plan import Plan, Problem
+from ..gemm.native import matrix_placement, tuning_cache
+from ..gemm.plan import Plan, Problem
 
 
 @dataclass(frozen=True)
@@ -57,14 +57,55 @@ def decode_configuration(workload, data):
     return kernels,AttentionPlan(**data['attention'])
 
 
+def row_regions(cores, name, rows, width):
+    """Unique contiguous row shards: the graph's input and output layout."""
+    return [Region(core,name,rows*core//cores,0,rows*(core+1)//cores-rows*core//cores,width)
+            for core in range(cores) if rows*(core+1)//cores > rows*core//cores]
+
+
 def row_layout(graph, name, rows, width):
-    result = []
-    for core in range(graph.cores):
-        start = rows*core//graph.cores; end = rows*(core+1)//graph.cores
-        if end > start:
-            graph.tensor(core,name,[end-start,width])
-            result.append(Region(core,name,start,0,end-start,width))
+    result = row_regions(graph.cores, name, rows, width)
+    for r in result:
+        graph.tensor(r.core,name,[r.rows,width])
     return result
+
+
+def port(workload, cores, name, choice=None):
+    """Logical layout of one operator boundary; ``choice`` is its bound Gemm or AttentionPlan."""
+    p = workload.attention
+    if name == 'row':
+        return row_regions(cores, 'row', p.batch*p.queries, p.hidden)
+    if name == 'kv':
+        return KVLayout(p, cores).regions()
+    op, end = name.split('.')
+    if op == 'attention':
+        return endpoints(KVLayout(p, cores), choice)[end == 'O']
+    return choice.input_layout(cores)[0] if end == 'A' else choice.output_layout(cores)
+
+
+def edges(workload):
+    """Layout conversions ``build`` performs: ``(source, target, alias, count)``.
+
+    Ports are ``op.A``/``op.C`` of a GEMM, ``attention.Q``/``attention.O``,
+    the row-sharded graph input/output ``row`` and the KV cache ``kv``.
+    ``alias`` is the ``tasks.traffic`` rule for same-core pieces; ``count``
+    is how many layers repeat the edge.
+    """
+    n = workload.layers; later = n-1
+    result = [('row', 'qkv.A', 'bind', 1), ('qkv.C', 'kv', 'none', n), ('qkv.C', 'attention.Q', 'cover', n),
+              ('attention.O', 'output.A', 'bind', n), ('row', 'output.C', 'none', 1),
+              ('output.C', 'expand.A', 'bind', n), ('expand.C', 'contract.A', 'bind', n),
+              ('output.C', 'contract.C', 'none', n), ('contract.C', 'row', 'none', 1)]
+    if later:
+        result += [('contract.C', 'qkv.A', 'bind', later), ('contract.C', 'output.C', 'none', later)]
+    return result
+
+
+def edge_regions(workload, cores, target, source, destination):
+    """(source, target) regions of an edge; the KV append moves only new K/V columns."""
+    if target == 'kv':
+        return KVLayout(workload.attention, cores).appended(source, destination)
+    return source, destination
 
 
 def build(workload, chip, config):
@@ -133,9 +174,10 @@ def tune_native(workload, chip, out, workers=4):
             raise ValueError('Native K/N shape must divide mesh side')
         local = (m,n//side,k//side)
         a,b,c = matrix_placement(local,2,capacity)['tensor']
-        op = Operator(name=name,op_type=OperatorType.GEMM,B=1,M=m,N=local[1],K=local[2])
+        # Named by local shape, so standalone GEMM tuning shares the cache.
+        op = Operator(name='gemm_{}_{}_{}'.format(*local),op_type=OperatorType.GEMM,B=1,M=m,N=local[1],K=local[2])
         best = explore_gemm_comp(a,c,[b],op,2,load_chip_config_from_yaml(cfg),str(tuning),
-                                8,512,8,workers,str(out/name))
+                                8,512,8,workers,str(out/name),str(tuning_cache(chip)))
         if best is None:
             raise ValueError('Native tile domain has no SRAM-feasible point')
         tm,tk,tn = best['tiling_factors']
