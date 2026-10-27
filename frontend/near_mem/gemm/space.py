@@ -121,10 +121,11 @@ class Proxy:
         """Standalone score: the kernel plus single-copy input replication."""
         return self.kernel(problem,p)+self.distribution(problem,p)
 
-    def edge(self,load,dtype=2):
-        """Score of a relayout from ``tasks.traffic``: its busiest core's DRAM or NoC port."""
+    def edge(self,phases,dtype=2):
+        """Score of a relayout from ``tasks.traffic``: per phase, its busiest DRAM or NoC port or link."""
         flit=self.arch['noc']['flit_size']
-        return max((max((r+w)*dtype/self.dram_bw,s*dtype/flit,x*dtype/flit) for r,w,s,x in load.values()),default=0)
+        return sum(max((max((r+w)*dtype/self.dram_bw,s*dtype/flit,x*dtype/flit) for r,w,s,x in load.values()),default=0)
+                   for load in phases)
 
     def distribution(self,problem,p):
         # Initial single-copy distribution: each replica receives (r-1)/r.

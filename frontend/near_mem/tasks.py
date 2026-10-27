@@ -92,33 +92,32 @@ def transfers(source, target):
 
 
 def traffic(source, target, alias='bind', side=None):
-    """Per-core element counts ``convert`` moves: dram read/write, NoC sent/received.
+    """Per-phase, per-core element counts ``convert`` moves: dram read/write, NoC sent/received.
 
-    With the mesh ``side``, each directed link's load is added under
-    ``('link', (a, b))`` in the sent slot, since links, not only ports, bound
-    a relayout's NoC time.
+    The first phase is the unicast scatter; with the mesh ``side``, each
+    directed link's load is added under ``('link', (a, b))`` in the sent
+    slot. Then come the hops of the row and column phases of the replica
+    all-gather, whose line schedule keeps every link at one slab per hop.
 
-    Each moved piece is read where it is sent, as ``convert`` does. Same-core pieces
-    are free when ``alias`` is ``'cover'`` and one local source region covers
-    the whole target region (the consumer reads it in place), or ``'bind'``
-    and a core's whole target comes from one local tensor at the same offsets
-    (the consumer reuses it, as ``bind_input`` does); otherwise they are a
-    local DRAM copy.
+    Same-core pieces are free when ``alias`` is ``'cover'`` and one local
+    source region covers the whole target region (the consumer reads it in
+    place), or ``'bind'`` and a core's whole target comes from one local
+    tensor at the same offsets (the consumer reuses it, as ``bind_input``
+    does); otherwise they are a local DRAM copy.
     """
     if alias == 'cover':
         target = [t for t in target if not any(r.core == t.core and (x := r.intersect(t)) is not None
                                                and x.area == t.area for r in source)]
-    pairs = transfers(source, target); load = defaultdict(lambda: [0, 0, 0, 0]); links = Counter()
     aliased = set()
     if alias == 'bind':
         names = defaultdict(set)
-        for src, dst in pairs:
+        for src, dst in transfers(source, target):
             same = src.core == dst.core and (src.local_row, src.local_col) == (dst.local_row, dst.local_col)
             names[dst.core].add(src.name if same else None)
         aliased = {core for core, n in names.items() if len(n) == 1 and None not in n}
+    pairs, groups = conversion(source, [t for t in target if t.core not in aliased], side)
+    load = defaultdict(lambda: [0, 0, 0, 0]); links = Counter()
     for src, dst in pairs:
-        if src.core == dst.core and dst.core in aliased:
-            continue
         load[src.core][0] += src.area; load[dst.core][1] += src.area
         if src.core != dst.core:
             load[src.core][2] += src.area; load[dst.core][3] += src.area
@@ -126,7 +125,83 @@ def traffic(source, target, alias='bind', side=None):
                 links[link] += src.area
     for link, area in links.items():
         load.setdefault(('link', link), [0, 0, 0, 0])[2] = area
-    return dict(load)
+    phases = [dict(load)]
+    for lines in gather_lines(groups, side):
+        # Lockstep hops: at hop t member j receives the slabs of j-t and j+t.
+        for hop in range(1, max((len(m) for m, _ in lines), default=1)):
+            load = defaultdict(lambda: [0, 0, 0, 0])
+            for members, slabs in lines:
+                areas = [box[2]*box[3] for box in slabs]
+                for j, member in enumerate(members):
+                    got = sum(areas[i] for i in (j-hop, j+hop) if 0 <= i < len(members))
+                    load[member.core] = [x+y for x, y in zip(load[member.core],
+                                                             (areas[j]*(hop == 1), got, got, got))]
+            phases.append(dict(load))
+    return phases
+
+
+def subgrid(group, side):
+    """``(grid, rows, cols)`` when the regions sit on a full mesh sub-grid, else None."""
+    grid = {divmod(r.core, side): r for r in group}
+    rows = sorted({y for y, _ in grid}); cols = sorted({x for _, x in grid})
+    return (grid, rows, cols) if len(grid) == len(group) == len(rows)*len(cols) else None
+
+
+def gather_lines(groups, side):
+    """Row and column phases of the ATLAS linear all-gather: ``[(members, slabs)]`` each.
+
+    Each group lists the replicas of one block on a mesh sub-grid. Replica
+    (r, c) initially owns slab r*C+c; the row phase completes each row's
+    slabs, the column phase the block. A one-column group has no row phase,
+    so its column lines run in the first phase.
+    """
+    phases = ([], [])
+    for group in groups:
+        found = subgrid(group, side)
+        if found is None:
+            raise ValueError('Replica group is not a mesh sub-grid')
+        grid, rows, cols = found
+        first = group[0]; axis = int(first.rows < first.cols)
+        length = (first.rows, first.cols)[axis]; n, width = len(group), len(cols)
+        bound = [length*i//n for i in range(n+1)]
+        def slab(lo, hi):
+            return ((first.row+lo, first.col, hi-lo, first.cols) if axis == 0 else
+                    (first.row, first.col+lo, first.rows, hi-lo))
+        if width > 1:
+            for i, y in enumerate(rows):
+                phases[0].append(([grid[y, x] for x in cols],
+                                  [slab(bound[i*width+j], bound[i*width+j+1]) for j in range(width)]))
+        for x in cols if len(rows) > 1 else ():
+            phases[int(width > 1)].append(([grid[y, x] for y in rows],
+                                           [slab(bound[i*width], bound[(i+1)*width]) for i in range(len(rows))]))
+    return phases
+
+
+def conversion(source, target, side):
+    """Plan of a relayout: unicast ``(source, target)`` pairs and replica groups.
+
+    A target its core cannot fill from local copies is a replica when other
+    such targets hold the same block on a mesh sub-grid. Like the native
+    collectives, each block then crosses the NoC once: every replica receives
+    one slab by unicast and the linear all-gather completes the block. All
+    other targets are unicast from their nearest copy.
+    """
+    pairs = []; pending = defaultdict(list); groups = []
+    for t in target:
+        own = transfers(source, [t])
+        if all(s.core == t.core for s, _ in own):
+            pairs += own
+        else:
+            pending[t.row, t.col, t.rows, t.cols].append(t)
+    for members in pending.values():
+        if len(members) > 1 and side and subgrid(members, side) and max(members[0].rows, members[0].cols) >= len(members):
+            groups.append(members)
+        else:
+            pairs += transfers(source, members)
+    for lines in gather_lines(groups, side)[:1]:
+        for members, slabs in lines:
+            pairs += transfers(source, [m.crop(*box) for m, box in zip(members, slabs)])
+    return pairs, groups
 
 
 def route(src, dst, side):
@@ -276,42 +351,19 @@ class Graph:
     def add_timeline(self, name, timeline, **metadata):
         self.add(name, timeline.finish(), dict(timeline.counts, **metadata))
 
-    def allgather(self, name, groups):
-        """ATLAS-style linear all-gather: first along mesh rows, then columns.
+    def gather(self, timeline, groups, start=0):
+        """Emit the linear all-gather of replica ``groups`` from step ``start``.
 
-        Each group lists the replicas of one block on a mesh sub-grid. Replica
-        (r, c) initially owns slab r*C+c of the block. As in ATLAS's Q
-        all-gather, slabs move hop by hop in both directions, one per link and
-        step; each step is cut into SRAM-bounded panels. All groups run together.
+        As in ATLAS's Q all-gather, slabs move hop by hop in both directions,
+        one per link and step, cut into SRAM-bounded panels shared by the
+        groups on a core; all lines of a phase run together. Returns the
+        first free step.
         """
-        side = isqrt(self.cores); timeline = self.timeline()
         load = Counter(r.core for g in groups for r in g)
         limit = max(1, self.sram//(16*max(load.values(), default=1)))
-        phases = ([], [])
-        for group in groups:
-            grid = {divmod(r.core, side): r for r in group}
-            rows = sorted({y for y, _ in grid}); cols = sorted({x for _, x in grid})
-            if len(grid) != len(group) or len(grid) != len(rows)*len(cols):
-                raise ValueError('Replica group is not a mesh sub-grid')
-            first = group[0]; axis = int(first.rows < first.cols)
-            length = (first.rows, first.cols)[axis]; n, width = len(group), len(cols)
-            bound = [length*i//n for i in range(n+1)]
-            def slab(lo, hi):
-                return ((first.row+lo, first.col, hi-lo, first.cols) if axis == 0 else
-                        (first.row, first.col+lo, first.rows, hi-lo))
-            for i, y in enumerate(rows):
-                phases[0].append(([grid[y, x] for x in cols],
-                                  [slab(bound[i*width+j], bound[i*width+j+1]) for j in range(width)]))
-            # A one-column group has no row phase; let its column lines start at once.
-            for j, x in enumerate(cols):
-                phases[int(width > 1)].append(([grid[y, x] for y in rows],
-                                  [slab(bound[i*width], bound[(i+1)*width]) for i in range(len(rows))]))
-        start = 0
-        for lines in phases:
+        for lines in gather_lines(groups, isqrt(self.cores)):
             end = start
             for members, slabs in lines:
-                if len(members) < 2:
-                    continue
                 panels = [panelize(box, limit) for box in slabs]
                 count = max(map(len, panels))
                 for origin, src in enumerate(members):
@@ -328,41 +380,47 @@ class Graph:
                                 timeline.memory(t+1, members[j].crop(*box), True)
                                 prev = members[j]; end = max(end, t+2)
             start = end
+        return start
+
+    def allgather(self, name, groups):
+        """ATLAS-style linear all-gather of replica ``groups``, rows then columns."""
+        timeline = self.timeline()
+        self.gather(timeline, groups)
         self.add_timeline(name, timeline, category='distribution', groups=len(groups))
         self.edges.append(dict(name=name, **timeline.counts, aliased=False))
 
     def convert(self, name, source, target):
-        """Relayout: every target element is read once from its nearest source copy.
+        """Relayout ``source`` into ``target`` as planned by ``conversion``.
 
-        Transfers are cut into SRAM-bounded panels and pipelined like the
-        linear all-gather: read, send and write of successive panels overlap,
-        and each core sends at most one and receives at most one panel per
-        step, so a step costs one panel on every port. Each unicast is placed
-        at the earliest step where both ends are free and reads its panel
-        from DRAM itself (DRAM is far faster than one NoC port; SRAM keeps no
-        panel across steps).
+        Unicasts are cut into SRAM-bounded panels and pipelined: read, send
+        and write of successive panels overlap. Each panel is placed at the
+        earliest step where its sender, its receiver and every mesh link on
+        its X-Y route are free, so a step carries at most one panel per port
+        and link; it reads its panel from DRAM itself (SRAM keeps no panel
+        across steps). Replicas then complete by the linear all-gather.
         """
-        pairs = transfers(source, target)
+        side = isqrt(self.cores)
+        pairs, groups = conversion(source, target, side)
         timeline = self.timeline(); limit = max(1, self.sram//16)
-        moves = []
+        busy = defaultdict(set); end = 0
         for src, dst in pairs:
             if src.core == dst.core and src.name == dst.name and (src.local_row, src.local_col) == (dst.local_row, dst.local_col):
                 continue
+            uses = [('tx', src.core), ('rx', dst.core), *route(src.core, dst.core, side)]
             for box in panelize((src.row, src.col, src.rows, src.cols), limit):
-                moves.append((src.crop(*box), dst.crop(*box)))
-        sending = defaultdict(set); receiving = defaultdict(set)
-        for src, dst in moves:
-            step = 0
-            while step in sending[src.core] or step in receiving[dst.core]:
-                step += 1
-            sending[src.core].add(step); receiving[dst.core].add(step)
-            timeline.memory(step, src)
-            timeline.send(step+1, src.core, dst.core, src.area*2)
-            timeline.memory(step+2, dst, True)
-        if moves:
-            self.add_timeline(name, timeline, category='layout', regions=len(pairs))
-        record = dict(name=name, **timeline.counts, aliased=not moves)
-        self.edges.append(record)
+                step = 0
+                while any(step in busy[u] for u in uses):
+                    step += 1
+                for u in uses:
+                    busy[u].add(step)
+                timeline.memory(step, src.crop(*box))
+                timeline.send(step+1, src.core, dst.core, box[2]*box[3]*2)
+                timeline.memory(step+2, dst.crop(*box), True); end = max(end, step+3)
+        end = self.gather(timeline, groups, end)
+        moved = bool(end)
+        if moved:
+            self.add_timeline(name, timeline, category='layout', regions=len(pairs), groups=len(groups))
+        self.edges.append(dict(name=name, **timeline.counts, aliased=not moved))
         return target
 
     def simulate(self, out, timeout=7200):

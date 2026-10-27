@@ -1,18 +1,17 @@
-"""Fixed-workload Transformer: the ATLAS native graph against each method.
+"""One steady-state Transformer layer: the ATLAS native graph against one method.
 
-The ATLAS incumbent uses native fixed K/N GEMMs with exhaustive native tiles,
-its original Q/KV/FFN collectives and the best native fused-attention split.
-Weights are stored once for every method: an M split must rotate B.
-
-Each method chooses all operators jointly. Its options per operator are the
-native kernel plus its own proxy proposals; every option is simulated alone
-with inputs in place, and every layout conversion between adjacent choices is
-scored from its busiest port or mesh link. Beam search over this chain
-proposes the best few distinct complete graphs, which are simulated whole.
-The chain score misses overlap between operators, so a short coordinate
-descent then tries, per decision, its few best standalone options. Methods
-run in registry order, starting from the best graph so far, so a method can
-only improve on those it includes.
+Every graph is chosen the same way. Each operator has a few options (for the
+ATLAS incumbent: the native GEMMs and native fused-attention splits; for a
+method: those plus the method's proxy proposals). Every option is simulated
+alone with its inputs in place, and every layout conversion between adjacent
+choices is scored from its busiest port or mesh link. Beam search over this
+chain proposes the ``keep`` best complete graphs, which are simulated whole.
+The chain score misses overlap between operators, so a coordinate descent
+then simulates, in parallel, every graph that changes one decision to one of
+its few best standalone options, keeps the best, and repeats up to
+``passes`` times while it improves. Weights are stored once for every method:
+an M split must rotate B. Each run searches one method; compare methods by
+separate runs.
 """
 import argparse
 from copy import deepcopy
@@ -20,7 +19,6 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
 import hashlib
 import json
-from itertools import permutations
 from math import isqrt
 from pathlib import Path
 import time
@@ -96,15 +94,16 @@ def set_attention(cfg, plan):
 
 
 def descend(exp, start, neighbours, label, passes, workers):
-    """Whole-graph coordinate descent: try ``neighbours[name]`` for one decision at a time."""
+    """Coordinate descent over whole graphs; ``neighbours(best)`` gives each decision's alternatives."""
     best = start
     for sweep in range(passes):
-        before = best['key']
-        for name, choices in neighbours.items():
-            edit = set_attention if name == 'attention' else set_kernel(name)
-            best = exp.best_of(best, variants(best['configuration'], edit, choices), f'{label}_{sweep}_{name}', workers)
-        if before == best['key']:
+        configs = [cfg for name, choices in neighbours(best).items()
+                   for cfg in variants(best['configuration'], set_attention if name == 'attention' else set_kernel(name),
+                                       choices)]
+        candidate = exp.best_of(best, configs, f'{label}_descent{sweep}', workers)
+        if candidate['key'] == best['key']:
             break
+        best = candidate
     return best
 
 
@@ -182,60 +181,44 @@ class Chain:
 
     def search(self, options, width, keep):
         """The ``keep`` best distinct complete assignments ``{operator: choice}`` by joint proxy."""
-        graph_edges = [(s, d, alias, count, s.split('.')[0], d.split('.')[0])
-                       for s, d, alias, count in edges(self.exp.workload)]
+        graph_edges = [(s, d, alias, s.split('.')[0], d.split('.')[0]) for s, d, alias in edges(self.exp.workload)]
         def cost(name, index, partial):
             chosen = {**{o: options[o][i] for o, i in partial.items()}, name: options[name][index]}
-            pick = lambda o: None if o in ('row', 'kv') else chosen.get(o, False)
+            pick = lambda o: None if o == 'kv' else chosen.get(o, False)
             value = self.cycles[name, token(chosen[name])]
             # Charge each edge once, when its later endpoint is chosen.
-            for src, dst, alias, count, a, b in graph_edges:
+            for src, dst, alias, a, b in graph_edges:
                 if name in (a, b) and pick(a) is not False and pick(b) is not False:
-                    value += count*self.edge(src, dst, alias, pick(a), pick(b))
+                    value += self.edge(src, dst, alias, pick(a), pick(b))
             return value
         ranked = beam([(name, range(len(choices))) for name, choices in options.items()], cost, width, keep)
         return [(score, {name: options[name][i] for name, i in chosen.items()}) for score, chosen in ranked]
 
-    def neighbours(self, options, best, count):
-        """Per decision, the ``count`` options of lowest standalone cycles other than ``best``'s."""
-        return {name: sorted((c for c in choices if token(c) != token(best[name])),
-                             key=lambda c: self.cycles[name, token(c)])[:count]
-                for name, choices in options.items()}
+    def neighbours(self, options, count):
+        """``row -> {decision: alternatives}``: per decision, the ``count`` options of
+        lowest standalone cycles other than the one ``row`` uses."""
+        def alternatives(row):
+            cfg = row['configuration']
+            current = {**cfg['kernels'], 'attention': AttentionPlan(**cfg['attention'])}
+            return {name: sorted((c for c in choices if token(c) != token(current[name])),
+                                 key=lambda c: self.cycles[name, token(c)])[:count]
+                    for name, choices in options.items()}
+        return alternatives
+
+    def propose(self, options, width, keep):
+        """Measure the options alone; the ``keep`` best complete graphs of the chain as configurations."""
+        options = self.prepare(options)
+        proposals = self.search(options, width, keep)
+        configs = [dict(kernels={k: c[k] for k in self.exp.workload.problems}, attention=asdict(c['attention']))
+                   for _, c in proposals]
+        return options, proposals, configs
 
 
-def matched_control(exp, best, workers):
-    """The winning spatial/tile choices without any rotation, six loops retuned.
-
-    Separates the gain of temporal rotation from that of the spatial/tile
-    choices it was found with. Returns None when removing rotation would
-    exceed a capacity (no impossible control is timed).
-    """
-    config = deepcopy(best['configuration']); rotated = []
-    kernels, _ = decode_configuration(exp.workload, config)
-    for name, value in config['kernels'].items():
-        plan = kernels[name].plan
-        if not value['native'] and plan.layers:
-            if plan.ps[0] > 1:  # without B rotation an M split would replicate the weights
-                dump(exp.out/'matched_control_infeasible.json', dict(reason=f'{name}: weights would be replicated'))
-                return None
-            rotated.append(name)
-            value['plan'] = asdict(replace(plan, a=(1, 1), b=(1, 1), c=(1, 1), group=(1, 1, 1), layer_order=(), panel=None))
-    config['attention'].update(query_parts=1, context_parts=1)
-    try:
-        control = exp.measure(config, 'matched_local')
-        for name in rotated:
-            loop = lambda cfg, order: cfg['kernels'][name]['plan'].update(loop=''.join(order))
-            control = exp.best_of(control, variants(control['configuration'], loop, permutations('mnk')),
-                                  'matched_local_'+name, workers)
-        return control
-    except ValueError as error:
-        if 'capacity' not in str(error) and 'SRAM' not in str(error):
-            raise
-        dump(exp.out/'matched_control_infeasible.json', dict(reason=str(error), configuration=config))
-        return None
+ORDER = ('qkv', 'attention', 'output', 'expand', 'contract')
 
 
-def run(workload, chip, out, budget=4, workers=4, tile_min=16, passes=1, width=64, keep=8, tiles=2, refine=3):
+def run(workload, chip, out, method='ours', budget=4, workers=4, tile_min=16, passes=2, width=64, keep=8, tiles=2,
+        refine=3):
     exp = Experiment(workload, chip, out); started = time.monotonic()
     kernels = tune_native(workload, chip, exp.out/'native_tuning', workers)
     # Weights are preplaced once, like the native TP shards; replicating them
@@ -244,51 +227,41 @@ def run(workload, chip, out, budget=4, workers=4, tile_min=16, passes=1, width=6
     native_attention = list(attention_plans(layout, hw['sram'], False))
     if not native_attention:
         raise ValueError('No SRAM-feasible attention plan')
-    atlas = min(exp.measure_many([configuration(kernels, p) for p in native_attention], 'atlas', workers), key=cycles)
-    native = atlas['configuration']['kernels']
+    native = configuration(kernels, native_attention[0])['kernels']
+    proxy = Proxy(chip); chain = Chain(exp, hw, proxy, workers); joint = {}
+
+    def choose(label, options, incumbent=None):
+        options, proposals, configs = chain.propose({k: options[k] for k in ORDER}, width, keep)
+        rows = exp.measure_many(configs, label+'_joint', workers)
+        best = min([*([incumbent] if incumbent else []), *rows], key=cycles)
+        joint[label] = [dict(score=score, configuration=cfg) for (score, _), cfg in zip(proposals, configs)]
+        return descend(exp, best, chain.neighbours(options, refine), label, passes, workers)
+
+    # The ATLAS incumbent is chosen like any method, over native options only.
+    atlas = choose('atlas', {**{k: [native[k]] for k in workload.problems}, 'attention': native_attention})
 
     # Graph inputs arrive through layout edges whose cost depends on the
     # neighbours. Rank by the kernel alone and, in the same scan, by kernel plus
     # single-copy distribution, so plans that need no input replication (the
     # ones that make edges cheap) are always proposed too.
-    proxy = Proxy(chip); ranked = {}; report = {}
+    report = {}; names = (*METHODS[method].includes, method)
+    options = {'attention': list(dict.fromkeys(native_attention+[p for m in names
+                                                                 for p in METHODS[m].attention(layout, hw['sram'])]))}
     for name, problem in workload.problems.items():
         score = lambda p: (k := proxy.kernel(problem, p), k+proxy.distribution(problem, p))
         bound = lambda q: (k := proxy.lower(problem, q), k+proxy.distribution(problem, q))
-        ranked[name], scanned = propose(problem, hw, lambda space: diverse(space, score, budget, structure, tiles, bound))
-        report[name] = dict(scanned=scanned, chosen={k: [asdict(p) for p, _ in v] for k, v in ranked[name].items()})
-
-    chain = Chain(exp, hw, proxy, workers); winners = {}; incumbent = atlas; joint = {}
-    for name, method in METHODS.items():
-        options = {k: [native[k]]+[dict(native[k], plan=asdict(p), native=False) for p in union(ranked[k], name)]
-                   for k in ('qkv', 'output', 'expand', 'contract')}
-        options['attention'] = native_attention+method.attention(layout, hw['sram'])
-        options = chain.prepare({k: options[k] for k in ('qkv', 'attention', 'output', 'expand', 'contract')})
-        proposals = chain.search(options, width, keep)
-        configs = [dict(kernels={k: choice[k] for k in workload.problems}, attention=asdict(choice['attention']))
-                   for _, choice in proposals]
-        incumbent = exp.best_of(incumbent, configs, name+'_joint', workers)
-        joint[name] = [dict(score=score, configuration=cfg) for (score, _), cfg in zip(proposals, configs)]
-        # The chain score misses overlap between operators; a short local
-        # descent over each decision's few best standalone options repairs it.
-        current = {**incumbent['configuration']['kernels'], 'attention': AttentionPlan(**incumbent['configuration']['attention'])}
-        neighbours = chain.neighbours(options, current, refine)
-        incumbent = descend(exp, incumbent, neighbours, name, passes, workers)
-        winners[name] = incumbent
+        ranked, scanned = propose(problem, hw, lambda space: diverse(space, score, budget, structure, tiles, bound),
+                                  method)
+        options[name] = [native[name]]+[dict(native[name], plan=asdict(p), native=False) for p in union(ranked, method)]
+        report[name] = dict(scanned=scanned, chosen={k: [asdict(p) for p, _ in v] for k, v in ranked.items()})
+    best = choose(method, options, atlas)
     dump(exp.out/'search.json', dict(gemm=report, joint=joint, budget=budget, tiles=tiles, passes=passes, width=width,
                                       keep=keep, refine=refine))
-    control = matched_control(exp, winners['ours'], workers)
-    if control is not None:
-        # The control lies in the local space; let it improve every method that contains local.
-        for name in winners:
-            winners[name] = min(winners[name], control, key=cycles)
-    summary = dict(workload=asdict(workload), chip=str(Path(chip).resolve()), atlas=atlas, **winners,
-                   matched_local=control,
-                   speedup={k: cycles(atlas)/cycles(v) for k, v in winners.items()},
-                   rotation_gain=cycles(winners['local'])/cycles(winners['ours']),
+    summary = dict(workload=asdict(workload), chip=str(Path(chip).resolve()), method=method, atlas=atlas, best=best,
+                   speedup=cycles(atlas)/cycles(best),
                    seconds=time.monotonic()-started, sha256=exp.provenance)
     dump(exp.out/'summary.json', summary)
-    print(json.dumps({k: summary[k] for k in ('speedup', 'rotation_gain', 'seconds')}, indent=2), flush=True)
+    print(json.dumps({k: summary[k] for k in ('method', 'speedup', 'seconds')}, indent=2), flush=True)
     return summary
 
 
@@ -296,17 +269,18 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--chip', required=True, type=Path); parser.add_argument('--output', required=True, type=Path)
     parser.add_argument('--mode', choices=('prefill', 'decode'), default='prefill')
+    parser.add_argument('--method', choices=list(METHODS), default='ours')
     for name, value in [('batch', 1), ('context', 128), ('query-heads', 8), ('kv-heads', 2), ('head-dim', 64),
-                        ('ffn', 1536), ('layers', 1), ('budget', 4), ('workers', 4), ('tile-min', 16), ('passes', 2),
+                        ('ffn', 1536), ('budget', 4), ('workers', 4), ('tile-min', 16), ('passes', 2),
                         ('width', 64), ('keep', 8), ('tiles', 2), ('refine', 3)]:
         parser.add_argument('--'+name, type=int, default=value)
     a = parser.parse_args()
-    if min(a.batch, a.context, a.query_heads, a.kv_heads, a.head_dim, a.ffn, a.layers, a.budget, a.workers,
+    if min(a.batch, a.context, a.query_heads, a.kv_heads, a.head_dim, a.ffn, a.budget, a.workers,
            a.tile_min, a.width, a.keep, a.tiles) < 1 or min(a.passes, a.refine) < 0:
         parser.error('Counts must be positive')
     workload = Workload(a.batch, a.context if a.mode == 'prefill' else 1, a.context, a.query_heads, a.kv_heads,
-                        a.head_dim, a.ffn, a.layers)
-    run(workload, a.chip, a.output, a.budget, a.workers, a.tile_min, a.passes, a.width, a.keep, a.tiles, a.refine)
+                        a.head_dim, a.ffn)
+    run(workload, a.chip, a.output, a.method, a.budget, a.workers, a.tile_min, a.passes, a.width, a.keep, a.tiles, a.refine)
 
 
 if __name__ == '__main__':

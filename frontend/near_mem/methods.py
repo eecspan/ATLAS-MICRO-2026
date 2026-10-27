@@ -3,13 +3,13 @@
 A method is a named mapping space over the same compiler and simulator.
 Hardware, input accounting, lowering and measurement are shared, so methods
 differ only in what they may choose. ``space`` yields the plans a method adds;
-``includes`` lists every smaller method whose candidates it also keeps, so
-nested comparisons (atlas ⊂ local ⊂ ours) hold by construction. A new baseline
-(e.g. ELK/T10 or FlashGEMM) is one more entry with its own ``space``.
+``includes`` lists every smaller method whose space it contains, so the
+spaces nest (atlas ⊂ local ⊂ ours) by construction. Each experiment runs one
+method on its own; comparing methods means running each separately. A new
+baseline (e.g. ELK/T10 or FlashGEMM) is one more entry with its own ``space``.
 
 The original ATLAS compiler is the common incumbent of every method. It is
-tuned exhaustively by ``gemm.native`` and the native attention plans, outside
-this registry.
+tuned by ``gemm.native`` and the native attention plans, outside this registry.
 """
 from dataclasses import dataclass
 
@@ -51,14 +51,14 @@ def target(chip, tile_min=16, tile_policy='powers', layer_policy='elk'):
                 tile_min=tile_min, tile_policy=tile_policy, layer_policy=layer_policy)
 
 
-def propose(problem, hw, pick):
-    """Each method's own ranked proposals.
+def propose(problem, hw, pick, name):
+    """Ranked proposals of method ``name`` and of every method it includes.
 
     ``pick`` maps a space ``skip -> plans`` to ``([(plan, score)], scanned)``,
-    as ``search.shortlist`` does. Returns the lists and the plans scored per method.
+    as ``search.shortlist`` does. Returns the lists and the plans scored, per method.
     """
     ranked = {}; scanned = {}
-    for m in METHODS.values():
+    for m in (METHODS[x] for x in (*METHODS[name].includes, name)):
         ranked[m.name], scanned[m.name] = pick(lambda skip=None, m=m: m.space(problem, skip=skip, **hw))
     return ranked, scanned
 

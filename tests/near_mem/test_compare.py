@@ -18,8 +18,7 @@ def test_complete_standalone_comparison_contains_native_and_nests_spaces(tmp_pat
     chip=make_hardware(tmp_path/'hardware',4,8)
     out=tmp_path/'compare'
     summary=run(Problem(8,8,16),chip,out,budget=2,workers=2,tile_min=4,layer_policy='all')
-    assert summary['speedup']['local']>=1 and summary['speedup']['ours']>=summary['speedup']['local']
-    assert summary['rotation_gain']>=1
+    assert summary['method']=='ours' and summary['speedup']>=1
     plans=[as_plan(r['plan']) for r in json.loads((out/'results.json').read_text())]
     assert as_plan(summary['atlas']['plan']) in plans
     assert any(p.b!=(1,1) for p in plans)
@@ -31,9 +30,10 @@ def test_attention_comparison_nests_native_splits(tmp_path):
     from frontend.near_mem.experiments.attention import run as attention
     from frontend.near_mem.model.attention import Attention
     chip=make_hardware(tmp_path/'hardware',4,64)
-    summary=attention(Attention(2,32,32,4,2,16),chip,tmp_path/'attention',2)
-    assert summary['plans']['atlas']<=summary['plans']['local']<summary['plans']['ours']
-    assert summary['speedup']['ours']>=summary['speedup']['local']==1
+    local=attention(Attention(2,32,32,4,2,16),chip,tmp_path/'local','local',2)
+    ours=attention(Attention(2,32,32,4,2,16),chip,tmp_path/'ours','ours',2)
+    assert local['plans']['atlas']==local['plans']['method']<ours['plans']['method']
+    assert local['speedup']==1 and ours['speedup']>=1
 
 
 def test_single_weight_copy_requires_b_rotation_for_m_splits():

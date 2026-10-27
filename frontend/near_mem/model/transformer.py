@@ -1,8 +1,11 @@
-"""Fixed-workload Transformer graphs, evaluated entirely by native ATLAS.
+"""One steady-state Transformer layer, evaluated entirely by native ATLAS.
 
 The original GEMM/Q/KV/FFN collectives remain a real incumbent. Shared additions
 are statically sharded KV, causal prefill, fused attention, RMSNorm/residual/RoPE,
-and explicit layout edges. Measurement and search live in ``experiment.py``.
+and explicit layout edges. Every layer uses the same plan, so the layer input
+is the previous layer's FFN output in that plan's ``contract`` layout; one
+simulated layer therefore stands for any layer of the model, including the
+relayout between layers. Measurement and search live in ``experiments``.
 """
 from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
@@ -25,7 +28,6 @@ class Workload:
     kv_heads: int = 2
     head_dim: int = 64
     ffn: int = 1536
-    layers: int = 1
     rope: bool = True
 
     @property
@@ -54,24 +56,20 @@ def decode_configuration(workload, data):
     return kernels,AttentionPlan(**data['attention'])
 
 
-def row_regions(cores, name, rows, width):
-    """Unique contiguous row shards: the graph's input and output layout."""
-    return [Region(core,name,rows*core//cores,0,rows*(core+1)//cores-rows*core//cores,width)
-            for core in range(cores) if rows*(core+1)//cores > rows*core//cores]
-
-
-def row_layout(graph, name, rows, width):
-    result = row_regions(graph.cores, name, rows, width)
-    for r in result:
-        graph.tensor(r.core,name,[r.rows,width])
-    return result
+def materialize(graph, name, regions):
+    """Per-core tensors holding ``regions`` at their local offsets (renamed to ``name``)."""
+    extent = {}
+    for r in regions:
+        rows, cols = extent.get(r.core, (0, 0))
+        extent[r.core] = max(rows, r.local_row+r.rows), max(cols, r.local_col+r.cols)
+    for core, shape in sorted(extent.items()):
+        graph.tensor(core, name, list(shape))
+    return [replace(r, name=name) for r in regions]
 
 
 def port(workload, cores, name, choice=None):
     """Logical layout of one operator boundary; ``choice`` is its bound Gemm or AttentionPlan."""
     p = workload.attention
-    if name == 'row':
-        return row_regions(cores, 'row', p.batch*p.queries, p.hidden)
     if name == 'kv':
         return KVLayout(p, cores).regions()
     op, end = name.split('.')
@@ -81,21 +79,15 @@ def port(workload, cores, name, choice=None):
 
 
 def edges(workload):
-    """Layout conversions ``build`` performs: ``(source, target, alias, count)``.
+    """Layout conversions ``build`` performs: ``(source, target, alias)``.
 
     Ports are ``op.A``/``op.C`` of a GEMM, ``attention.Q``/``attention.O``,
-    the row-sharded graph input/output ``row`` and the KV cache ``kv``.
-    ``alias`` is the ``tasks.traffic`` rule for same-core pieces; ``count``
-    is how many layers repeat the edge.
+    and the KV cache ``kv``. The layer input is ``contract.C`` of the previous
+    layer. ``alias`` is the ``tasks.traffic`` rule for same-core pieces.
     """
-    n = workload.layers; later = n-1
-    result = [('row', 'qkv.A', 'bind', 1), ('qkv.C', 'kv', 'none', n), ('qkv.C', 'attention.Q', 'cover', n),
-              ('attention.O', 'output.A', 'bind', n), ('row', 'output.C', 'none', 1),
-              ('output.C', 'expand.A', 'bind', n), ('expand.C', 'contract.A', 'bind', n),
-              ('output.C', 'contract.C', 'none', n), ('contract.C', 'row', 'none', 1)]
-    if later:
-        result += [('contract.C', 'qkv.A', 'bind', later), ('contract.C', 'output.C', 'none', later)]
-    return result
+    return [('contract.C', 'qkv.A', 'bind'), ('qkv.C', 'kv', 'none'), ('qkv.C', 'attention.Q', 'cover'),
+            ('attention.O', 'output.A', 'bind'), ('contract.C', 'output.C', 'none'),
+            ('output.C', 'expand.A', 'bind'), ('expand.C', 'contract.A', 'bind'), ('output.C', 'contract.C', 'none')]
 
 
 def edge_regions(workload, cores, target, source, destination):
@@ -106,55 +98,55 @@ def edge_regions(workload, cores, target, source, destination):
 
 
 def build(workload, chip, config):
-    if workload.layers < 1 or workload.ffn < 1:
-        raise ValueError('Positive layer count and FFN width required')
+    if workload.ffn < 1:
+        raise ValueError('Positive FFN width required')
     graph = Graph(chip); p = workload.attention
     if workload.rope and p.head_dim % 2:
         raise ValueError('RoPE requires an even head dimension')
-    selected, attention_plan = decode_configuration(workload,config)
+    kernels, attention_plan = decode_configuration(workload,config)
     layout = KVLayout(p,graph.cores)
-    layers = []
-    for layer in range(workload.layers):
-        kernels = {name:deepcopy(selected[name]).prepare(graph,f'l{layer}_{name}') for name in workload.problems}
-        cache = layout.allocate(graph,f'l{layer}_kv')
-        layers.append((kernels,cache))
+    kernels = {name:kernels[name].prepare(graph,name) for name in workload.problems}
+    cache = layout.allocate(graph,'kv')
     rows = workload.batch*workload.queries
-    value = row_layout(graph,'input',rows,p.hidden)
-    for layer,(kernels,cache) in enumerate(layers):
-        prefix = f'l{layer}_'
-        normalized = rmsnorm(graph,prefix+'norm_attention',value,rows,p.hidden)
-        query,temporary = kernels['qkv'].qkv(graph,normalized,layout,cache,rope=workload.rope)
-        graph.release(normalized)
-        if workload.rope:
-            new_keys = []
-            for r in cache:
-                request = r.row//p.context
-                start = max(r.row,request*p.context+p.context-p.queries)
-                end = min(r.row+r.rows,(request+1)*p.context)
-                if start < end:
-                    new_keys.append(r.crop(start,r.col,end-start,p.head_dim))
-            pointwise(graph,prefix+'rope_k',new_keys,6)
-        attended = compile_attention(graph,layout,attention_plan,query,cache,prefix+'attention')
-        graph.release(temporary)
-        projected = kernels['output'].compile(graph,attended)
-        graph.release(attended)
-        projected = residual(graph,prefix+'attention_residual',projected,value)
-        graph.release(value,keep=projected); value = projected
-        normalized = rmsnorm(graph,prefix+'norm_ffn',value,rows,p.hidden)
-        expanded = kernels['expand'].compile(graph,normalized)
-        graph.release(normalized)
-        contracted = kernels['contract'].compile(graph,expanded)
-        graph.release(expanded)
-        contracted = residual(graph,prefix+'ffn_residual',contracted,value)
-        graph.release(value,keep=contracted); value = contracted
-    target = row_layout(graph,'output',rows,p.hidden)
-    graph.convert('output_layout',value,target)
-    graph.release(value,keep=target)
+    # Steady state: the input is the previous layer's output, in this plan's contract layout.
+    value = materialize(graph,'input',kernels['contract'].output_layout(graph.cores))
+    normalized = rmsnorm(graph,'norm_attention',value,rows,p.hidden)
+    query,temporary = kernels['qkv'].qkv(graph,normalized,layout,cache,rope=workload.rope)
+    graph.release(normalized)
+    if workload.rope:
+        new_keys = []
+        for r in cache:
+            request = r.row//p.context
+            start = max(r.row,request*p.context+p.context-p.queries)
+            end = min(r.row+r.rows,(request+1)*p.context)
+            if start < end:
+                new_keys.append(r.crop(start,r.col,end-start,p.head_dim))
+        pointwise(graph,'rope_k',new_keys,6)
+    attended = compile_attention(graph,layout,attention_plan,query,cache,'attention')
+    graph.release(temporary)
+    projected = kernels['output'].compile(graph,attended)
+    graph.release(attended)
+    projected = residual(graph,'attention_residual',projected,value)
+    graph.release(value,keep=projected); value = projected
+    normalized = rmsnorm(graph,'norm_ffn',value,rows,p.hidden)
+    expanded = kernels['expand'].compile(graph,normalized)
+    graph.release(normalized)
+    contracted = kernels['contract'].compile(graph,expanded)
+    graph.release(expanded)
+    contracted = residual(graph,'ffn_residual',contracted,value)
+    graph.release(value,keep=contracted)
     return graph
 
 
 def tune_native(workload, chip, out, workers=4):
-    """Native K/N-grid kernels with the best native tile of each local shape."""
+    """Native K/N-grid kernels with the best native tile of each local shape.
+
+    Fixed TP axes: each all-reduce leaves its output where the next GEMM reads
+    it. Upstream splits QKV's K over mesh rows, so its layer input (the FFN
+    output, split over columns) needs a transpose that upstream never pays;
+    QKV uses the matching axis instead. ATLAS's packed single-KV-head
+    protocol only supports the upstream axis.
+    """
     arch,_,_ = hardware(chip); side = isqrt(arch['core_num'])
     if side*side != arch['core_num'] or side % 2:
         raise ValueError('Native cloud baseline needs an even square mesh')
@@ -164,5 +156,6 @@ def tune_native(workload, chip, out, workers=4):
         if n % side or k % side:
             raise ValueError('Native K/N shape must divide mesh side')
         tm,tk,tn = best_tile((m,n//side,k//side),chip,out/name,workers)['tiling_factors']
-        kernels[name] = Gemm(problem,Plan((1,side,side),(tm,tn,tk)),True,int(name=='expand'),name=='expand')
+        direction = dict(expand=1, qkv=int(workload.kv_heads > 1)).get(name, 0)
+        kernels[name] = Gemm(problem,Plan((1,side,side),(tm,tn,tk)),True,direction,name=='expand')
     return kernels

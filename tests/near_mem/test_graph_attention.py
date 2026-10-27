@@ -18,30 +18,30 @@ from frontend.near_mem.sim import make_hardware
 def replay_copy(raw, arrays):
     """Replay emitted DRAM/NoC events with native slot semantics.
 
-    Slot ``s`` reads DRAM, sends/receives one stage later and writes DRAM two
-    stages later; each slot owns its read and receive buffers (pipelining).
+    In slot ``s`` a core reads DRAM, sends and receives, and writes what it
+    received (or, for a local copy, what it read). A send without a read in
+    the same slot forwards, in order, what the core received from the
+    neighbour on the opposite side, as the linear all-gather does.
     """
-    read = {}; received = {}; packets = {}
+    from collections import defaultdict, deque
+    queues = defaultdict(deque); packets = {}
+    def window(task):
+        (r,c),(h,w) = task['access_base'],task['access_extent']
+        return np.s_[r:r+h,c:c+w]
     for s, _ in enumerate(raw[0]):
-        for core, phases in enumerate(raw):
-            for task in phases[s]['dram']:
-                if not task['is_write']:
-                    r,c = task['access_base']; h,w = task['access_extent']
-                    read[core,s] = arrays[core,task['name']][r:r+h,c:c+w].copy()
-    for s, _ in enumerate(raw[0]):
+        read = {core:[arrays[core,t['name']][window(t)].copy() for t in phases[s]['dram'] if not t['is_write']]
+                for core, phases in enumerate(raw)}
         for core, phases in enumerate(raw):
             for task in phases[s]['noc_tx']:
-                packets[task['src'],task['init_flit_id']] = read[core,s]
-    for s, _ in enumerate(raw[0]):
+                data = read[core][0] if read[core] else queues[core, 2*core-task['dst']].popleft()
+                packets[task['src'],task['init_flit_id']] = data
         for core, phases in enumerate(raw):
-            for task in phases[s]['noc_rx']:
-                received[core,s] = packets[task['src'],task['init_flit_id']]
-    for s, _ in enumerate(raw[0]):
-        for core, phases in enumerate(raw):
-            for task in phases[s]['dram']:
-                if task['is_write']:
-                    r,c = task['access_base']; h,w = task['access_extent']
-                    arrays[core,task['name']][r:r+h,c:c+w] = received.get((core,s), read.get((core,s)))
+            received = [packets[t['src'],t['init_flit_id']] for t in phases[s]['noc_rx']]
+            for t in phases[s]['noc_rx']:
+                queues[core, t['src']].append(packets[t['src'],t['init_flit_id']])
+            writes = [t for t in phases[s]['dram'] if t['is_write']]
+            for task, data in zip(writes, received or read[core]):
+                arrays[core,task['name']][window(task)] = data
 
 
 @pytest.fixture
@@ -145,9 +145,9 @@ def test_capacity_and_storage_reuse_are_enforced(chip):
         graph.tensor(0,'huge',[graph.capacity,2])
 
 
-@pytest.mark.parametrize('queries,context,layers',[(8,8,1),(1,17,1),(4,4,2)])
-def test_native_and_full_space_transformer_graphs_execute(chip,tmp_path,queries,context,layers):
-    workload = Workload(1,queries,context,2,1,16,64,layers)
+@pytest.mark.parametrize('queries,context',[(8,8),(1,17),(4,4)])
+def test_native_and_full_space_transformer_graphs_execute(chip,tmp_path,queries,context):
+    workload = Workload(1,queries,context,2,1,16,64)
     native = {name:Gemm(p,Plan((1,2,2),(min(4,queries),8,min(16,p.k//2))),True,int(name=='expand'),name=='expand')
               for name,p in workload.problems.items()}
     baseline = configuration(native,AttentionPlan(1,1,1))
@@ -165,7 +165,7 @@ def test_native_and_full_space_transformer_graphs_execute(chip,tmp_path,queries,
         assert all(n <= graph.capacity for n in graph.peak)
         macs = sum(task['mac_count'] for op in graph.operations if op['kind']=='mpmd-general'
                    for core in op['raw'] for phase in core for task in phase['matrix'])
-        expected = layers*(sum(p.m*p.n*p.k for p in workload.problems.values())
+        expected = (sum(p.m*p.n*p.k for p in workload.problems.values())
                            +2*workload.query_heads*workload.head_dim*sum(range(context-queries+1,context+1)))
         assert macs == expected
         for op in graph.operations:
@@ -275,19 +275,16 @@ def test_incomplete_fused_pairs_are_rejected(chip):
         Gemm(Problem(4,15,16),Plan((1,1,4),(2,3,4)),gated=True).prepare(graph,'invalid')
 
 
-@pytest.mark.parametrize('layers',[1,2])
-def test_edge_traffic_model_matches_built_graph(tmp_path,layers):
+def test_edge_traffic_model_matches_built_graph(tmp_path):
     """The search's layout-edge traffic equals the DRAM writes the graph emits."""
     from frontend.near_mem.model.transformer import decode_configuration, edge_regions, edges, port
     from frontend.near_mem.tasks import traffic
     chip = make_hardware(tmp_path/'hardware',16,64)
-    w = Workload(2,32,32,4,2,16,64,layers); m = w.batch*w.queries
-    names = {('row','qkv.A'):'l0_qkv_A_layout',('contract.C','qkv.A'):'l1_qkv_A_layout',
-             ('qkv.C','kv'):'l0_qkv_kv_append',('qkv.C','attention.Q'):'l0_attention_query_layout',
-             ('attention.O','output.A'):'l0_output_A_layout',('row','output.C'):'l0_attention_residual_layout',
-             ('contract.C','output.C'):'l1_attention_residual_layout',('output.C','expand.A'):'l0_expand_A_layout',
-             ('expand.C','contract.A'):'l0_contract_A_layout',('output.C','contract.C'):'l0_ffn_residual_layout',
-             ('contract.C','row'):'output_layout'}
+    w = Workload(2,32,32,4,2,16,64); m = w.batch*w.queries
+    names = {('contract.C','qkv.A'):'qkv_A_layout',('qkv.C','kv'):'qkv_kv_append',
+             ('qkv.C','attention.Q'):'attention_query_layout',('attention.O','output.A'):'output_A_layout',
+             ('contract.C','output.C'):'attention_residual_layout',('output.C','expand.A'):'expand_A_layout',
+             ('expand.C','contract.A'):'contract_A_layout',('output.C','contract.C'):'ffn_residual_layout'}
     for plans,attention in [({},AttentionPlan(1,1,1)),
                             ({'qkv':Plan((16,1,1),(m//16,16,16)),'contract':Plan((4,4,1),(m//4,16,16)),
                               'expand':Plan((2,8,1),(m//2,16,64))},AttentionPlan(2,1,4)),
@@ -298,7 +295,7 @@ def test_edge_traffic_model_matches_built_graph(tmp_path,layers):
         written = {e['name']:e['dram_write_bytes'] for e in graph.edges}
         bound,_ = decode_configuration(w,configuration(kernels,attention))
         choice = {k:v.bind(16,graph.sram,graph.capacity) for k,v in bound.items()}; choice['attention'] = attention
-        for src,dst,alias,_ in edges(w):
+        for src,dst,alias in edges(w):
             regions = edge_regions(w,16,dst,port(w,16,src,choice.get(src.split('.')[0])),
                                    port(w,16,dst,choice.get(dst.split('.')[0])))
-            assert 2*sum(x[1] for x in traffic(*regions,alias).values()) == written[names[src,dst]]
+            assert 2*sum(x[1] for load in traffic(*regions,alias) for x in load.values()) == written[names[src,dst]]

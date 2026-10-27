@@ -50,35 +50,35 @@ def operators(result, kinds=None):
 def gemm(folder):
     s = json.loads((folder/'summary.json').read_text())
     row = dict(shape=[s['problem'][x] for x in 'mnk'], chip=chip_name(s['chip']))
-    for name in ('atlas', 'ours'):
-        r = s[name]['result']; kernel = r['kernel_cycles']
+    for name, key in (('atlas', 'atlas'), ('ours', 'best')):
+        r = s[key]['result']; kernel = r['kernel_cycles']
         row[name] = dict(total=r['e2e_cycles'], kernel=kernel, replication=r['distribution_cycles'],
                          replication_share=r['distribution_cycles']/r['e2e_cycles'],
                          mac_busy_in_kernel=min(r['matrix_cycles'], kernel)/kernel,
                          noc_busy_in_kernel=min(r['noc_cycles'], kernel)/kernel,
-                         input_footprint=replicated_bytes(s['problem'], s[name]['plan']),
-                         plan={k: s[name]['plan'][k] for k in ('ps', 'tile', 'a', 'b', 'c', 'loop')})
-    row['speedup'] = s['speedup']['ours']
+                         input_footprint=replicated_bytes(s['problem'], s[key]['plan']),
+                         plan={k: s[key]['plan'][k] for k in ('ps', 'tile', 'a', 'b', 'c', 'loop')})
+    row['speedup'] = s['speedup']
     return row
 
 
 def attention(folder):
-    s = json.loads((folder/'summary.json').read_text()); row = dict(problem=s['problem'], speedup=s['speedup']['ours'])
-    for name in ('atlas', 'ours'):
-        r = s[name]['result']
-        row[name] = dict(plan=s[name]['plan'], **breakdown(r['e2e_cycles'], operators(r)))
+    s = json.loads((folder/'summary.json').read_text()); row = dict(problem=s['problem'], speedup=s['speedup'])
+    for name, key in (('atlas', 'atlas'), ('ours', 'best')):
+        r = s[key]['result']
+        row[name] = dict(plan=s[key]['plan'], **breakdown(r['e2e_cycles'], operators(r)))
     return row
 
 
 def transformer(folder):
     s = json.loads((folder/'summary.json').read_text())
-    row = dict(workload=s['workload'], chip=chip_name(s['chip']), speedup=s['speedup']['ours'])
-    for name in ('atlas', 'ours'):
-        path = Path(s[name]['path']); r = json.loads((path/'result.json').read_text())
+    row = dict(workload=s['workload'], chip=chip_name(s['chip']), speedup=s['speedup'])
+    for name, key in (('atlas', 'atlas'), ('ours', 'best')):
+        path = Path(s[key]['path']); r = json.loads((path/'result.json').read_text())
         kinds = {o['name']: o['metadata'].get('category', 'other')
                  for o in json.loads((path/'graph.json').read_text())['operators']}
-        row[name] = dict(breakdown(r['e2e_cycles'], operators(r, kinds)), layout_noc_bytes=s[name]['layout_noc_bytes'],
-                         peak_dram_bytes=s[name]['peak_dram_bytes'])
+        row[name] = dict(breakdown(r['e2e_cycles'], operators(r, kinds)), layout_noc_bytes=s[key]['layout_noc_bytes'],
+                         peak_dram_bytes=s[key]['peak_dram_bytes'])
     return row
 
 
