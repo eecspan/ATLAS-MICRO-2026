@@ -31,7 +31,7 @@ from ..model.kernels import Gemm
 from ..model.transformer import (Workload, build, configuration, decode_configuration, edge_regions, edges,
                                  port, tune_native)
 from ..search import beam, diverse
-from ..sim import dump, fingerprint
+from ..sim import WORKERS, dump, fingerprint
 from ..tasks import Graph, traffic
 from . import attention as standalone_attention
 
@@ -217,7 +217,7 @@ class Chain:
 ORDER = ('qkv', 'attention', 'output', 'expand', 'contract')
 
 
-def run(workload, chip, out, method='ours', budget=4, workers=4, tile_min=16, passes=2, width=64, keep=8, tiles=2,
+def run(workload, chip, out, method='ours', budget=4, workers=WORKERS, tile_min=16, passes=2, width=64, keep=8, tiles=2,
         refine=3):
     exp = Experiment(workload, chip, out); started = time.monotonic()
     kernels = tune_native(workload, chip, exp.out/'native_tuning', workers)
@@ -271,7 +271,7 @@ def main():
     parser.add_argument('--mode', choices=('prefill', 'decode'), default='prefill')
     parser.add_argument('--method', choices=list(METHODS), default='ours')
     for name, value in [('batch', 1), ('context', 128), ('query-heads', 8), ('kv-heads', 2), ('head-dim', 64),
-                        ('ffn', 1536), ('budget', 4), ('workers', 4), ('tile-min', 16), ('passes', 2),
+                        ('ffn', 1536), ('budget', 4), ('workers', WORKERS), ('tile-min', 16), ('passes', 2),
                         ('width', 64), ('keep', 8), ('tiles', 2), ('refine', 3)]:
         parser.add_argument('--'+name, type=int, default=value)
     a = parser.parse_args()

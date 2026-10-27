@@ -12,7 +12,7 @@ from dataclasses import asdict, dataclass, replace
 from math import isqrt
 
 from .attention import Attention, AttentionPlan, KVLayout, compile_attention, endpoints
-from ..sim import hardware
+from ..sim import WORKERS, hardware
 from ..tasks import Graph, Region
 from .kernels import Gemm, pointwise, residual, rmsnorm
 from ..gemm.native import best_tile
@@ -138,7 +138,7 @@ def build(workload, chip, config):
     return graph
 
 
-def tune_native(workload, chip, out, workers=4):
+def tune_native(workload, chip, out, workers=WORKERS):
     """Native K/N-grid kernels with the best native tile of each local shape.
 
     Fixed TP axes: each all-reduce leaves its output where the next GEMM reads

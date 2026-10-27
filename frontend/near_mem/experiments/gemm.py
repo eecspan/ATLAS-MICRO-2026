@@ -22,14 +22,14 @@ from ..gemm.plan import Plan, Problem
 from ..gemm.space import Proxy, families, family
 from ..methods import METHODS, propose, target, union
 from ..search import best, measure_all, shortlist
-from ..sim import dump, fingerprint
+from ..sim import WORKERS, dump, fingerprint
 
 
 def as_plan(data):
     return Plan(**{k: tuple(v) if isinstance(v, list) else v for k, v in data.items()})
 
 
-def run(problem, chip, out, method='ours', budget=16, workers=4, tile_min=16, tile_policy='powers', layer_policy='elk'):
+def run(problem, chip, out, method='ours', budget=16, workers=WORKERS, tile_min=16, tile_policy='powers', layer_policy='elk'):
     chip = Path(chip).resolve(); out = Path(out).resolve()
     if out.exists() and any(out.iterdir()):
         raise ValueError('Use an empty output directory')
@@ -71,7 +71,7 @@ def run(problem, chip, out, method='ours', budget=16, workers=4, tile_min=16, ti
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    for key, value in [('m', 128), ('n', 6144), ('k', 4096), ('budget', 16), ('workers', 4), ('tile-min', 16)]:
+    for key, value in [('m', 128), ('n', 6144), ('k', 4096), ('budget', 16), ('workers', WORKERS), ('tile-min', 16)]:
         ap.add_argument('--'+key, type=int, default=value)
     ap.add_argument('--chip', type=Path, required=True); ap.add_argument('--output', type=Path, required=True)
     ap.add_argument('--method', choices=list(METHODS), default='ours')

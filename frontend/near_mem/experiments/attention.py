@@ -16,7 +16,7 @@ from ..methods import METHODS
 from ..model.attention import Attention, AttentionPlan, KVLayout, compile_attention, endpoints, plans
 from ..model.transformer import materialize
 from ..search import measure_all
-from ..sim import dump, hardware
+from ..sim import WORKERS, dump, hardware
 from ..tasks import Graph, Region
 
 cycles = lambda row: row['result']['e2e_cycles']
@@ -44,7 +44,7 @@ def measure(problem, chip, out, plan, placed=False):
     return dict(plan=asdict(plan), result=graph.simulate(Path(out)/name)['result'])
 
 
-def run(problem, chip, out, method='ours', workers=4):
+def run(problem, chip, out, method='ours', workers=WORKERS):
     chip = Path(chip).resolve(); out = Path(out).resolve(); started = time.monotonic()
     out.mkdir(parents=True, exist_ok=True)
     arch, _, _ = hardware(chip); sram = arch['core']['buffer']['buffer_size']*1024
@@ -67,7 +67,7 @@ def run(problem, chip, out, method='ours', workers=4):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     for name, value in [('batch', 1), ('queries', 128), ('context', 128), ('query-heads', 8),
-                        ('kv-heads', 2), ('head-dim', 64), ('workers', 4)]:
+                        ('kv-heads', 2), ('head-dim', 64), ('workers', WORKERS)]:
         ap.add_argument('--'+name, type=int, default=value)
     ap.add_argument('--chip', type=Path, required=True); ap.add_argument('--output', type=Path, required=True)
     ap.add_argument('--method', choices=list(METHODS), default='ours')

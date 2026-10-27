@@ -17,7 +17,7 @@ from types import SimpleNamespace
 import yaml
 
 from ..search import shortlist
-from ..sim import dump, execute, fingerprint, hardware, span, strides
+from ..sim import WORKERS, dump, execute, fingerprint, hardware, span, strides
 from .plan import Plan, Problem
 from .space import Proxy, divisors
 from .distribution import charge, distribute, received_bytes
@@ -61,7 +61,7 @@ def _simulate_tiles(args):
     return explore_gemm_comp_worker(*args)
 
 
-def best_tile(shape, chip, out, workers=4, budget=BUDGET):
+def best_tile(shape, chip, out, workers=WORKERS, budget=BUDGET):
     """Best native tile of one core's local GEMM: proxy top-``budget``, then
     the upstream single-core explorer. Every core runs the same kernel without
     communication, so one core is exact (``tune`` checks this on the chip)."""
@@ -86,7 +86,7 @@ def best_tile(shape, chip, out, workers=4, budget=BUDGET):
     return dict(min(results, key=lambda r: r['latency']), domain=len(domain), simulated=len(chosen))
 
 
-def tune(problem,chip,out,workers=4):
+def tune(problem,chip,out,workers=WORKERS):
     """Native tiles per M/N partition; total cycles include input replication.
 
     A partition's replication time is at least its largest inbound volume

@@ -12,6 +12,9 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 KEYS = ('matrix', 'vector', 'buffer_load', 'buffer_store', 'dram', 'noc_tx', 'noc_rx')
+# Concurrent simulator processes: each is independent and deterministic, and
+# a whole-graph run peaks near 3.5 GB, so 32 fit a shared host comfortably.
+WORKERS = 32
 
 
 def strides(shape, dtype=2, column=False):
