@@ -1,3 +1,4 @@
+import pytest
 from dataclasses import replace
 
 from frontend.near_mem.gemm.plan import Plan,Problem
@@ -45,13 +46,30 @@ def test_proxy_bound_pruning_is_exact(tmp_path):
     from frontend.near_mem.search import diverse
     from frontend.near_mem.sim import make_hardware
     proxy=Proxy(make_hardware(tmp_path/'hw',4,64));problem=Problem(64,64,128);hw=dict(cores=4,sram=64*1024,dram=2**30,tile_min=8)
-    for m in METHODS.values():
-        space=lambda skip=None:m.space(problem,skip=skip,**hw)
+    cases=[(m,None) for m in METHODS.values() if not m.native]+[(METHODS['tp'],d) for d in (0,1)]
+    for m,direction in cases:
+        space=lambda skip=None:m.space(problem,skip=skip,direction=direction,**hw)
         for p in space():
             k=proxy.kernel(problem,p)
-            assert proxy.lower(problem,p)<=k*(1+1e-9) and proxy.lower(problem,replace(p,tile=None))<=k*(1+1e-9)
+            assert proxy.lower(problem,p)<=k*(1+1e-9)
+            if not m.flash:assert proxy.lower(problem,replace(p,tile=None))<=k*(1+1e-9)
         score=lambda p:proxy(problem,p);bound=lambda q:proxy.lower(problem,q)+proxy.distribution(problem,q)
-        assert shortlist(space,score,3,family)[0]==shortlist(space,score,3,family,bound,families)[0]
+        fam=lambda q:families(q,m.loops)
+        assert shortlist(space,score,3,family)[0]==shortlist(space,score,3,family,bound,fam)[0]
         pair=lambda p:(k:=proxy.kernel(problem,p),k+proxy.distribution(problem,p))
         low=lambda q:(k:=proxy.lower(problem,q),k+proxy.distribution(problem,q))
         assert diverse(space,pair,2,structure,2)[0]==diverse(space,pair,2,structure,2,low)[0]
+
+
+def test_measure_all_deadline_drops_aborted_candidates():
+    from subprocess import TimeoutExpired
+    import time
+    from frontend.near_mem.search import measure_all
+    stop=time.monotonic()+0.3
+    def measure(x):
+        if x and time.monotonic()>stop:raise TimeoutExpired('x',0)
+        time.sleep(0.2);return x
+    rows=measure_all(range(50),measure,4,deadline=stop)
+    assert rows[0]==0 and len(rows)<50
+    with pytest.raises(TimeoutExpired):
+        measure_all(range(3),lambda x:(_ for _ in ()).throw(TimeoutExpired('x',0)),2,deadline=stop)

@@ -16,7 +16,7 @@ from ..sim import WORKERS, hardware
 from ..tasks import Graph, Region
 from .kernels import Gemm, pointwise, residual, rmsnorm
 from ..gemm.native import best_tile
-from ..gemm.plan import Plan, Problem
+from ..gemm.plan import Plan, Problem, load
 
 
 @dataclass(frozen=True)
@@ -49,9 +49,7 @@ def configuration(kernels, attention):
 
 
 def decode_configuration(workload, data):
-    def plan(obj):
-        return Plan(**{k:tuple(v) if isinstance(v,list) else v for k,v in obj.items()})
-    kernels = {k:Gemm(workload.problems[k],plan(v['plan']),v['native'],v['direction'],v['gated'])
+    kernels = {k:Gemm(workload.problems[k],load(v['plan']),v['native'],v['direction'],v['gated'])
                for k,v in data['kernels'].items()}
     return kernels,AttentionPlan(**data['attention'])
 
@@ -156,6 +154,10 @@ def tune_native(workload, chip, out, workers=WORKERS):
         if n % side or k % side:
             raise ValueError('Native K/N shape must divide mesh side')
         tm,tk,tn = best_tile((m,n//side,k//side),chip,out/name,workers)['tiling_factors']
-        direction = dict(expand=1, qkv=int(workload.kv_heads > 1)).get(name, 0)
-        kernels[name] = Gemm(problem,Plan((1,side,side),(tm,tn,tk)),True,direction,name=='expand')
+        kernels[name] = Gemm(problem,Plan((1,side,side),(tm,tn,tk)),True,**roles(workload,name))
     return kernels
+
+
+def roles(workload, name):
+    """Fixed graph roles of a GEMM: its native TP axis and whether it is the gated FFN."""
+    return dict(direction=dict(expand=1, qkv=int(workload.kv_heads > 1)).get(name, 0), gated=name == 'expand')

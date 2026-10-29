@@ -1,17 +1,21 @@
-"""One steady-state Transformer layer: the ATLAS native graph against one method.
+"""One steady-state Transformer layer: one method's graph, measured by ATLAS.
 
-Every graph is chosen the same way. Each operator has a few options (for the
-ATLAS incumbent: the native GEMMs and native fused-attention splits; for a
-method: those plus the method's proxy proposals). Every option is simulated
+Every method chooses its graph the same way. Each operator has a few options:
+for a GEMM the method's proxy proposals (``tp``: the fixed TP grid along the
+GEMM's mesh direction, tiles only), for attention the shared context splits
+plus the method's additions. ``atlas`` uses the upstream natively tuned TP
+GEMMs and collectives instead (a check of ``tp``). Every option is simulated
 alone with its inputs in place, and every layout conversion between adjacent
 choices is scored from its busiest port or mesh link. Beam search over this
 chain proposes the ``keep`` best complete graphs, which are simulated whole.
 The chain score misses overlap between operators, so a coordinate descent
 then simulates, in parallel, every graph that changes one decision to one of
 its few best standalone options, keeps the best, and repeats up to
-``passes`` times while it improves. Weights are stored once for every method:
-an M split must rotate B. Each run searches one method; compare methods by
-separate runs.
+``passes`` times while it improves. ``deadline`` caps the wall-clock seconds:
+after it no further whole graph starts and running ones are aborted (the first
+joint graphs always complete), so all methods can be held to one limit. Weights are stored once for every method:
+an M split must rotate B. Each run writes only its own cycles;
+``experiments.compare`` turns separate runs into speedups.
 """
 import argparse
 from copy import deepcopy
@@ -20,17 +24,18 @@ from dataclasses import asdict, replace
 import hashlib
 import json
 from math import isqrt
+from subprocess import TimeoutExpired
 from pathlib import Path
 import time
 
-from ..gemm.plan import Plan
+from ..gemm.plan import load
 from ..gemm.space import Proxy, structure
 from ..methods import METHODS, propose, target, union
 from ..model.attention import AttentionPlan, KVLayout, plans as attention_plans
 from ..model.kernels import Gemm
 from ..model.transformer import (Workload, build, configuration, decode_configuration, edge_regions, edges,
-                                 port, tune_native)
-from ..search import beam, diverse
+                                 port, roles, tune_native)
+from ..search import beam, diverse, measure_all
 from ..sim import WORKERS, dump, fingerprint
 from ..tasks import Graph, traffic
 from . import attention as standalone_attention
@@ -45,11 +50,11 @@ class Experiment:
         self.out.mkdir(parents=True, exist_ok=True)
         self.provenance = fingerprint(chip); self.rows = []; self.seen = {}
 
-    def measure(self, config, label, record=True):
+    def measure(self, config, label, record=True, deadline=None):
         key = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()[:20]
         if key not in self.seen:
             folder = self.out/'runs'/key
-            run = build(self.workload, self.chip, config).simulate(folder)
+            run = build(self.workload, self.chip, config).simulate(folder, deadline=deadline)
             self.seen[key] = (run['result'], run['graph'], folder)
         result, manifest, folder = self.seen[key]
         row = dict(label=label, key=key, configuration=config, result=result,
@@ -64,17 +69,15 @@ class Experiment:
         self.rows.append(row); dump(self.out/'measurements.json', self.rows)
         print(f'{row["label"]}: {cycles(row)} cycles, peak {row["peak_dram_bytes"]} B/core', flush=True)
 
-    def measure_many(self, configs, label, workers):
-        """Measure independent neighbors in parallel; each uses its own simulator process."""
+    def measure_many(self, configs, label, workers, deadline=None, abort=True):
+        """Measure independent graphs in parallel, in order, until ``deadline``;
+        with ``abort`` graphs still running at the deadline are dropped."""
         unique = {json.dumps(cfg, sort_keys=True): cfg for cfg in configs}
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            rows = list(pool.map(lambda cfg: self.measure(cfg, label, record=False), unique.values()))
+        rows = measure_all(unique, lambda key: self.measure(unique[key], label, False, deadline if abort else None),
+                           workers, deadline=deadline)
         for row in rows:
             self.record(row)
         return rows
-
-    def best_of(self, incumbent, configs, label, workers):
-        return min([incumbent, *self.measure_many(configs, label, workers)], key=cycles)
 
 
 def variants(config, edit, choices):
@@ -93,14 +96,20 @@ def set_attention(cfg, plan):
     cfg['attention'] = asdict(plan)
 
 
-def descend(exp, start, neighbours, label, passes, workers):
+def descend(exp, start, neighbours, label, passes, workers, deadline=None):
     """Coordinate descent over whole graphs; ``neighbours(best)`` gives each decision's alternatives."""
     best = start
     for sweep in range(passes):
+        if deadline and time.monotonic() >= deadline:
+            break
         configs = [cfg for name, choices in neighbours(best).items()
                    for cfg in variants(best['configuration'], set_attention if name == 'attention' else set_kernel(name),
                                        choices)]
-        candidate = exp.best_of(best, configs, f'{label}_descent{sweep}', workers)
+        try:
+            rows = exp.measure_many(configs, f'{label}_descent{sweep}', workers, deadline)
+        except TimeoutExpired:
+            break
+        candidate = min([best, *rows], key=cycles)
         if candidate['key'] == best['key']:
             break
         best = candidate
@@ -123,9 +132,8 @@ class Chain:
         self.cycles = {}; self.ports = {}; self.edge_scores = {}
 
     def kernel(self, name, entry):
-        k = Gemm(self.exp.workload.problems[name], Plan(**{a: tuple(b) if isinstance(b, list) else b
-                                                          for a, b in entry['plan'].items()}),
-                 entry['native'], entry['direction'], entry['gated'])
+        k = Gemm(self.exp.workload.problems[name], load(entry['plan']), entry['native'], entry['direction'],
+                 entry['gated'])
         return k.bind(self.hw['cores'], self.hw['sram'], self.hw['dram'])
 
     def simulate(self, name, choice):
@@ -217,51 +225,45 @@ class Chain:
 ORDER = ('qkv', 'attention', 'output', 'expand', 'contract')
 
 
-def run(workload, chip, out, method='ours', budget=4, workers=WORKERS, tile_min=16, passes=2, width=64, keep=8, tiles=2,
-        refine=3):
-    exp = Experiment(workload, chip, out); started = time.monotonic()
-    kernels = tune_native(workload, chip, exp.out/'native_tuning', workers)
+def run(workload, chip, out, method='ours', budget=4, workers=WORKERS, tile_min=8, passes=2, width=64, keep=8, tiles=2,
+        refine=3, deadline=None):
+    exp = Experiment(workload, chip, out); started = time.monotonic(); stop = deadline and started+deadline
     # Weights are preplaced once, like the native TP shards; replicating them
     # would trade unbilled DRAM capacity for speed.
     hw = dict(target(chip, tile_min), single_b=True); layout = KVLayout(workload.attention, hw['cores'])
-    native_attention = list(attention_plans(layout, hw['sram'], False))
-    if not native_attention:
+    names = (*METHODS[method].includes, method)
+    options = {'attention': list(dict.fromkeys([*attention_plans(layout, hw['sram'], False),
+                                                *(p for m in names for p in METHODS[m].attention(layout, hw['sram']))]))}
+    if not options['attention']:
         raise ValueError('No SRAM-feasible attention plan')
-    native = configuration(kernels, native_attention[0])['kernels']
-    proxy = Proxy(chip); chain = Chain(exp, hw, proxy, workers); joint = {}
-
-    def choose(label, options, incumbent=None):
-        options, proposals, configs = chain.propose({k: options[k] for k in ORDER}, width, keep)
-        rows = exp.measure_many(configs, label+'_joint', workers)
-        best = min([*([incumbent] if incumbent else []), *rows], key=cycles)
-        joint[label] = [dict(score=score, configuration=cfg) for (score, _), cfg in zip(proposals, configs)]
-        return descend(exp, best, chain.neighbours(options, refine), label, passes, workers)
-
-    # The ATLAS incumbent is chosen like any method, over native options only.
-    atlas = choose('atlas', {**{k: [native[k]] for k in workload.problems}, 'attention': native_attention})
-
-    # Graph inputs arrive through layout edges whose cost depends on the
-    # neighbours. Rank by the kernel alone and, in the same scan, by kernel plus
-    # single-copy distribution, so plans that need no input replication (the
-    # ones that make edges cheap) are always proposed too.
-    report = {}; names = (*METHODS[method].includes, method)
-    options = {'attention': list(dict.fromkeys(native_attention+[p for m in names
-                                                                 for p in METHODS[m].attention(layout, hw['sram'])]))}
-    for name, problem in workload.problems.items():
-        score = lambda p: (k := proxy.kernel(problem, p), k+proxy.distribution(problem, p))
-        bound = lambda q: (k := proxy.lower(problem, q), k+proxy.distribution(problem, q))
-        ranked, scanned = propose(problem, hw, lambda space: diverse(space, score, budget, structure, tiles, bound),
-                                  method)
-        options[name] = [native[name]]+[dict(native[name], plan=asdict(p), native=False) for p in union(ranked, method)]
-        report[name] = dict(scanned=scanned, chosen={k: [asdict(p) for p, _ in v] for k, v in ranked.items()})
-    best = choose(method, options, atlas)
-    dump(exp.out/'search.json', dict(gemm=report, joint=joint, budget=budget, tiles=tiles, passes=passes, width=width,
-                                      keep=keep, refine=refine))
-    summary = dict(workload=asdict(workload), chip=str(Path(chip).resolve()), method=method, atlas=atlas, best=best,
-                   speedup=cycles(atlas)/cycles(best),
-                   seconds=time.monotonic()-started, sha256=exp.provenance)
+    proxy = Proxy(chip); report = {}
+    if METHODS[method].native:
+        kernels = tune_native(workload, chip, exp.out/'native_tuning', workers)
+        options.update({k: [v] for k, v in configuration(kernels, options['attention'][0])['kernels'].items()})
+    else:
+        # Graph inputs arrive through layout edges whose cost depends on the
+        # neighbours. Rank by the kernel alone and, in the same scan, by kernel
+        # plus single-copy distribution, so plans that need no input
+        # replication (the ones that make edges cheap) are always proposed too.
+        for name, problem in workload.problems.items():
+            score = lambda p: (k := proxy.kernel(problem, p), k+proxy.distribution(problem, p))
+            bound = lambda q: (k := proxy.lower(problem, q), k+proxy.distribution(problem, q))
+            ranked, scanned = propose(problem, dict(hw, direction=roles(workload, name)['direction']),
+                                      lambda space, m: diverse(space, score, budget, structure, tiles, bound), method)
+            options[name] = [dict(plan=asdict(p), native=False, **roles(workload, name)) for p in union(ranked, method)]
+            report[name] = dict(scanned=scanned, chosen={k: [asdict(p) for p, _ in v] for k, v in ranked.items()})
+    chain = Chain(exp, hw, proxy, workers)
+    options, proposals, configs = chain.propose({k: options[k] for k in ORDER}, width, keep)
+    best = min(exp.measure_many(configs, method+'_joint', workers, stop, abort=False), key=cycles)
+    best = descend(exp, best, chain.neighbours(options, refine), method, passes, workers, stop)
+    dump(exp.out/'search.json', dict(gemm=report, joint=[dict(score=score, configuration=cfg)
+                                                          for (score, _), cfg in zip(proposals, configs)],
+                                      budget=budget, tiles=tiles, passes=passes, width=width, keep=keep, refine=refine))
+    summary = dict(experiment='transformer', workload=asdict(workload), chip=str(Path(chip).resolve()), method=method,
+                   best=best, cycles=cycles(best), seconds=time.monotonic()-started, deadline=deadline,
+                   hit_deadline=bool(stop and time.monotonic() > stop), sha256=exp.provenance)
     dump(exp.out/'summary.json', summary)
-    print(json.dumps({k: summary[k] for k in ('method', 'speedup', 'seconds')}, indent=2), flush=True)
+    print(json.dumps({k: summary[k] for k in ('method', 'cycles', 'seconds')}, indent=2), flush=True)
     return summary
 
 
@@ -271,16 +273,18 @@ def main():
     parser.add_argument('--mode', choices=('prefill', 'decode'), default='prefill')
     parser.add_argument('--method', choices=list(METHODS), default='ours')
     for name, value in [('batch', 1), ('context', 128), ('query-heads', 8), ('kv-heads', 2), ('head-dim', 64),
-                        ('ffn', 1536), ('budget', 4), ('workers', WORKERS), ('tile-min', 16), ('passes', 2),
+                        ('ffn', 1536), ('budget', 4), ('workers', WORKERS), ('tile-min', 8), ('passes', 2),
                         ('width', 64), ('keep', 8), ('tiles', 2), ('refine', 3)]:
         parser.add_argument('--'+name, type=int, default=value)
+    parser.add_argument('--deadline', type=float, help='common wall-clock cap in seconds (no graph starts later)')
     a = parser.parse_args()
     if min(a.batch, a.context, a.query_heads, a.kv_heads, a.head_dim, a.ffn, a.budget, a.workers,
            a.tile_min, a.width, a.keep, a.tiles) < 1 or min(a.passes, a.refine) < 0:
         parser.error('Counts must be positive')
     workload = Workload(a.batch, a.context if a.mode == 'prefill' else 1, a.context, a.query_heads, a.kv_heads,
                         a.head_dim, a.ffn)
-    run(workload, a.chip, a.output, a.method, a.budget, a.workers, a.tile_min, a.passes, a.width, a.keep, a.tiles, a.refine)
+    run(workload, a.chip, a.output, a.method, a.budget, a.workers, a.tile_min, a.passes, a.width, a.keep, a.tiles, a.refine,
+        a.deadline)
 
 
 if __name__ == '__main__':

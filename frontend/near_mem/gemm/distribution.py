@@ -14,6 +14,8 @@ from ..sim import FIELDS
 
 
 def replica_groups(problem, plan, tensor):
+    if getattr(plan, 'kind', None) == 'flash' or plan.layout == 'global':
+        return None, []  # one plan-independent copy, read in place or remotely
     own = Ownership(problem, plan); shape = [own.base[d] for d in DEPENDENCIES[tensor]]
     shapes = []; groups = defaultdict(list)
     for core in range(plan.cores):
@@ -36,17 +38,17 @@ def received_bytes(problem, plan):
     return max(inbound.values(), default=0)
 
 
-def distribute(problem, plan, chip, out):
+def distribute(problem, plan, chip, out, deadline=None):
     graph = Graph(chip); groups = []
     for v in 'AB':
         shapes, replicas = replica_groups(problem, plan, v)
-        for core, shape in enumerate(shapes):
+        for core, shape in enumerate(shapes or ()):
             graph.tensor(core, v, shape, dtype=problem.dtype_bytes, column=v == 'B')
         groups += replicas
     if not groups:
         return {k: 0 for k in FIELDS}
     graph.allgather('distribute', groups)
-    return graph.simulate(out, timeout=7200)['result']
+    return graph.simulate(out, deadline=deadline)['result']
 
 
 def charge(kernel, distribution):

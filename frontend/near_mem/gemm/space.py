@@ -20,6 +20,9 @@ from ..sim import hardware
 from .plan import Plan, Problem, DEPENDENCIES
 
 
+LOOPS=tuple(''.join(o) for o in permutations('mnk'))
+
+
 @lru_cache(None)
 def divisors(n):
     small=[i for i in range(1,isqrt(n)+1) if n%i==0]
@@ -46,49 +49,59 @@ def groups(base,loop):
 
 
 def resident_bytes(p,dtype=2):
-    return (2*sum((count if prod(parts)>1 else 1)*prod(p.tile[d] for d in DEPENDENCIES[v])*dtype
-                 for (v,parts),count in zip(p.temporal.items(),p.payload_tiles))
-            + (2*p.tile[0]*p.tile[1]*dtype if prod(p.c)==1 else 0))
+    return p.sram_bytes(dtype)
 
 
-def candidates(problem,cores,capacity,tile_min=8,tile_policy='powers',layer_policy='elk',dram_capacity=float('inf'),
-               rotation=True,skip=None,single_b=False):
+def tile_values(n,low,policy='all'):
+    """Tile extents of a dimension ``n``: divisors of at least ``min(n, low)``
+    (ATLAS's native rule); ``powers`` keeps powers of two and ``n``."""
+    values=[v for v in divisors(n) if v>=min(n,low)]
+    return values if policy=='all' else [v for v in values if v&(v-1)==0 or v==n]
+
+
+def candidates(problem,cores,capacity,tile_min=8,tile_policy='all',layer_policy='elk',dram_capacity=float('inf'),
+               rotation=True,skip=None,single_b=False,receive='sram_consume',layout='local',loops=LOOPS,parts=None,
+               transpose=False):
     """Yields immutable Plans, one ``(ps,a,b,c)`` shell at a time.
 
     ``single_b`` keeps one DRAM copy of B (a graph's weights): an M split
     must then rotate B over its cores instead of replicating it.
+    ``receive``/``layout`` select the baseline variants of ``Plan``: DRAM
+    landing rotates only A/B in whole blocks; a global layout stores one
+    plan-independent copy, so weights are never replicated. ``loops`` limits
+    the micro loop orders; a single fixed loop also fixes the group to 1.
+    ``tile_min`` is one minimum or per-axis ``(m, n, k)`` minima; ``parts``
+    restricts the spatial partitions, numbered column-major if ``transpose``.
 
     ``skip(prefix)`` is asked for every shell (``tile=None``) and every tile
     before loops, groups and layer orders are expanded; ``True`` drops all
     completions of that prefix.
     """
-    for ps in spatial_parts(cores):
+    low=tile_min if isinstance(tile_min,tuple) else (tile_min,)*3
+    for ps in parts or spatial_parts(cores):
         if any(n%s for n,s in zip(problem.shape,ps)):continue
         periods=product(temporal_parts(ps[1]),temporal_parts(ps[0]),temporal_parts(ps[2])) if rotation else [((1,1),)*3]
         for a,b,c in periods:
-            if single_b and prod(b)!=ps[0]:continue
-            shell=Plan(ps,(1,1,1),a,b,c)
+            if single_b and layout=='local' and prod(b)!=ps[0]:continue
+            shell=Plan(ps,(1,1,1),a,b,c,receive=receive,layout=layout,transpose=transpose)
             try:
                 shell.validate(problem)
             except ValueError:continue
             lm,ln,lk=(n//s for n,s in zip(problem.shape,ps))
-            address=0
-            for size in (lm*lk//prod(a),lk*ln//prod(b),lm*ln//prod(c)):
+            address=0;copies=3 if shell.land else 1
+            for size in (lm*lk//prod(a)*copies,lk*ln//prod(b)*copies,lm*ln//prod(c)*(1+(shell.land and c!=(1,1)))):
                 address=(address+127)//128*128+size*problem.dtype_bytes
             if address>dram_capacity:continue
             if skip and skip(replace(shell,tile=None)):continue
             base=tuple(n//(s*t) for n,s,t in zip(problem.shape,ps,shell.periods))
-            def tiles(n):
-                all_tiles=[v for v in divisors(n) if v>=min(n,tile_min)]
-                return all_tiles if tile_policy=='all' else [v for v in all_tiles if v&(v-1)==0 or v==n]
-            for tile in product(*(tiles(n) for n in base)):
+            if shell.land and not shell.layers:continue  # nothing rotates: a local plan
+            for tile in product(*(tile_values(n,l,tile_policy) for n,l in zip(base,low))):
                 basic=replace(shell,tile=tile)
                 if resident_bytes(basic,problem.dtype_bytes)>capacity:continue
                 if skip and skip(basic):continue
                 counts=tuple(n//t for n,t in zip(base,tile))
-                for loop in permutations('mnk'):
-                    loop=''.join(loop)
-                    for group in (groups(counts,loop) if shell.layers else [(1,1,1)]):
+                for loop in loops:
+                    for group in (groups(counts,loop) if shell.layers and not shell.land and len(loops)>1 else [(1,1,1)]):
                         p=replace(basic,loop=loop,group=group)
                         if resident_bytes(p,problem.dtype_bytes)>capacity:continue
                         if layer_policy=='all':orders=p.orders()
@@ -121,6 +134,19 @@ class Proxy:
         """Standalone score: the kernel plus single-copy input replication."""
         return self.kernel(problem,p)+self.distribution(problem,p)
 
+    @property
+    def mac(self):
+        return self.arch['core']['matrix']['mac_num']
+
+    def roofline(self,problem):
+        """Whole-chip ideal: all MACs at peak, or every operand moved once at full DRAM bandwidth."""
+        cores=self.arch['core_num'];m,n,k=problem.shape
+        return max(m*n*k/(cores*self.mac),(m*k+k*n+m*n)*problem.dtype_bytes/(cores*self.dram_bw))
+
+    def remote(self,p):
+        """Share of a global-layout tile that lives on other cores (T10's NUMA fraction)."""
+        return 1-1/p.cores if p.layout=='global' else 0
+
     def edge(self,phases,dtype=2):
         """Score of a relayout from ``tasks.traffic``: per phase, its busiest DRAM or NoC port or link."""
         flit=self.arch['noc']['flit_size']
@@ -129,17 +155,22 @@ class Proxy:
 
     def distribution(self,problem,p):
         # Initial single-copy distribution: each replica receives (r-1)/r.
+        if getattr(p,'kind',None)=='flash' or p.layout=='global':return 0
         lm,ln,lk=(n//s for n,s in zip(problem.shape,p.ps))
         received=(lm*lk/prod(p.a)*(1-prod(p.a)/p.ps[1])+lk*ln/prod(p.b)*(1-prod(p.b)/p.ps[0]))*problem.dtype_bytes
         return max(received/self.arch['noc']['flit_size'],2*received/self.dram_bw)
 
     def kernel(self,problem,p):
         """Kernel score with inputs already in place (graph edges are scored apart)."""
+        if getattr(p,'kind',None)=='flash':
+            from .flash import score
+            return score(problem,p,self.mac,self.dram_bw,self.arch['noc']['flit_size'])
         lm,ln,lk=(n//s for n,s in zip(problem.shape,p.ps));tm,tn,tk=p.tile;dtype=problem.dtype_bytes
         nm,nn,nk=lm//tm,ln//tn,lk//tk;inner=p.loop[-1]
-        reads_a=(nm*nk if inner=='n' else nm*nn*nk)*tm*tk*dtype/prod(p.a)
-        reads_b=(nn*nk if inner=='m' else nm*nn*nk)*tk*tn*dtype/prod(p.b)
-        if p.layers and p.b==(1,1) and p.c==(1,1):
+        # A DRAM-landed tensor is re-read from DRAM at every rotation step.
+        reads_a=(nm*nk if inner=='n' else nm*nn*nk)*tm*tk*dtype/(1 if p.land else prod(p.a))
+        reads_b=(nn*nk if inner=='m' else nm*nn*nk)*tk*tn*dtype/(1 if p.land else prod(p.b))
+        if p.layers and p.b==(1,1) and p.c==(1,1) and not p.land:
             epochs=tuple(n//(s*t*g*period) for n,s,t,g,period in zip(problem.shape,p.ps,p.tile,p.group,p.periods))
             varying=[d for d in p.loop if epochs['mnk'.index(d)]>1]
             repeats=1 if not varying or varying[-1]=='n' else epochs[1]
@@ -162,15 +193,23 @@ class Proxy:
             serial+=outer*(layer.radix-1)*payload['C']*('C' in layer.tensors)
             events+=outer*(layer.radix-1)
             outer*=layer.radix
-        volume*=epochs;serial*=epochs
-        residual=p.ps[2]//prod(p.c)
-        serial+=lm*ln*dtype*2*(residual-1)/residual
-        events=events*epochs+nm*nn*ceil(log2(residual))
+        volume*=epochs;serial*=epochs;rotated_c=serial
+        # Residual split-K: a line reduce-scatter per wave of ``residual`` C
+        # tiles, r-1 tile hops each (both directions in parallel), r+1 phases.
+        residual=p.ps[2]//prod(p.c);waves=ceil(max(1,nm*nn//prod(p.c))/residual)*(residual>1)
+        serial+=waves*(residual-1)*tm*tn*dtype
+        # DRAM-landing copies overlap compute and add no exchange phase.
+        events=(0 if p.land else events*epochs)+waves*(residual+1)
         micro_steps=nm*nn*nk
         step=ceil(prod(p.tile)/self.arch['core']['matrix']['mac_num'])
         mac=micro_steps*step
-        dram=(reads_a+reads_b+c)/self.dram_bw
-        noc=volume/self.arch['noc']['flit_size'];serial/=self.arch['noc']['flit_size']
+        # DRAM landing: every forwarded block is read by its sender and
+        # written by its receiver, overlapped with compute (no shift phases).
+        landed=2*(volume+rotated_c) if p.land else 0
+        # Global layout: non-home tile reads and final writes cross the NoC.
+        remote=self.remote(p)*(reads_a+reads_b+lm*ln*dtype/prod(p.c))
+        dram=(reads_a+reads_b+c+landed)/self.dram_bw
+        noc=(volume+remote)/self.arch['noc']['flit_size'];serial/=self.arch['noc']['flit_size']
         # Native tasks cannot issue fractional micro-iterations. Count their
         # phase overhead and one phase per shift or reduction step.
         # This is a ranking heuristic, never a safe latency lower bound.
@@ -179,12 +218,14 @@ class Proxy:
 
     def lower(self,problem,p):
         """Lower bound of ``kernel`` over all loops, groups and layer orders of
-        ``p``; with ``p.tile=None`` also over all tiles.
+        ``p``; with ``p.tile=None`` also over all tiles. FlashGEMM spaces are
+        small and scanned without pruning, so their bound is the score.
 
         Per tensor, payload x epochs >= its local panel / temporal parts, and the
         layer order minimizing sum(outer*(radix-1)*weight) sorts layers by
         weight, largest first (exchange argument).
         """
+        if getattr(p,'kind',None)=='flash':return self.kernel(problem,p)
         lm,ln,lk=local=tuple(n//s for n,s in zip(problem.shape,p.ps));dtype=problem.dtype_bytes
         weight={v:dtype*prod(local[d]/parts[i] for i,d in enumerate(DEPENDENCIES[v])) for v,parts in p.temporal.items()}
         def least(w):
@@ -192,30 +233,36 @@ class Proxy:
             for layer in sorted(p.layers,key=w,reverse=True):total+=outer*(layer.radix-1)*w(layer);outer*=layer.radix
             return total
         volume=least(lambda l:sum(weight[v] for v in l.tensors if v!='C'))
-        serial=least(lambda l:weight['C']*('C' in l.tensors))
+        serial=least(lambda l:weight['C']*('C' in l.tensors));rotated_c=serial
         residual=p.ps[2]//prod(p.c)
-        serial+=lm*ln*dtype*2*(residual-1)/residual
+        serial+=lm*ln/prod(p.c)*dtype*(residual-1)/residual
         if p.tile is None:
             micro_steps=rows=1;mac=lm*ln*lk/self.arch['core']['matrix']['mac_num']
         else:
             nm,nn,nk=(n//t for n,t in zip(local,p.tile));micro_steps=nm*nn*nk;rows=nm*nn
             mac=micro_steps*ceil(prod(p.tile)/self.arch['core']['matrix']['mac_num'])
-        events=prod(l.radix for l in p.layers)-1+rows*ceil(log2(residual))
-        dram=(lm*lk/prod(p.a)+lk*ln/prod(p.b)+lm*ln/prod(p.c)*(1+2*(residual>1)))*dtype/self.dram_bw
+        waves=ceil(max(1,rows//prod(p.c))/residual)*(residual>1)
+        events=(0 if p.land else prod(l.radix for l in p.layers)-1)+waves*(residual+1)
+        a=lm*lk/(1 if p.land else prod(p.a));b=lk*ln/(1 if p.land else prod(p.b))
+        dram=((a+b+lm*ln/prod(p.c)*(1+2*(residual>1)))*dtype+2*(volume+rotated_c)*p.land)/self.dram_bw
+        remote=self.remote(p)*(lm*lk/prod(p.a)+lk*ln/prod(p.b)+lm*ln/prod(p.c))*dtype
         flit=self.arch['noc']['flit_size']
-        return max(mac,dram,volume/flit)+serial/flit+micro_steps+events
+        return max(mac,dram,(volume+remote)/flit)+serial/flit+micro_steps+events
 
 
 def family(p):
     """Structural class kept by the shortlist: loop, rotation pattern, split-K."""
+    if getattr(p,'kind',None)=='flash':return (p.dataflow,p.b_resident)
     return (p.loop,p.a[1]!=p.b[0],prod(p.c)>1,p.ps[2]>1)
 
 
-def families(prefix):
+def families(prefix,loops=LOOPS):
     """Every ``family`` a completion of ``prefix`` can have (loops are chosen later)."""
-    return {family(replace(prefix,loop=''.join(o))) for o in permutations('mnk')}
+    if getattr(prefix,'kind',None)=='flash':return {family(prefix)}
+    return {family(replace(prefix,loop=o)) for o in loops}
 
 
 def structure(p):
     """Spatial and rotation decision of a plan, independent of tiles and loops."""
+    if getattr(p,'kind',None)=='flash':return (p.dataflow,p.b_resident)
     return (p.ps,p.a,p.b,p.c)

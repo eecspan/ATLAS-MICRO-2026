@@ -7,10 +7,12 @@ interchangeable: ``shortlist``/``diverse`` scan a finite space exactly,
 ``beam`` chooses jointly over a sequence of operators, and ``anneal``
 explores spaces too large to enumerate.
 """
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
 import heapq
 import math
 import random
+from subprocess import TimeoutExpired
+import time
 
 
 def _bounded(bound, values):
@@ -125,16 +127,38 @@ def beam(decisions, cost, width=64, keep=8):
     return states[:keep]
 
 
-def measure_all(candidates, measure, workers=1, processes=False):
-    """Measure each distinct candidate once, preserving order.
+def measure_all(candidates, measure, workers=1, processes=False, deadline=None):
+    """Measure each distinct candidate once, in order; returns the rows measured.
 
     Use ``processes`` when ``measure`` spends real Python time lowering tasks
-    before the simulator subprocess runs; it must then be picklable.
+    before the simulator subprocess runs; it must then be picklable. With a
+    ``deadline`` (a ``time.monotonic()`` value) no measurement starts after it,
+    except the first, and a measurement still running at the deadline is
+    aborted (``measure`` raises ``TimeoutExpired``) and dropped, so the rows
+    cover a prefix of the candidates minus the aborted ones.
     """
     unique = list(dict.fromkeys(candidates))
     pool_type = ProcessPoolExecutor if processes else ThreadPoolExecutor
-    with pool_type(max_workers=max(1, workers)) as pool:
-        return list(pool.map(measure, unique))
+    workers = max(1, workers)
+    with pool_type(max_workers=workers) as pool:
+        if deadline is None:
+            return list(pool.map(measure, unique))
+        futures = []; running = set()
+        for c in unique:
+            while len(running) >= workers:
+                running = wait(running, return_when=FIRST_COMPLETED).not_done
+            if futures and time.monotonic() >= deadline:
+                break
+            futures.append(pool.submit(measure, c)); running.add(futures[-1])
+        rows = []
+        for f in futures:
+            try:
+                rows.append(f.result())
+            except TimeoutExpired:
+                pass
+        if not rows:
+            raise TimeoutExpired('measure', 0)
+        return rows
 
 
 def best(rows):

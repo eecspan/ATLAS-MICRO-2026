@@ -7,6 +7,7 @@ import re
 from pathlib import Path
 import subprocess
 import sys
+import time
 
 import yaml
 
@@ -102,7 +103,13 @@ def dump(path, value):
     path.write_text(json.dumps(value, indent=2))
 
 
-def execute(chip, out, operators, placement, timeout=600):
+def execute(chip, out, operators, placement, timeout=7200, deadline=None):
+    """Run the simulator in its own process. ``deadline`` (``time.monotonic()``) also
+    bounds the run; a run that cannot finish in time raises ``TimeoutExpired``."""
+    if deadline is not None:
+        timeout = min(timeout, deadline-time.monotonic())
+        if timeout <= 0:
+            raise subprocess.TimeoutExpired('frontend.near_mem.sim', 0)
     out.mkdir(parents=True, exist_ok=True)
     dump(out/'operators.yaml', operators)
     dump(out/'placement.yaml', placement)

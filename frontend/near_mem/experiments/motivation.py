@@ -1,7 +1,8 @@
 """Motivation data: where the time of simple (native ATLAS) compilation goes.
 
-Reads finished ``experiments.gemm``/``attention``/``transformer`` outputs and
-reports, for the ATLAS incumbent and for ours:
+Reads finished ``experiments.gemm``/``attention``/``transformer`` runs, pairs
+the ``tp`` and ``ours`` runs of each case (``compare.runs``) and reports,
+for both:
 
 * input replication: its cycles and the DRAM bytes every replica occupies;
 * resource idleness: the share of the critical path during which the matrix
@@ -18,11 +19,9 @@ from math import prod
 from pathlib import Path
 
 from ..sim import dump
+from .compare import chip_name, runs
 
-
-def chip_name(path):
-    path = Path(path)
-    return path.parent.name if path.stem == 'chip' else path.stem
+NAMES = ('tp', 'ours')
 
 
 def replicated_bytes(problem, plan):
@@ -47,38 +46,38 @@ def operators(result, kinds=None):
             for name, o in result['operators'].items()]
 
 
-def gemm(folder):
-    s = json.loads((folder/'summary.json').read_text())
+def gemm(pair):
+    s = pair['ours']
     row = dict(shape=[s['problem'][x] for x in 'mnk'], chip=chip_name(s['chip']))
-    for name, key in (('atlas', 'atlas'), ('ours', 'best')):
-        r = s[key]['result']; kernel = r['kernel_cycles']
+    for name in NAMES:
+        best = pair[name]['best']; r = best['result']; kernel = r['kernel_cycles']
         row[name] = dict(total=r['e2e_cycles'], kernel=kernel, replication=r['distribution_cycles'],
                          replication_share=r['distribution_cycles']/r['e2e_cycles'],
                          mac_busy_in_kernel=min(r['matrix_cycles'], kernel)/kernel,
                          noc_busy_in_kernel=min(r['noc_cycles'], kernel)/kernel,
-                         input_footprint=replicated_bytes(s['problem'], s[key]['plan']),
-                         plan={k: s[key]['plan'][k] for k in ('ps', 'tile', 'a', 'b', 'c', 'loop')})
-    row['speedup'] = s['speedup']
+                         input_footprint=replicated_bytes(s['problem'], best['plan']),
+                         plan={k: best['plan'][k] for k in ('ps', 'tile', 'a', 'b', 'c', 'loop')})
+    row['speedup'] = pair['tp']['cycles']/s['cycles']
     return row
 
 
-def attention(folder):
-    s = json.loads((folder/'summary.json').read_text()); row = dict(problem=s['problem'], speedup=s['speedup'])
-    for name, key in (('atlas', 'atlas'), ('ours', 'best')):
-        r = s[key]['result']
-        row[name] = dict(plan=s[key]['plan'], **breakdown(r['e2e_cycles'], operators(r)))
+def attention(pair):
+    s = pair['ours']; row = dict(problem=s['problem'], speedup=pair['tp']['cycles']/s['cycles'])
+    for name in NAMES:
+        best = pair[name]['best']; r = best['result']
+        row[name] = dict(plan=best['plan'], **breakdown(r['e2e_cycles'], operators(r)))
     return row
 
 
-def transformer(folder):
-    s = json.loads((folder/'summary.json').read_text())
-    row = dict(workload=s['workload'], chip=chip_name(s['chip']), speedup=s['speedup'])
-    for name, key in (('atlas', 'atlas'), ('ours', 'best')):
-        path = Path(s[key]['path']); r = json.loads((path/'result.json').read_text())
+def transformer(pair):
+    s = pair['ours']
+    row = dict(workload=s['workload'], chip=chip_name(s['chip']), speedup=pair['tp']['cycles']/s['cycles'])
+    for name in NAMES:
+        best = pair[name]['best']; path = Path(best['path']); r = json.loads((path/'result.json').read_text())
         kinds = {o['name']: o['metadata'].get('category', 'other')
                  for o in json.loads((path/'graph.json').read_text())['operators']}
-        row[name] = dict(breakdown(r['e2e_cycles'], operators(r, kinds)), layout_noc_bytes=s[key]['layout_noc_bytes'],
-                         peak_dram_bytes=s[key]['peak_dram_bytes'])
+        row[name] = dict(breakdown(r['e2e_cycles'], operators(r, kinds)), layout_noc_bytes=best['layout_noc_bytes'],
+                         peak_dram_bytes=best['peak_dram_bytes'])
     return row
 
 
@@ -88,8 +87,8 @@ def plot(report, out):
     if report['gemm']:
         rows = report['gemm']; fig, ax = plt.subplots(figsize=(1.3*len(rows)+2, 3))
         for i, r in enumerate(rows):
-            base = r['atlas']['total']
-            for j, name in enumerate(('atlas', 'ours')):
+            base = r['tp']['total']
+            for j, name in enumerate(NAMES):
                 x = i+0.38*(j-0.5)
                 ax.bar(x, r[name]['kernel']/base, 0.36, color=('C0', 'C2')[j], label=f'{name} kernel' if i == 0 else None)
                 ax.bar(x, r[name]['replication']/base, 0.36, bottom=r[name]['kernel']/base, color='C3',
@@ -99,13 +98,13 @@ def plot(report, out):
         fig.tight_layout(); fig.savefig(out/'gemm_breakdown.png', dpi=200); plt.close(fig)
     if report['transformer']:
         rows = report['transformer']; labels = []
-        kinds = sorted({k for r in rows for n in ('atlas', 'ours') for k in r[n]['categories']})
+        kinds = sorted({k for r in rows for n in NAMES for k in r[n]['categories']})
         fig, ax = plt.subplots(figsize=(1.6*len(rows)+3, 3))
         for i, r in enumerate(rows):
-            for j, name in enumerate(('atlas', 'ours')):
+            for j, name in enumerate(NAMES):
                 bottom = 0
                 for c, kind in enumerate(kinds):
-                    value = r[name]['categories'].get(kind, 0)/r['atlas']['total']
+                    value = r[name]['categories'].get(kind, 0)/r['tp']['total']
                     ax.bar(2*i+j, value, 0.7, bottom=bottom, color=f'C{c}', label=kind if 2*i+j == 0 else None)
                     bottom += value
                 w = r['workload']; labels.append(f"{r['chip']}\nB{w['batch']} q{w['queries']}\n{name}")
@@ -116,12 +115,14 @@ def plot(report, out):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    for name in ('gemm', 'attention', 'transformer'):
-        ap.add_argument('--'+name, type=Path, nargs='*', default=[], help=f'experiments.{name} output folders')
+    ap.add_argument('folders', type=Path, nargs='+', help='result folders with tp and ours runs, searched recursively')
     ap.add_argument('--output', type=Path, required=True)
     a = ap.parse_args(); a.output.mkdir(parents=True, exist_ok=True)
-    report = dict(gemm=[gemm(f) for f in a.gemm], attention=[attention(f) for f in a.attention],
-                  transformer=[transformer(f) for f in a.transformer])
+    report = dict(gemm=[], attention=[], transformer=[])
+    readers = dict(gemm=gemm, attention=attention, transformer=transformer)
+    for (experiment, _, _), methods in sorted(runs(a.folders).items()):
+        if all(n in methods for n in NAMES):
+            report[experiment].append(readers[experiment](methods))
     dump(a.output/'motivation.json', report); plot(report, a.output)
     print(json.dumps(report, indent=1))
 

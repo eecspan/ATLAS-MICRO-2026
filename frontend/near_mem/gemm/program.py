@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from math import prod
 
 from .plan import DEPENDENCIES
+from ..tasks import Region, coalesce
 
 
 @dataclass
@@ -12,6 +13,48 @@ class Program:
     phases: list
     placements: list
     sram_bytes: int
+
+    @property
+    def suffix(self):
+        """Final outputs go to ``C+suffix``: a global layout writes them to their homes."""
+        return 'g' if self.plan.layout=='global' else ''
+
+    @property
+    def gate_tile(self):
+        """N extent of each final output tile."""
+        return self.plan.tile[1]
+
+    def regions(self, tensor):
+        """Global windows of ``tensor`` in DRAM: inputs as read, C as finally written."""
+        from .layout import GlobalLayout
+        from .ownership import Ownership
+        p=self.plan
+        if p.layout=='global':
+            return GlobalLayout(self.problem,p.cores).regions(tensor)
+        regions=[]
+        if tensor=='C':
+            for phase in self.phases:
+                for core,actions in enumerate(phase):
+                    for a in actions:
+                        if a['op']=='store' and a.get('final'):
+                            regions.append(Region(core,'C',a['key'][0]*p.tile[0],a['key'][1]*p.tile[1],
+                                                  *a['extent'],*a['base']))
+                        elif a['op']=='forward' and a.get('final'):  # a landed C copied home
+                            regions.append(Region(a['dst'],'C',a['key'][0]*p.tile[0],a['key'][1]*p.tile[1],
+                                                  *a['extent'],*a['base']))
+        else:
+            own=Ownership(self.problem,p);axes=DEPENDENCIES[tensor];shape=[own.base[d] for d in axes]
+            for core in range(p.cores):
+                blocks=own.tensor_blocks(core,tensor)
+                indices=[sorted({b[i] for b in blocks}) for i in range(2)]
+                for block in blocks:
+                    regions.append(Region(core,tensor,block[0]*shape[0],block[1]*shape[1],*shape,
+                                          indices[0].index(block[0])*shape[0],indices[1].index(block[1])*shape[1]))
+        return coalesce(regions)
+
+    def lower(self, flit, final_ops=None):
+        from .lower import lower_tasks
+        return lower_tasks(self,flit,final_ops)
 
     def replay(self, a, b):
         import numpy as np
@@ -44,10 +87,17 @@ class Program:
                         sram[core]['C'][m,n]+=sram[core]['A'][m,k]@sram[core]['B'][k,n]
                         macs+=prod(plan.tile)
                     elif kind=='send':
-                        incoming.append((op['dst'],op.get('target',v),{k:x.copy() for k,x in sram[core][v].items()}))
+                        keys=[tuple(op['key'])] if 'key' in op else list(sram[core][v])
+                        incoming.append((op['dst'],op.get('target',v),{k:sram[core][v][k].copy() for k in keys}))
                     elif kind=='add':
-                        for key,value in sram[core]['partial'].items():sram[core]['C'][key]+=value
-                        sram[core]['partial']={}
+                        key=tuple(op['key'])
+                        if key in sram[core]['partial']:sram[core]['C'][key]+=sram[core]['partial'].pop(key)
+                    elif kind=='forward' and v=='C':
+                        key=tuple(op['key']);dram[op['dst']][key]=value=dram[core][key].copy()
+                        if op.get('final'):
+                            m,n=key;tm,tn=op['extent']
+                            output[m*tm:(m+1)*tm,n*tn:(n+1)*tn]=value
+                            written[m*tm:(m+1)*tm,n*tn:(n+1)*tn]+=1
                     elif kind=='store':
                         key=tuple(op['key']);value=sram[core]['C'][key]
                         dram[core][key]=value.copy()
@@ -55,7 +105,10 @@ class Program:
                             m,n=key;tm,tn=op['shape']
                             output[m*tm:(m+1)*tm,n*tn:(n+1)*tn]=value
                             written[m*tm:(m+1)*tm,n*tn:(n+1)*tn]+=1
-            for core,v,value in incoming:sram[core][v]=value
+            for core,v,value in incoming:
+                if v=='partial':  # received partial sums accumulate per tile
+                    for k,x in value.items():sram[core][v][k]=sram[core][v].get(k,0)+x
+                else:sram[core][v]=value
         assert macs==p.m*p.n*p.k
         assert np.all(written==1)
         return output

@@ -53,6 +53,25 @@ class Region:
         return [self.crop(*p) for p in pieces if min(p[2:]) > 0]
 
 
+def coalesce(regions):
+    """Merge regions that are adjacent both logically and in local storage."""
+    regions = list(regions)
+    for vertical in (False, True):
+        result = []
+        def key(r):
+            return ((r.core, r.name, r.col, r.cols, r.local_col, r.local_row-r.row, r.row) if vertical else
+                    (r.core, r.name, r.row, r.rows, r.local_row, r.local_col-r.col, r.col))
+        for r in sorted(regions, key=key):
+            if result:
+                p = result[-1]
+                if key(p)[:-1] == key(r)[:-1] and ((p.row+p.rows == r.row) if vertical else (p.col+p.cols == r.col)):
+                    result[-1] = replace(p, rows=p.rows+r.rows) if vertical else replace(p, cols=p.cols+r.cols)
+                    continue
+            result.append(r)
+        regions = result
+    return regions
+
+
 def window(regions, row, col, rows, cols):
     """A logical view: change global coordinates without moving physical data."""
     box = Region(0, '', row, col, rows, cols)
@@ -215,9 +234,18 @@ def route(src, dst, side):
     return path
 
 
-def panelize(box, limit):
-    """Split a (row, col, rows, cols) box into panels of at most limit elements."""
-    row, col, rows, cols = box; width = min(cols, limit); height = max(1, limit//width)
+def panelize(box, limit, column=False):
+    """Split a (row, col, rows, cols) box into panels of at most ``limit`` elements.
+
+    Panels follow the tensor's storage order (whole rows of a row-major
+    tensor, whole columns of a column-major one), so each panel is read and
+    written as long contiguous runs instead of a strided scatter.
+    """
+    row, col, rows, cols = box
+    if column:
+        height = min(rows, limit); width = max(1, limit//height)
+    else:
+        width = min(cols, limit); height = max(1, limit//width)
     return [(row+y, col+x, min(height, rows-y), min(width, cols-x))
             for x in range(0, cols, width) for y in range(0, rows, height)]
 
@@ -239,11 +267,20 @@ class Timeline:
             self.raw[core].append({k: [] for k in KEYS})
         self.raw[core][slot][key].append(task)
 
+    def access(self, core, time, name, base, extent, write=False, dtype=2):
+        """One DRAM read or write of a local window of tensor ``name``."""
+        rank = len(base)
+        self.add(core, time, 'dram', dict(name=name, is_write=write, access_base=list(base),
+                 access_extent=list(extent), access_stride_add=[1]*rank, access_offset_add=[0]*rank,
+                 init_iter=0, stride_iter=1, total_iter=1))
+        count = dtype
+        for n in extent:
+            count *= n
+        self.counts['dram_write_bytes' if write else 'dram_read_bytes'] += count
+
     def memory(self, time, region, write=False, dtype=2):
-        self.add(region.core, time, 'dram', dict(name=region.name, is_write=write,
-                 access_base=[region.local_row, region.local_col], access_extent=[region.rows, region.cols],
-                 access_stride_add=[1, 1], access_offset_add=[0, 0], init_iter=0, stride_iter=1, total_iter=1))
-        self.counts['dram_write_bytes' if write else 'dram_read_bytes'] += region.area*dtype
+        self.access(region.core, time, region.name, [region.local_row, region.local_col],
+                    [region.rows, region.cols], write, dtype)
 
     def buffer(self, core, time, size, write=False):
         if size:
@@ -262,12 +299,12 @@ class Timeline:
         self.buffer(core, time, read)
         self.buffer(core, time, write, True)
 
-    def send(self, time, src, dst, size):
+    def send(self, time, src, dst, size, name='data'):
         """Data arrival synchronises neighbours, as in native ATLAS collectives."""
         if src == dst or not size:
             return
         flits = (size+self.flit_size-1)//self.flit_size
-        packet = dict(name='data', src=src, dst=dst, flit_num=flits, init_flit_id=self.fid)
+        packet = dict(name=name, src=src, dst=dst, flit_num=flits, init_flit_id=self.fid)
         self.fid += flits
         self.add(src, time, 'noc_tx', dict(packet, is_send=True))
         self.add(dst, time, 'noc_rx', dict(packet, is_send=False))
@@ -351,6 +388,10 @@ class Graph:
     def add_timeline(self, name, timeline, **metadata):
         self.add(name, timeline.finish(), dict(timeline.counts, **metadata))
 
+    def column(self, region):
+        """Whether ``region``'s physical tensor is stored column-major."""
+        return self.tensors[region.core][region.name]['strides'][0] == 1
+
     def gather(self, timeline, groups, start=0):
         """Emit the linear all-gather of replica ``groups`` from step ``start``.
 
@@ -364,7 +405,7 @@ class Graph:
         for lines in gather_lines(groups, isqrt(self.cores)):
             end = start
             for members, slabs in lines:
-                panels = [panelize(box, limit) for box in slabs]
+                panels = [panelize(box, limit, self.column(m)) for m, box in zip(members, slabs)]
                 count = max(map(len, panels))
                 for origin, src in enumerate(members):
                     for q, box in enumerate(panels[origin]):
@@ -407,7 +448,7 @@ class Graph:
             if src.core == dst.core and src.name == dst.name and (src.local_row, src.local_col) == (dst.local_row, dst.local_col):
                 continue
             uses = [('tx', src.core), ('rx', dst.core), *route(src.core, dst.core, side)]
-            for box in panelize((src.row, src.col, src.rows, src.cols), limit):
+            for box in panelize((src.row, src.col, src.rows, src.cols), limit, self.column(src)):
                 step = 0
                 while any(step in busy[u] for u in uses):
                     step += 1
@@ -423,7 +464,7 @@ class Graph:
         self.edges.append(dict(name=name, **timeline.counts, aliased=not moved))
         return target
 
-    def simulate(self, out, timeout=7200):
+    def simulate(self, out, timeout=7200, deadline=None):
         out = Path(out).resolve(); out.mkdir(parents=True, exist_ok=True)
         operators = []
         for i, entry in enumerate(self.operations):
@@ -441,5 +482,5 @@ class Graph:
         (out/'graph.json').write_text(json.dumps(manifest, indent=2))
         placement = dict(core_tensor=[dict(core_id=i, tensor=list(t.values())) for i,t in enumerate(self.tensors)])
         dump(out/'operators.yaml',dict(operator=operators)); dump(out/'placement.yaml',placement)
-        result = execute(self.chip,out,dict(operator=operators),placement,timeout)
+        result = execute(self.chip,out,dict(operator=operators),placement,timeout,deadline)
         return dict(result=result, graph=manifest)

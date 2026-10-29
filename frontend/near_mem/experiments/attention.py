@@ -3,8 +3,9 @@
 Q is stored once, row-sharded over all cores; KV uses the common static
 head-partitioned layout. Moving or replicating Q to the cores a plan needs is
 part of the measured graph, as is writing the output. Attention plans are few,
-so every one is simulated; there is no proxy stage. Each run searches one
-method together with the native splits it contains.
+so every one is simulated; there is no proxy stage. ``atlas`` uses the native
+context splits; other methods add their own plans to them. Each run writes only
+its own cycles; ``experiments.compare`` turns separate runs into speedups.
 """
 import argparse
 from dataclasses import asdict, replace
@@ -13,7 +14,7 @@ from pathlib import Path
 import time
 
 from ..methods import METHODS
-from ..model.attention import Attention, AttentionPlan, KVLayout, compile_attention, endpoints, plans
+from ..model.attention import Attention, KVLayout, compile_attention, endpoints, plans
 from ..model.transformer import materialize
 from ..search import measure_all
 from ..sim import WORKERS, dump, hardware
@@ -54,13 +55,11 @@ def run(problem, chip, out, method='ours', workers=WORKERS):
     space = list(dict.fromkeys(native+[p for m in names for p in METHODS[m].attention(layout, sram)]))
     rows = measure_all(space, lambda p: measure(problem, chip, out/'runs', p), workers)
     dump(out/'results.json', rows)
-    atlas = min((r for r in rows if AttentionPlan(**r['plan']) in native), key=cycles)
     selected = min(rows, key=cycles)
-    summary = dict(problem=asdict(problem), chip=str(chip), method=method, atlas=atlas, best=selected,
-                   speedup=cycles(atlas)/cycles(selected), plans=dict(atlas=len(native), method=len(space)),
-                   seconds=time.monotonic()-started)
+    summary = dict(experiment='attention', problem=asdict(problem), chip=str(chip), method=method, best=selected,
+                   cycles=cycles(selected), plans=len(space), seconds=time.monotonic()-started)
     dump(out/'summary.json', summary)
-    print(json.dumps({k: summary[k] for k in ('method', 'speedup', 'plans')}, indent=2), flush=True)
+    print(json.dumps({k: summary[k] for k in ('method', 'cycles', 'plans')}, indent=2), flush=True)
     return summary
 
 

@@ -5,7 +5,7 @@ for lowering actual loads, stores, buffers and NoC messages into native ATLAS.
 It makes unequal periods and C rotation precise before backend migration.
 """
 from itertools import product
-from math import prod
+from math import isqrt, prod
 
 from .plan import DEPENDENCIES, REPLICA_AXIS
 
@@ -15,7 +15,11 @@ class Ownership:
         plan.validate(problem)
         self.problem,self.plan=problem,plan
         self.layers=plan.layers
-        self.coords=list(product(*(range(n) for n in plan.ps)))
+        coords=list(product(*(range(n) for n in plan.ps)))
+        if plan.transpose:
+            # Physical core r*s+c takes the coordinates of logical core c*s+r.
+            s=isqrt(len(coords));coords=[coords[(j%s)*s+j//s] for j in range(len(coords))]
+        self.coords=coords
         self.ids={c:i for i,c in enumerate(self.coords)}
         self.base=tuple(n//(sp*tp) for n,sp,tp in zip(problem.shape,plan.ps,plan.periods))
         self.strides={v:{} for v in DEPENDENCIES}

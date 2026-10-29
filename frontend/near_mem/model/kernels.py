@@ -3,52 +3,14 @@ from copy import deepcopy
 from dataclasses import dataclass, replace
 from math import isqrt
 
-from ..gemm.lower import lower_tasks
-from ..gemm.compiler import compile_plan
-from ..tasks import Region, transfers, unique, window
-from ..gemm.ownership import Ownership
-from ..gemm.plan import DEPENDENCIES, Problem
+from ..gemm.compiler import compile_kernel
+from ..tasks import Region, coalesce, transfers, unique, window
+from ..gemm.plan import Problem
 from ..sim import strides
 
 
-def coalesce(regions):
-    regions = list(regions)
-    for vertical in (False, True):
-        result = []
-        def key(r):
-            return ((r.core, r.name, r.col, r.cols, r.local_col, r.local_row-r.row, r.row) if vertical else
-                    (r.core, r.name, r.row, r.rows, r.local_row, r.local_col-r.col, r.col))
-        for r in sorted(regions, key=key):
-            if result:
-                p = result[-1]
-                if key(p)[:-1] == key(r)[:-1] and ((p.row+p.rows == r.row) if vertical else (p.col+p.cols == r.col)):
-                    result[-1] = replace(p, rows=p.rows+r.rows) if vertical else replace(p, cols=p.cols+r.cols)
-                    continue
-            result.append(r)
-        regions = result
-    return regions
-
-
 def program_regions(program, tensor):
-    own = Ownership(program.problem, program.plan); p = program.plan
-    regions = []
-    if tensor == 'C':
-        for phase in program.phases:
-            for core, actions in enumerate(phase):
-                for a in actions:
-                    if a['op'] == 'store' and a.get('final'):
-                        regions.append(Region(core, 'C', a['key'][0]*p.tile[0], a['key'][1]*p.tile[1],
-                                              *a['extent'], *a['base']))
-    else:
-        axes = DEPENDENCIES[tensor]
-        for core in range(p.cores):
-            blocks = own.tensor_blocks(core, tensor)
-            indices = [sorted({b[i] for b in blocks}) for i in range(2)]
-            shape = [own.base[d] for d in axes]
-            for block in blocks:
-                regions.append(Region(core, tensor, block[0]*shape[0], block[1]*shape[1], *shape,
-                                      indices[0].index(block[0])*shape[0], indices[1].index(block[1])*shape[1]))
-    return coalesce(regions)
+    return program.regions(tensor)
 
 
 def bind_input(graph, name, source, regions, tensors):
@@ -94,10 +56,10 @@ class Gemm:
             if n % self.side or k % self.side or (self.gated and n % (2*self.side)):
                 raise ValueError('Native K/N partitions require exact divisibility')
         else:
-            self.program = compile_plan(self.problem, self.plan, sram, capacity)
+            self.program = compile_kernel(self.problem, self.plan, sram, capacity)
             # Static parameter packing: each even N tile contains corresponding
             # gate/up halves. All partial sums retain the ordinary GEMM layout.
-            self.fused_gate = self.gated and self.plan.tile[1] % 2 == 0
+            self.fused_gate = self.gated and self.program.gate_tile % 2 == 0
         return self
 
     def prepare(self, graph, name):
@@ -141,40 +103,45 @@ class Gemm:
     def compile(self, graph, source, rope_width=0):
         if self.native:
             return self._native(graph, source)
-        p = self.program
-        if rope_width and (rope_width % 2 or p.plan.tile[1] % 2):
+        p = self.program; out = 'C'+p.suffix
+        if rope_width and (rope_width % 2 or p.gate_tile % 2):
             raise ValueError('Fused RoPE requires complete even-sized Q column tiles')
         inputs, names = bind_input(graph, self.name+'_A', source, *self.input_layout(graph.cores))
         outputs = program_regions(p, 'C')
         active = {r.core for r in outputs}
+        scratch = []
         for core, placement in enumerate(p.placements):
-            c = next(t for t in placement['tensor'] if t['name'] == 'C')
-            graph.tensor(core, self.name+'_C', c['shape'], c['strides'])
-            if self.fused_gate and core in active:
-                graph.tensor(core, self.name+'_G', [c['shape'][0],c['shape'][1]//2])
+            for t in placement['tensor']:
+                if t['name'] in ('A', 'B'):
+                    continue
+                graph.tensor(core, self.name+'_'+t['name'], t['shape'], t['strides'])
+                if t['name'] == out and self.fused_gate and core in active:
+                    graph.tensor(core, self.name+'_G'+p.suffix, [t['shape'][0], t['shape'][1]//2])
+                if t['name'] != out or self.fused_gate or core not in active:
+                    scratch.append((core, self.name+'_'+t['name']))
         def epilogue(action):
             if self.fused_gate:
                 count = action['shape'][0]*action['shape'][1]//2
                 final = dict(action,tensor='G',**{key:[action[key][0],action[key][1]//2]
                                                 for key in ('base','extent','shape')})
                 return final,5*count,4*count,2*count
-            column = action['key'][1]*p.plan.tile[1]
+            column = action['key'][1]*action['shape'][1]
             count = action['shape'][0]*max(0,min(action['shape'][1],rope_width-column))
             return action,6*count,2*count,2*count
-        raw, manifest = lower_tasks(p, graph.flit,epilogue if rope_width or self.fused_gate else None)
+        raw, manifest = p.lower(graph.flit,epilogue if rope_width or self.fused_gate else None)
         for core, phases in enumerate(raw):
             for phase in phases:
                 for task in phase['dram']:
                     task['name'] = names[core] if task['name'] == 'A' else self.name+'_'+task['name']
         graph.add(self.name, raw, dict(manifest, category='gemm', native=False,
                   fused_gate=self.fused_gate,weight_columns='gate/up halves per N tile' if self.fused_gate else 'logical'))
-        for core in range(graph.cores):
-            if self.fused_gate or core not in active:
-                graph.live[core].pop(self.name+'_C',None)
+        for core, name in scratch:
+            graph.live[core].pop(name, None)
         graph.release(inputs, keep=source)
         if self.gated and not self.fused_gate:
-            return gate(graph, [replace(r,name=self.name+'_C') for r in outputs], self.problem.m, self.problem.n//2, self.name+'_gate')
-        return [replace(r,name=self.name+('_G' if self.fused_gate else '_C')) for r in self.output_layout(graph.cores)]
+            return gate(graph, [replace(r,name=self.name+'_'+out) for r in outputs], self.problem.m, self.problem.n//2, self.name+'_gate')
+        final = self.name+('_G' if self.fused_gate else '_C')+p.suffix
+        return [replace(r,name=final) for r in self.output_layout(graph.cores)]
 
     def _native(self, graph, source, reduce=True):
         from frontend.auto.tiling_explorer_cloud import make_gemm_description

@@ -7,7 +7,7 @@ accepting a Plan here does not imply it can already be lowered by that backend.
 from dataclasses import dataclass
 from functools import lru_cache
 from itertools import permutations
-from math import gcd, lcm, prod
+from math import gcd, isqrt, lcm, prod
 
 
 @dataclass(frozen=True)
@@ -47,7 +47,15 @@ class Plan:
     layer_order: tuple[int, ...] = ()
     # None selects full shifted panels. Explicit counts preserve old endpoints.
     panel: tuple[int, int, int] | None = None
+    # Rotation endpoint: 'sram_consume' keeps shifted panels in SRAM (ours);
+    # 'dram_land' lands every shifted A/B block in the receiver's DRAM.
     receive: str = 'sram_consume'
+    # DRAM home of A/B/C: 'local' follows the plan (ours); 'global' is one
+    # fixed 2-D block layout over the mesh, independent of the plan (T10).
+    layout: str = 'local'
+    # Number cores across the square mesh column-major instead of row-major
+    # (a TP partition's mesh direction, see ``Ownership``).
+    transpose: bool = False
 
     @property
     def temporal(self):
@@ -82,6 +90,10 @@ class Plan:
         return tuple(layers)
 
     @property
+    def land(self):
+        return self.receive=='dram_land'
+
+    @property
     def payload_tiles(self):
         return tuple(prod(self.periods[d]//parts[i]*self.group[d] for i,d in enumerate(DEPENDENCIES[v]))
                      for v,parts in self.temporal.items())
@@ -114,12 +126,45 @@ class Plan:
             raise ValueError('Layer order must be a permutation of all gcd layers')
         if self.receive not in ('sram_consume','dram_land'):
             raise ValueError('Unknown receive endpoint')
+        if self.layout not in ('local','global'):
+            raise ValueError('Unknown DRAM layout')
+        if self.receive=='dram_land':
+            # Whole blocks shift between whole-block computations: one epoch,
+            # i.e. the compiler saturates the group (canonically (1,1,1)).
+            if self.layout!='local' or self.panel is not None or self.group!=(1,1,1):
+                raise ValueError('DRAM landing rotates whole blocks of a local layout')
+        if self.transpose and isqrt(self.cores)**2!=self.cores:
+            raise ValueError('A transposed core numbering needs a square mesh')
         if self.panel is not None:
             if len(self.panel)!=3:
                 raise ValueError('Three panel capacities required')
             for (v,parts),n,payload in zip(self.temporal.items(),self.panel,self.payload_tiles):
                 if type(n) is not int or n<1 or n>(payload if prod(parts)>1 else 1):
                     raise ValueError(f'Invalid {v} panel capacity')
+
+    def sram_bytes(self, dtype=2, overlap=True):
+        """Live SRAM: resident panels, double buffers and transit buffers.
+
+        C's partial-result scratch is reused as its receive bank. A/B two-bank
+        allocation admits prefetch or computation/shift overlap, never both
+        future payloads in one bank.
+        """
+        tile={v:prod(self.tile[d] for d in axes)*dtype for v,axes in DEPENDENCIES.items()}
+        total=0
+        for (v,parts),payload in zip(self.temporal.items(),self.payload_tiles):
+            shifted=prod(parts)>1;landed=shifted and self.land
+            resident=shifted and not landed
+            total+=(payload if resident else 1)*tile[v]*(2 if overlap or resident or v=='C' else 1)
+            total+=3*tile[v]*landed  # a forwarded tile being read, sent and landed
+        if overlap and prod(self.c)==1:
+            total+=2*tile['C']  # Native double-buffered partial and running outputs.
+        if self.layout=='global':
+            total+=2*(tile['A']+tile['B'])  # tiles a home core serves to remote readers
+        if self.ps[2]//prod(self.c)>1:
+            # The final line reduce-scatter runs after compute; per direction a
+            # rank holds the tile it sends, the one it accumulates and the next.
+            total=max(total,6*tile['C'])
+        return total
 
     def orders(self):
         """Lazy exact layer orders; a search policy may rank, but must not rename, them."""
@@ -141,3 +186,26 @@ class Plan:
         from dataclasses import replace
         return replace(plan,layer_order=tuple(sorted(range(len(plan.layers)),
                        key=lambda i:-sum(sizes[v] for v in plan.layers[i].tensors))))
+
+
+@dataclass(frozen=True)
+class FlashPlan:
+    """FlashGEMM on a square mesh (see ``gemm.flash``): per (M panel, K tile)
+    step operands are all-gathered along mesh lines while the previous step
+    computes. ``b_resident`` (weight-stationary only) keeps the local B in
+    SRAM across M panels. ``n_tile=None`` holds the whole local N, as in the
+    paper; a smaller N panel is only our enabling extension when no such
+    plan fits the SRAM."""
+    dataflow: str
+    m_tile: int
+    k_tile: int
+    b_resident: bool = False
+    cores: int = 16
+    kind: str = 'flash'
+    n_tile: int | None = None
+
+
+def load(data):
+    """A plan from its ``asdict`` form."""
+    data={k:tuple(v) if isinstance(v,list) else v for k,v in data.items()}
+    return FlashPlan(**data) if data.get('kind')=='flash' else Plan(**data)

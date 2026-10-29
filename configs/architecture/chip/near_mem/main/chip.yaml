@@ -1,0 +1,36 @@
+# Main near-memory evaluation chip: the ATLAS core (16 cores, 7680 MAC/core,
+# 4x4 mesh, 128 B flits) with a 1 MiB SRAM and 0.5 TB/s of DRAM per core.
+# At 1 GHz the DRAM/compute balance point is M = 30 rows, so decode (B = 16)
+# is bandwidth bound and prefill is compute bound; the SRAM holds a few
+# hundred KiB of operand tiles instead of whole operands.
+architecture:
+  frequency: 1000
+  core_num: 16
+  core:
+    controller:
+      power: 0.7250
+      area: 3.6650
+    matrix:
+      mac_num: 7680
+      power: 3.1250
+      area: 13.1255
+    vector:
+      vec_num: 480
+      power: 0.3766
+      area: 1.2500
+    buffer:
+      buffer_size: 1024
+      read_bw: 32768.0
+      write_bw: 32768.0
+      power: 1.2717
+      area: 3.9461
+  dram:
+    config_path: configs/architecture/dram/cloud/cloud_0.5TBps.yaml
+    power: 2.6665
+    area: 4.9980
+  noc:
+    topology: mesh
+    config_path: configs/architecture/noc/4x4_mesh
+    flit_size: 128
+    power: 0.4754
+    area: 6.5970
