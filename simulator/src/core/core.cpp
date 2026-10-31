@@ -207,6 +207,10 @@ void Core::reset_execution_status() {
 
 
 void Core::pre_simulate(std::shared_ptr<OperatorTask> task) {
+    scheduled_dram = false;
+    dram_busy_until = clk;
+    dram_deadline.clear();
+    dram_ready_before.clear();
     for(auto p: components) {
         p.second->reset_execution_status(false);
     }
@@ -762,6 +766,9 @@ void Core::pre_simulate(std::shared_ptr<OperatorTask> task) {
     }
     else if(task->type == OperatorType::SPMDGeneral || task->type == OperatorType::MPMDGeneral) {
         cur_task_iteration_count = task->iteration + 2;
+        scheduled_dram = true;
+        dram_deadline.assign(cur_task_iteration_count, cur_task_iteration_count);
+        dram_ready_before.assign(cur_task_iteration_count + 1, 0);
         for(auto& p: pre_estimated_cycles_per_iter) {
             p.second.assign(cur_task_iteration_count, 0);
         }
@@ -840,6 +847,12 @@ void Core::pre_simulate(std::shared_ptr<OperatorTask> task) {
 
             for(auto d: iter_task.DRAM_tasks) {
                 int dram_iter = raw_iter + (d.is_write ? 2 : 0);
+                int deadline = d.ready_iter < 0 ? dram_iter + 1 : d.ready_iter;
+                if(deadline <= dram_iter || deadline > cur_task_iteration_count)
+                    throw std::invalid_argument("DRAM ready_iter must follow issue and stay within the operator");
+                // Requests issued together retain the native batch service
+                // model; its earliest consumer conservatively waits for all.
+                dram_deadline[dram_iter] = std::min(dram_deadline[dram_iter], deadline);
                 const TensorPlacement& placement = placement_map->at(d.name);
                 append_dram_access_item(
                     dram_inputs[dram_iter],
@@ -869,10 +882,8 @@ void Core::pre_simulate(std::shared_ptr<OperatorTask> task) {
                 pre_estimated_cycles_per_iter[buffer_name][i]
             );
             on_chip_pipeline_iters.push_back(on_chip_pipeline_cyc);
-            pre_estimated_cycles_per_iter["Total"][i] = std::max(
-                on_chip_pipeline_cyc,
-                pre_estimated_cycles_per_iter[dram_name][i]
-            );
+            // DRAM is now charged by its shared queue, not by this iteration.
+            pre_estimated_cycles_per_iter["Total"][i] = on_chip_pipeline_cyc;
         }
     }
     else {
@@ -901,7 +912,7 @@ void Core::pre_simulate(std::shared_ptr<OperatorTask> task) {
             }
             if(on_chip_max > m)
                 on_chip_bubble += on_chip_max - m;
-            if(d > on_chip_max)
+            if(!scheduled_dram && d > on_chip_max)
                 dram_bubble += d - on_chip_max;
         }
         cur_task_stats.compute_non_overlap_cycles = non_overlap;
@@ -913,6 +924,7 @@ void Core::pre_simulate(std::shared_ptr<OperatorTask> task) {
     cur_iteration = 0;
     cur_iteration_cycles = pre_estimated_cycles_per_iter["Total"][0];
     cur_iteration_elapsed_cycles = 0;
+    issue_dram_iteration();
     // Insert 1st iter's NoC packets into send/receive buffers
     if(pre_generated_noc_packets.size() > cur_iteration) {
         send_buffer->insert(
@@ -926,6 +938,17 @@ void Core::pre_simulate(std::shared_ptr<OperatorTask> task) {
             pre_generated_noc_packets[cur_iteration].second.end()
         );
     }
+}
+
+void Core::issue_dram_iteration() {
+    if(!scheduled_dram) return;
+    uint64_t cycles = pre_estimated_cycles_per_iter[dram_name][cur_iteration];
+    if(!cycles) return;
+    dram_busy_until = std::max(clk, dram_busy_until) + cycles;
+    auto& ready = dram_ready_before[dram_deadline[cur_iteration]];
+    ready = std::max(ready, dram_busy_until);
+    // All writes and outstanding reads must finish before leaving the op.
+    dram_ready_before.back() = std::max(dram_ready_before.back(), dram_busy_until);
 }
 
 
@@ -957,13 +980,18 @@ void Core::tick() {
         bool non_NoC_finished = cur_iteration_elapsed_cycles >= cur_iteration_cycles;
         // NoC action is completed if all packets in send/receive buffers are processed
         bool NoC_finished =  send_buffer->empty() && received_buffer->empty();
+        bool dram_finished = !scheduled_dram || clk >= dram_ready_before[cur_iteration + 1];
+        if(non_NoC_finished && NoC_finished && !dram_finished)
+            cur_task_stats.matrix_bubble_dram_cycles++;
         
         // Tick active non-NoC components
         for(const auto& p: pre_estimated_cycles_per_iter) {
             if(p.first == "Total")
                 continue;
                 
-            if(cur_iteration_elapsed_cycles <= p.second[cur_iteration]) {
+            bool active = p.first == dram_name && scheduled_dram ? clk <= dram_busy_until
+                              : cur_iteration_elapsed_cycles <= p.second[cur_iteration];
+            if(active) {
                 components[p.first]->tick(true);
                 if(p.first == matrix_name)
                     cur_task_stats.matrix_cycles++;
@@ -985,7 +1013,7 @@ void Core::tick() {
             cur_task_stats.noc_cycles++;
 
         // If current iteration has passed all cycles, move on to the next cycle
-        if(non_NoC_finished && NoC_finished) {
+        if(non_NoC_finished && NoC_finished && dram_finished) {
             cur_task_stats.flop_count += 2 * pre_estimated_op_count_per_iter[matrix_name][cur_iteration]
                                        + pre_estimated_op_count_per_iter[vector_name][cur_iteration];
             cur_task_stats.memory_access_bytes += pre_estimated_op_count_per_iter[dram_name][cur_iteration];
@@ -995,6 +1023,7 @@ void Core::tick() {
             // Only update iteration state if there are remaining iterations
             if(cur_iteration < cur_task_iteration_count) {
                 cur_iteration_cycles = pre_estimated_cycles_per_iter["Total"][cur_iteration];
+                issue_dram_iteration();
                 // Update NoC Buffers and states
                 if(pre_generated_noc_packets.size() > cur_iteration) {
                     send_buffer->insert(

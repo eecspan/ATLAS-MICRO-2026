@@ -17,6 +17,47 @@ from .plan import Problem, load
 from ..sim import ROOT, KEYS, hardware, fingerprint
 
 
+def prefetch_windows(phases):
+    """Read issue/use positions for the compiler's two local A/B banks.
+
+    A new panel may start while the preceding panel computes, but never
+    crosses another load or a send/receive of that tensor: those occupy the
+    second bank. Thus B can prefetch across A rotations (and conversely),
+    without inventing a third bank for a tensor that is itself in flight.
+    """
+    uses = {}; sends = {}; ready = {}
+    for t in range(len(phases)-1,-1,-1):
+        for core,actions in enumerate(phases[t]):
+            # Uses in this phase precede loads appended by the pipeline.
+            for a in actions:
+                if a['op'] == 'load' and a['tensor'] in ('A','B'):
+                    v = a['tensor']
+                    end = min(uses.get((core,v,a['key']),len(phases)),sends.get((core,v),len(phases)))
+                    if end < len(phases):ready[id(a)] = end
+            for a in actions:
+                if a['op'] == 'gemm':
+                    m,n,k = a['index']
+                    uses[core,'A',(m,k)] = t; uses[core,'B',(k,n)] = t
+                elif a['op'] == 'send' and a['tensor'] in ('A','B'):
+                    sends[core,a['tensor']] = t
+    first_compute = {}; windows = {}
+    for t,row in enumerate(phases):
+        touched = set()
+        for core,actions in enumerate(row):
+            for v in ('A','B'):
+                key = (core,v)
+                if any(a['op']=='gemm' for a in actions):first_compute.setdefault(key,t)
+                for a in actions:
+                    if a['op']=='load' and a['tensor']==v:
+                        issue = first_compute.get(key,t)
+                        if id(a) in ready:windows[id(a)] = (issue,ready[id(a)])
+                        touched.add(key)
+                    elif a['op']=='send' and a['tensor']==v:
+                        touched.update((key,(a['dst'],v)))
+        for key in touched:first_compute.pop(key,None)
+    return windows
+
+
 def lower_tasks(program, flit_size, final_ops=None):
     """Return native tasks without imposing a file or graph boundary.
 
@@ -34,20 +75,23 @@ def lower_tasks(program, flit_size, final_ops=None):
     # does not additionally charge DRAM staging or implicit accumulator clear.
     phases=[row for row in program.phases if any(a['op'] not in ('clear','zero','drop') for ops in row for a in ops)]
     if glob:phases.insert(0,[[] for _ in range(p.cores)])  # room for the first remote reads
+    windows = prefetch_windows(phases) if program.overlap and not glob and not p.land else {}
     length=len(phases)+1
     raw=[[{k:[] for k in KEYS} for _ in range(length)] for _ in range(p.cores)]
     fid=macs=vectors=reads=writes=0
+    finalized={}
     def cell(core,slot):
         if slot<0:raise ValueError('Program starts before its operands can arrive')
         return raw[core][slot]
     def buffer(core,i,count,write):
         cell(core,i)['buffer_store' if write else 'buffer_load'].append(dict(name='sram',byte_count=count,is_write=write))
-    def dram(core,slot,name,base,extent,write):
+    def dram(core,slot,name,base,extent,write,ready=None):
         nonlocal reads,writes
         rank=len(base);count=prod(extent)*dtype
         cell(core,slot)['dram'].append(dict(name=name,is_write=write,access_base=list(base),access_extent=list(extent),
                                             access_stride_add=[1]*rank,access_offset_add=[0]*rank,
-                                            init_iter=0,stride_iter=1,total_iter=1))
+                                            init_iter=0,stride_iter=1,total_iter=1,
+                                            **({} if ready is None else dict(ready_iter=ready))))
         reads+=0 if write else count;writes+=count if write else 0
     def send(slot,src,dst,name,count):
         nonlocal fid
@@ -62,8 +106,9 @@ def lower_tasks(program, flit_size, final_ops=None):
                 op=a['op']
                 if op in ('load','store'):
                     if op=='store' and a.get('final') and final_ops is not None:
+                        ready=a['key'] in finalized
                         a,operations,read_bytes,write_bytes = final_ops(a)
-                        if operations:
+                        if operations and not ready:
                             cell(core,i-1)['vector'].append(dict(name='output_epilogue',vec_count=operations))
                             buffer(core,i-1,read_bytes,False);buffer(core,i-1,write_bytes,True)
                             vectors+=operations
@@ -79,7 +124,8 @@ def lower_tasks(program, flit_size, final_ops=None):
                             else:
                                 dram(home,i,name,base,extent,False);send(i,home,core,a['tensor'],prod(extent)*dtype)
                     else:
-                        dram(core,i-1 if write else i+1,a.get('name',a['tensor']),a['base'],a['extent'],write)
+                        issue,ready = windows.get(id(a),(i+1,None))
+                        dram(core,i-1 if write else issue,a.get('name',a['tensor']),a['base'],a['extent'],write,ready)
                 elif op=='forward':
                     dram(core,i,a['name'],a['base'],a['extent'],False)
                     send(i,core,a['dst'],a['tensor'],a['byte_count'])
@@ -100,7 +146,17 @@ def lower_tasks(program, flit_size, final_ops=None):
                     count=a['byte_count']//dtype;vectors+=count
                     cell(core,i)['vector'].append(dict(name='split_k_add',vec_count=count))
                     buffer(core,i,a['byte_count']*2,False);buffer(core,i,a['byte_count'],True)
-                elif op=='send':send(i,core,a['dst'],a['tensor'],a['byte_count'])
+                elif op=='finalize':
+                    out,operations,read_bytes,write_bytes=final_ops(a) if final_ops else (a,0,0,0)
+                    finalized[a['key']]=out
+                    if operations:
+                        cell(core,i)['vector'].append(dict(name='output_epilogue',vec_count=operations))
+                        buffer(core,i,read_bytes,False);buffer(core,i,write_bytes,True);vectors+=operations
+                elif op in ('send','copy'):
+                    count=a['byte_count']
+                    if op=='copy' and a['key'] in finalized:
+                        count=prod(finalized[a['key']]['extent'])*dtype
+                    send(i,core,a['dst'],a['tensor'],count)
                 elif op not in ('clear','zero','drop','nop'):raise ValueError(f'Unknown IR operation: {op}')
     while not any(any(x[-1].values()) for x in raw):
         for x in raw:x.pop()

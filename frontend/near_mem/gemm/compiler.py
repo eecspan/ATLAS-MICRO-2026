@@ -16,6 +16,7 @@ from .ownership import Ownership
 from .plan import DEPENDENCIES
 from .program import Program
 from ..sim import span, strides
+from ..output import reduce_steps, broadcast_steps, root_index
 
 
 def compile_kernel(problem, plan, sram_bytes, dram_bytes):
@@ -188,7 +189,8 @@ def compile_plan(problem, plan, sram_bytes, dram_bytes, overlap=True):
             rows[2+s][dst].append(dict(op='add',key=key,byte_count=tile_bytes['C']))
             rows[1+s][src].append(dict(op='send',dst=dst,tensor='C',target='partial',key=key,byte_count=tile_bytes['C']))
         for c,key in enumerate(keys):
-            rows[r+1][cores[r-1-c]].append(access(cores[r-1-c],'C',key,True,True))
+            if p.output != 'replicated':
+                rows[r+1][cores[r-1-c]].append(access(cores[r-1-c],'C',key,True,True))
         for (core,key),row in last.items():  # free a forwarded partial after its last send
             if core!=cores[r-1-keys.index(key)]:
                 rows[row][core].append(dict(op='drop',tensor='C',key=key));cache[core]['C'].discard(key)
@@ -268,17 +270,44 @@ def compile_plan(problem, plan, sram_bytes, dram_bytes, overlap=True):
             writes[-1]['final']=True
             continue
         groups.setdefault(tuple(cores),[]).append(key)
-    waves=[[(cores,keys[i:i+len(cores)]) for i in range(0,len(keys),len(cores))] for cores,keys in groups.items()]
+    waves=[[(cores,keys[i:i+(1 if p.output in ('first','last') else len(cores))])
+            for i in range(0,len(keys),1 if p.output in ('first','last') else len(cores))] for cores,keys in groups.items()]
     for w in range(max(map(len,waves),default=0)):
         batch=[g[w] for g in waves if w<len(g)]
         rows=[phase() for _ in range(max(len(c) for c,_ in batch)+2)]
-        for cores,keys in batch:reduce_scatter(rows,cores,keys)
+        for cores,keys in batch:
+            if p.output in ('first','last'):
+                key=keys[0]; root=root_index(p.output,len(cores),0)
+                for core in cores:
+                    rows[0][core].extend([dict(op='clear',tensor='C'),access(core,'C',key)])
+                for t,src,dst in reduce_steps(cores,root):
+                    rows[1+t][src].append(dict(op='send',dst=dst,tensor='C',target='partial',key=key,byte_count=tile_bytes['C']))
+                    rows[2+t][dst].insert(0,dict(op='add',key=key,byte_count=tile_bytes['C']))
+                rows[-1][cores[root]].append(access(cores[root],'C',key,True,True))
+            else:
+                reduce_scatter(rows,cores,keys)
+        if p.output == 'replicated':
+            # Broadcast completed tiles directly from SRAM, one tile at a
+            # time per group. No intermediate final store/reload is inserted.
+            for c in range(max(len(keys) for _,keys in batch)):
+                final=phase()
+                send_rows=[phase() for _ in range(max(len(cores) for cores,_ in batch))]
+                stores=phase()
+                for cores,keys in batch:
+                    if c>=len(keys):continue
+                    key=keys[c]; root=len(cores)-1-c
+                    final[cores[root]].append(dict(access(cores[root],'C',key,True,True),op='finalize'))
+                    for t,src,dst in broadcast_steps(cores,root):
+                        send_rows[t][src].append(dict(op='copy',dst=dst,tensor='C',key=key,byte_count=tile_bytes['C']))
+                    for core in cores:
+                        stores[core].append(access(core,'C',key,True,True))
+                        stores[core].append(dict(op='drop',tensor='C',key=key))
     phases=[row for row in phases if any(row)]
     if overlap:
         phases=pipeline(phases)
     if forwards:
         phases=place_forwards(phases,forwards)
-    return Program(problem,plan,phases,placements,needed)
+    return Program(problem,plan,phases,placements,needed,overlap)
 
 
 def timed(row):

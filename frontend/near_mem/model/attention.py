@@ -15,6 +15,7 @@ from math import ceil, gcd
 
 from ..tasks import Region, window
 from ..gemm.space import divisors
+from ..output import root_index, destinations
 
 
 @dataclass(frozen=True)
@@ -162,6 +163,7 @@ class AttentionPlan:
     kv_tile: int = 0
     query_shift: int = 0
     kv_shift: int = 1
+    output: str = 'sharded'
 
     def sram_bytes(self, problem):
         q = min(self.query_tile, ceil(problem.queries/self.query_parts))*problem.group
@@ -172,6 +174,7 @@ class AttentionPlan:
         return 16*q*d + 16*q + 16*k*d + 4*q*k
 
     def validate(self, layout, sram):
+        root_index(self.output,self.context_parts,self.context_parts-1)
         p = self.query_parts
         if min(p, self.context_parts, self.query_tile) < 1 or self.kv_tile < 0:
             raise ValueError('Attention tile/partition sizes must be positive')
@@ -230,11 +233,14 @@ def endpoints(layout, plan):
     from .attention_schedule import packets, lane_core
     blocks = list(assignments(layout,plan)); output = []
     for h,b,s,c,r in blocks:
-        if c != plan.context_parts-1:
+        if c != 0:
             continue
-        rounds = max(map(len,packets(layout,plan,h,b,c)))
-        lane = (s+rounds*(plan.query_parts-1)*plan.query_shift)%plan.query_parts
-        output.append(replace(r,core=lane_core(layout,plan,h,b,lane,c)))
+        cores=[]
+        for segment in range(plan.context_parts):
+            rounds = max(map(len,packets(layout,plan,h,b,segment)))
+            lane = (s+rounds*(plan.query_parts-1)*plan.query_shift)%plan.query_parts
+            cores.append(lane_core(layout,plan,h,b,lane,segment))
+        output.extend(replace(r,core=core) for core in destinations(plan.output,cores,plan.context_parts-1))
     return [r for *_,r in blocks],output
 
 
@@ -242,3 +248,23 @@ def compile_attention(graph, layout, plan, query, cache, name='attention'):
     from .attention_schedule import Schedule
     plan.validate(layout,graph.sram)
     return Schedule(layout,plan,cache).lower(graph,query,name)
+
+
+def build_attention(problem, chip, plan, placed=False):
+    """Single-operator graph shared by proxy and simulation.
+
+    Q starts with one row-sharded copy, or already in the consumer layout
+    for whole-graph search (whose edges account for distribution separately).
+    """
+    from ..tasks import Graph
+    graph = Graph(chip); layout = KVLayout(problem,graph.cores)
+    cache = layout.allocate(graph); rows = problem.batch*problem.queries
+    regions = endpoints(layout,plan)[0] if placed else [
+        Region(c,'',rows*c//graph.cores,0,rows*(c+1)//graph.cores-rows*c//graph.cores,problem.hidden)
+        for c in range(graph.cores) if rows*(c+1)//graph.cores>rows*c//graph.cores]
+    query = []
+    for i,r in enumerate(regions):
+        name = f'query_{i}'
+        graph.tensor(r.core,name,[r.rows,r.cols]); query.append(replace(r,name=name))
+    compile_attention(graph,layout,plan,query,cache)
+    return graph

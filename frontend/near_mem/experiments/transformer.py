@@ -31,7 +31,9 @@ import time
 from ..gemm.plan import load
 from ..gemm.space import Proxy, structure
 from ..methods import METHODS, propose, target, union
+from ..output import variants as output_variants
 from ..model.attention import AttentionPlan, KVLayout, plans as attention_plans
+from ..model.attention_proxy import AttentionProxy
 from ..model.kernels import Gemm
 from ..model.transformer import (Workload, build, configuration, decode_configuration, edge_regions, edges,
                                  port, roles, tune_native)
@@ -127,9 +129,11 @@ class Chain:
     Each option is simulated once with its inputs already in its own layout;
     each layout edge is scored from its exact per-core traffic.
     """
-    def __init__(self, exp, hw, proxy, workers):
+    def __init__(self, exp, hw, proxy, workers, attention_budget=32):
         self.exp = exp; self.hw = hw; self.proxy = proxy; self.workers = workers
         self.cycles = {}; self.ports = {}; self.edge_scores = {}
+        self.attention_proxy = AttentionProxy(exp.chip); self.attention_budget = attention_budget
+        self.attention_report = {}
 
     def kernel(self, name, entry):
         k = Gemm(self.exp.workload.problems[name], load(entry['plan']), entry['native'], entry['direction'],
@@ -153,6 +157,14 @@ class Chain:
 
     def prepare(self, options):
         """Measure every distinct option once; drop illegal and behaviourally equal options."""
+        def boundaries(name, choice):
+            if name == 'attention':
+                return output_variants(choice)
+            if choice['native']:
+                return [choice]  # upstream checker retains its original collective
+            return [dict(choice,plan=asdict(p)) for p in output_variants(load(choice['plan']))]
+        options = {name:[c for choice in choices for c in boundaries(name,choice)]
+                   for name,choices in options.items()}
         def legal(name, c):
             try:
                 return name == 'attention' or self.kernel(name, c) is not None
@@ -160,6 +172,12 @@ class Chain:
                 return False
         options = {name: list({token(c): c for c in choices if legal(name, c)}.values())
                    for name, choices in options.items()}
+        if 'attention' in options:
+            candidates = options['attention']
+            options['attention'] = self.attention_proxy.select(self.exp.workload.attention,candidates,
+                                                               self.attention_budget,placed=True)
+            self.attention_report = dict(plans=len(candidates),measured=len(options['attention']),
+                                         proxy_budget=self.attention_budget)
         jobs = list({(name, token(c)): (name, c) for name, choices in options.items() for c in choices
                      if (name, token(c)) not in self.cycles}.items())
         with ThreadPoolExecutor(max_workers=self.workers) as pool:
@@ -226,7 +244,7 @@ ORDER = ('qkv', 'attention', 'output', 'expand', 'contract')
 
 
 def run(workload, chip, out, method='ours', budget=4, workers=WORKERS, tile_min=8, passes=2, width=64, keep=8, tiles=2,
-        refine=3, deadline=None):
+        refine=3, deadline=None, attention_budget=32):
     exp = Experiment(workload, chip, out); started = time.monotonic(); stop = deadline and started+deadline
     # Weights are preplaced once, like the native TP shards; replicating them
     # would trade unbilled DRAM capacity for speed.
@@ -252,11 +270,11 @@ def run(workload, chip, out, method='ours', budget=4, workers=WORKERS, tile_min=
                                       lambda space, m: diverse(space, score, budget, structure, tiles, bound), method)
             options[name] = [dict(plan=asdict(p), native=False, **roles(workload, name)) for p in union(ranked, method)]
             report[name] = dict(scanned=scanned, chosen={k: [asdict(p) for p, _ in v] for k, v in ranked.items()})
-    chain = Chain(exp, hw, proxy, workers)
+    chain = Chain(exp, hw, proxy, workers, attention_budget)
     options, proposals, configs = chain.propose({k: options[k] for k in ORDER}, width, keep)
     best = min(exp.measure_many(configs, method+'_joint', workers, stop, abort=False), key=cycles)
     best = descend(exp, best, chain.neighbours(options, refine), method, passes, workers, stop)
-    dump(exp.out/'search.json', dict(gemm=report, joint=[dict(score=score, configuration=cfg)
+    dump(exp.out/'search.json', dict(gemm=report, attention=chain.attention_report, joint=[dict(score=score, configuration=cfg)
                                                           for (score, _), cfg in zip(proposals, configs)],
                                       budget=budget, tiles=tiles, passes=passes, width=width, keep=keep, refine=refine))
     summary = dict(experiment='transformer', workload=asdict(workload), chip=str(Path(chip).resolve()), method=method,
@@ -274,7 +292,7 @@ def main():
     parser.add_argument('--method', choices=list(METHODS), default='ours')
     for name, value in [('batch', 1), ('context', 128), ('query-heads', 8), ('kv-heads', 2), ('head-dim', 64),
                         ('ffn', 1536), ('budget', 4), ('workers', WORKERS), ('tile-min', 8), ('passes', 2),
-                        ('width', 64), ('keep', 8), ('tiles', 2), ('refine', 3)]:
+                        ('width', 64), ('keep', 8), ('tiles', 2), ('refine', 3), ('attention-budget', 32)]:
         parser.add_argument('--'+name, type=int, default=value)
     parser.add_argument('--deadline', type=float, help='common wall-clock cap in seconds (no graph starts later)')
     a = parser.parse_args()
@@ -284,7 +302,7 @@ def main():
     workload = Workload(a.batch, a.context if a.mode == 'prefill' else 1, a.context, a.query_heads, a.kv_heads,
                         a.head_dim, a.ffn)
     run(workload, a.chip, a.output, a.method, a.budget, a.workers, a.tile_min, a.passes, a.width, a.keep, a.tiles, a.refine,
-        a.deadline)
+        a.deadline,a.attention_budget)
 
 
 if __name__ == '__main__':

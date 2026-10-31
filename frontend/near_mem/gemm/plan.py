@@ -56,6 +56,7 @@ class Plan:
     # Number cores across the square mesh column-major instead of row-major
     # (a TP partition's mesh direction, see ``Ownership``).
     transpose: bool = False
+    output: str = 'sharded'
 
     @property
     def temporal(self):
@@ -99,6 +100,9 @@ class Plan:
                      for v,parts in self.temporal.items())
 
     def validate(self, problem):
+        from ..output import POLICIES
+        if self.output not in POLICIES or (self.layout == 'global' and self.output != 'sharded'):
+            raise ValueError('Invalid output contract for the DRAM layout')
         if any(len(x)!=3 for x in (self.ps,self.tile,self.group)) or any(len(x)!=2 for x in (self.a,self.b,self.c)):
             raise ValueError('Spatial/tile/group triples and tensor period pairs required')
         numbers=(*problem.shape,problem.dtype_bytes,*self.ps,*self.tile,*self.a,*self.b,*self.c,*self.group)

@@ -84,6 +84,15 @@ private:
     // Used for storing pre-generated NoC packets in each iteration
     std::vector<std::pair<std::vector<Packet>, std::vector<Packet>>> pre_generated_noc_packets;
 
+    // General operators use the same Ramulator batch service times as before,
+    // on one FIFO DRAM resource per core. Only annotated reads may survive an
+    // iteration boundary; consumers and the operator epilogue wait for them.
+    bool scheduled_dram = false;
+    uint64_t dram_busy_until = 0;
+    std::vector<int> dram_deadline;
+    std::vector<uint64_t> dram_ready_before;
+    void issue_dram_iteration();
+
     void pre_simulate(std::shared_ptr<OperatorTask> task);
     void update_cur_task_energy();
 

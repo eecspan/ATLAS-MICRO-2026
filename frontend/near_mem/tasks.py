@@ -267,20 +267,22 @@ class Timeline:
             self.raw[core].append({k: [] for k in KEYS})
         self.raw[core][slot][key].append(task)
 
-    def access(self, core, time, name, base, extent, write=False, dtype=2):
-        """One DRAM read or write of a local window of tensor ``name``."""
+    def access(self, core, time, name, base, extent, write=False, dtype=2, ready=None):
+        """Local DRAM access; a prefetched read waits only at ``ready`` time."""
         rank = len(base)
+        if ready is not None and (write or ready <= time):
+            raise ValueError('Prefetch requires a read with a later consumer')
         self.add(core, time, 'dram', dict(name=name, is_write=write, access_base=list(base),
                  access_extent=list(extent), access_stride_add=[1]*rank, access_offset_add=[0]*rank,
-                 init_iter=0, stride_iter=1, total_iter=1))
+                 init_iter=0, stride_iter=1, total_iter=1, **({} if ready is None else dict(ready_iter=ready))))
         count = dtype
         for n in extent:
             count *= n
         self.counts['dram_write_bytes' if write else 'dram_read_bytes'] += count
 
-    def memory(self, time, region, write=False, dtype=2):
+    def memory(self, time, region, write=False, dtype=2, ready=None):
         self.access(region.core, time, region.name, [region.local_row, region.local_col],
-                    [region.rows, region.cols], write, dtype)
+                    [region.rows, region.cols], write, dtype, ready)
 
     def buffer(self, core, time, size, write=False):
         if size:
@@ -379,7 +381,14 @@ class Graph:
             if isinstance(obj, list):
                 return [copy(v) for v in obj]
             return obj
-        raw = copy(raw)
+        if kind in ('mpmd-general','spmd-general'):
+            # General tasks have a fixed shallow schema. Only packets need
+            # renumbering; traversing every scalar in compute/DRAM tasks is
+            # expensive when a fused schedule has thousands of iterations.
+            raw = [[dict(phase,noc_tx=[copy(p) for p in phase['noc_tx']],
+                               noc_rx=[copy(p) for p in phase['noc_rx']]) for phase in row] for row in raw]
+        else:
+            raw = copy(raw)
         self.next_flit += largest+1
         if self.next_flit >= 2**31:
             raise ValueError('Native flit identifier overflow')

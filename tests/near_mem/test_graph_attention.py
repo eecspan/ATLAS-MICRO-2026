@@ -289,7 +289,11 @@ def test_edge_traffic_model_matches_built_graph(tmp_path):
                             ({'qkv':Plan((16,1,1),(m//16,16,16)),'contract':Plan((4,4,1),(m//4,16,16)),
                               'expand':Plan((2,8,1),(m//2,16,64))},AttentionPlan(2,1,4)),
                             ({'qkv':Plan((1,16,1),(m,8,16)),'output':Plan((4,4,1),(m//4,4,16))},AttentionPlan(1,2,1)),
-                            ({},AttentionPlan(4,2,4,4,1,2))]:
+                            ({},AttentionPlan(4,2,4,4,1,2)),
+                            ({'qkv':Plan((1,4,4),(16,16,16),output='replicated'),
+                              'output':Plan((1,4,4),(16,16,16),output='first'),
+                              'expand':Plan((1,4,4),(16,16,16),output='replicated')},
+                             AttentionPlan(4,2,4,4,1,2,output='replicated'))]:
         kernels = {n:Gemm(p,plans.get(n,Plan((1,4,4),(16,16,16))),n not in plans,int(n=='expand'),n=='expand')
                    for n,p in w.problems.items()}
         graph = build(w,chip,configuration(kernels,attention))

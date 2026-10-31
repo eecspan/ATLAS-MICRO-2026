@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <iostream>
 #include <string>
+#include <stdexcept>
 #include <vector>
 #include <yaml-cpp/yaml.h>
 
@@ -56,6 +57,9 @@ struct DRAMTask {
     int init_iter = 0;
     int stride_iter = 0;
     int total_iter = 0;
+    // General-task read: simulator iteration of its first SRAM consumer.
+    // Absent means the legacy read-before-next-iteration barrier.
+    int ready_iter = -1;
 
     std::vector<int64_t> access_base;
     std::vector<int64_t> access_extent;
@@ -74,6 +78,11 @@ struct DRAMTask {
         init_iter = config["init_iter"].as<int>();
         stride_iter = config["stride_iter"].as<int>();
         total_iter = config["total_iter"].as<int>();
+        if(config["ready_iter"]) {
+            ready_iter = config["ready_iter"].as<int>();
+            if(is_write || ready_iter < 0)
+                throw std::invalid_argument("ready_iter requires a nonnegative read dependency");
+        }
 
         if(
             access_base.empty() ||

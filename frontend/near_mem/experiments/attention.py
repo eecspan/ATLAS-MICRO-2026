@@ -1,51 +1,36 @@
-"""Single fused attention: native ATLAS splits against one method's plans.
+"""Single fused attention: native context splits plus one method's plans.
 
 Q is stored once, row-sharded over all cores; KV uses the common static
 head-partitioned layout. Moving or replicating Q to the cores a plan needs is
-part of the measured graph, as is writing the output. Attention plans are few,
-so every one is simulated; there is no proxy stage. ``atlas`` uses the native
-context splits; other methods add their own plans to them. Each run writes only
-its own cycles; ``experiments.compare`` turns separate runs into speedups.
+part of the measured graph, as is writing the output. A task-based proxy
+shortlists candidates before simulation; --budget 0 validates exhaustively.
+The common context-split space is extended by each method's additional
+attention plans. Each run writes only its own cycles;
+``experiments.compare`` turns separate runs into speedups.
 """
 import argparse
-from dataclasses import asdict, replace
+from dataclasses import asdict
 import json
 from pathlib import Path
 import time
 
 from ..methods import METHODS
-from ..model.attention import Attention, KVLayout, compile_attention, endpoints, plans
-from ..model.transformer import materialize
+from ..model.attention import Attention, KVLayout, build_attention, plans
+from ..model.attention_proxy import AttentionProxy
 from ..search import measure_all
 from ..sim import WORKERS, dump, hardware
-from ..tasks import Graph, Region
 
 cycles = lambda row: row['result']['e2e_cycles']
 
 
-def row_shards(cores, name, rows, width):
-    """Contiguous row shards over all cores: the single stored copy of Q."""
-    return [Region(core, name, rows*core//cores, 0, rows*(core+1)//cores-rows*core//cores, width)
-            for core in range(cores) if rows*(core+1)//cores > rows*core//cores]
-
-
 def measure(problem, chip, out, plan, placed=False):
     """Simulate one plan. Q starts row-sharded, or, if ``placed``, already where the plan reads it."""
-    graph = Graph(chip); layout = KVLayout(problem, graph.cores)
-    cache = layout.allocate(graph)
-    if placed:
-        query = []
-        for i, r in enumerate(endpoints(layout, plan)[0]):
-            graph.tensor(r.core, f'q{i}', [r.rows, r.cols]); query.append(replace(r, name=f'q{i}'))
-    else:
-        rows = problem.batch*problem.queries
-        query = materialize(graph, 'query', row_shards(graph.cores, 'query', rows, problem.hidden))
-    compile_attention(graph, layout, plan, query, cache)
+    graph = build_attention(problem,chip,plan,placed)
     name = '_'.join(map(str, asdict(plan).values()))+('_placed' if placed else '')
     return dict(plan=asdict(plan), result=graph.simulate(Path(out)/name)['result'])
 
 
-def run(problem, chip, out, method='ours', workers=WORKERS):
+def run(problem, chip, out, method='ours', workers=WORKERS, budget=32):
     chip = Path(chip).resolve(); out = Path(out).resolve(); started = time.monotonic()
     out.mkdir(parents=True, exist_ok=True)
     arch, _, _ = hardware(chip); sram = arch['core']['buffer']['buffer_size']*1024
@@ -53,26 +38,29 @@ def run(problem, chip, out, method='ours', workers=WORKERS):
     native = list(plans(layout, sram, False))
     names = (*METHODS[method].includes, method)
     space = list(dict.fromkeys(native+[p for m in names for p in METHODS[m].attention(layout, sram)]))
-    rows = measure_all(space, lambda p: measure(problem, chip, out/'runs', p), workers)
+    proxy = AttentionProxy(chip)
+    candidates = proxy.select(problem,space,budget)
+    rows = measure_all(candidates, lambda p: measure(problem, chip, out/'runs', p), workers)
     dump(out/'results.json', rows)
     selected = min(rows, key=cycles)
     summary = dict(experiment='attention', problem=asdict(problem), chip=str(chip), method=method, best=selected,
-                   cycles=cycles(selected), plans=len(space), seconds=time.monotonic()-started)
+                   cycles=cycles(selected), plans=len(space), measured=len(candidates), proxy_budget=budget,
+                   seconds=time.monotonic()-started)
     dump(out/'summary.json', summary)
-    print(json.dumps({k: summary[k] for k in ('method', 'cycles', 'plans')}, indent=2), flush=True)
+    print(json.dumps({k: summary[k] for k in ('method', 'cycles', 'plans', 'measured', 'proxy_budget')}, indent=2), flush=True)
     return summary
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     for name, value in [('batch', 1), ('queries', 128), ('context', 128), ('query-heads', 8),
-                        ('kv-heads', 2), ('head-dim', 64), ('workers', WORKERS)]:
+                        ('kv-heads', 2), ('head-dim', 64), ('workers', WORKERS), ('budget', 32)]:
         ap.add_argument('--'+name, type=int, default=value)
     ap.add_argument('--chip', type=Path, required=True); ap.add_argument('--output', type=Path, required=True)
     ap.add_argument('--method', choices=list(METHODS), default='ours')
     a = ap.parse_args()
     problem = Attention(a.batch, a.queries, a.context, a.query_heads, a.kv_heads, a.head_dim)
-    run(problem, a.chip, a.output, a.method, a.workers)
+    run(problem, a.chip, a.output, a.method, a.workers, a.budget)
 
 
 if __name__ == '__main__':

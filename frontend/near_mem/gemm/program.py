@@ -13,6 +13,7 @@ class Program:
     phases: list
     placements: list
     sram_bytes: int
+    overlap: bool = True
 
     @property
     def suffix(self):
@@ -89,6 +90,11 @@ class Program:
                     elif kind=='send':
                         keys=[tuple(op['key'])] if 'key' in op else list(sram[core][v])
                         incoming.append((op['dst'],op.get('target',v),{k:sram[core][v][k].copy() for k in keys}))
+                    elif kind=='copy':
+                        key=tuple(op['key'])
+                        incoming.append((op['dst'],'replica',{key:sram[core][v][key].copy()}))
+                    elif kind=='finalize':
+                        pass  # graph epilogues are injected only during lowering
                     elif kind=='add':
                         key=tuple(op['key'])
                         if key in sram[core]['partial']:sram[core]['C'][key]+=sram[core]['partial'].pop(key)
@@ -103,12 +109,18 @@ class Program:
                         dram[core][key]=value.copy()
                         if op.get('final'):
                             m,n=key;tm,tn=op['shape']
+                            previous=written[m*tm:(m+1)*tm,n*tn:(n+1)*tn]
+                            if np.any(previous):
+                                np.testing.assert_allclose(output[m*tm:(m+1)*tm,n*tn:(n+1)*tn],value)
                             output[m*tm:(m+1)*tm,n*tn:(n+1)*tn]=value
                             written[m*tm:(m+1)*tm,n*tn:(n+1)*tn]+=1
             for core,v,value in incoming:
-                if v=='partial':  # received partial sums accumulate per tile
+                if v=='replica':
+                    sram[core]['C'].update(value)
+                elif v=='partial':  # received partial sums accumulate per tile
                     for k,x in value.items():sram[core][v][k]=sram[core][v].get(k,0)+x
                 else:sram[core][v]=value
         assert macs==p.m*p.n*p.k
-        assert np.all(written==1)
+        copies=plan.ps[2]//prod(plan.c) if plan.output=='replicated' else 1
+        assert np.all(written==copies)
         return output
