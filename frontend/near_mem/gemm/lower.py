@@ -13,7 +13,7 @@ from frontend.auto.gemm_schedule import gemm_work
 from .compiler import compile_kernel, compile_plan
 from .distribution import charge, distribute
 from .layout import GlobalLayout
-from .plan import Problem, load
+from .plan import Problem, load, execution_problem
 from ..sim import ROOT, KEYS, hardware, fingerprint
 
 
@@ -71,8 +71,10 @@ def lower_tasks(program, flit_size, final_ops=None):
     if dtype!=2:raise ValueError('This backend matches native FP16 SRAM payloads')
     if prod(p.tile)>=2**31:raise ValueError('Native signed matrix count would overflow')
     glob=GlobalLayout(program.problem,p.cores) if p.layout=='global' else None
-    # ATLAS accounts SRAM accesses at compute/NoC consumers; its native GEMM
-    # does not additionally charge DRAM staging or implicit accumulator clear.
+    # Match ATLAS's explicit compute/NoC SRAM traffic. DRAM staging does not
+    # add separate SRAM-port accesses; this is a shared DMA abstraction, not
+    # a claim that Ramulator already charges those accesses. Capacity still
+    # includes the staging banks, and implicit accumulator clear is omitted.
     phases=[row for row in program.phases if any(a['op'] not in ('clear','zero','drop') for ops in row for a in ops)]
     if glob:phases.insert(0,[[] for _ in range(p.cores)])  # room for the first remote reads
     windows = prefetch_windows(phases) if program.overlap and not glob and not p.land else {}
@@ -165,7 +167,7 @@ def lower_tasks(program, flit_size, final_ops=None):
     manifest = dict(problem=asdict(program.problem),plan=asdict(p),sram_bytes=program.sram_bytes,
                 macs=macs,vector_ops=vectors,logical_dram_read_bytes=reads,logical_dram_write_bytes=writes,
                 noc_bytes=fid*flit_size,phases=len(program.phases),
-                accounting='native ATLAS compute/NoC SRAM accesses; DRAM staging not charged twice')
+                accounting='native ATLAS compute/NoC SRAM accesses; extra DRAM staging SRAM accesses omitted')
     return raw, manifest
 
 
@@ -185,11 +187,14 @@ def simulate(problem,plan,chip,out,timeout=7200,overlap=True,provenance=None,dea
     if deadline is not None:
         timeout=min(timeout,deadline-time.monotonic())
         if timeout<=0:raise subprocess.TimeoutExpired('frontend.near_mem.sim',0)
+    logical_shape=plan.logical_shape or problem.shape
+    problem=execution_problem(problem,plan)
     arch,dram,_=hardware(chip)
     if arch['core_num']!=plan.cores:raise ValueError('Core count mismatch')
     program=(compile_plan(problem,plan,arch['core']['buffer']['buffer_size']*1024,dram,overlap) if not overlap else
              compile_kernel(problem,plan,arch['core']['buffer']['buffer_size']*1024,dram))
     manifest=lower(program,out,arch['noc']['flit_size'])
+    manifest.update(logical_problem_shape=list(logical_shape),execution_problem_shape=list(problem.shape))
     manifest.update(overlap=overlap,sha256=provenance or fingerprint(chip))
     (out/'manifest.json').write_text(json.dumps(manifest,indent=2))
     (out/'result.json').unlink(missing_ok=True)
@@ -204,6 +209,7 @@ def simulate(problem,plan,chip,out,timeout=7200,overlap=True,provenance=None,dea
 def measure(problem,plan,chip,folder,provenance,deadline=None):
     """ATLAS cycles of one plan, including the single-copy input distribution.
     ``deadline`` (``time.monotonic()``) aborts a run that cannot finish in time."""
+    problem=execution_problem(problem,plan)
     key=hashlib.sha256(json.dumps(asdict(plan),sort_keys=True).encode()).hexdigest()[:24]
     out=Path(folder)/key
     run=simulate(problem,plan,chip,out,provenance=provenance,deadline=deadline)

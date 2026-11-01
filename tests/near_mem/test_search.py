@@ -61,6 +61,48 @@ def test_proxy_bound_pruning_is_exact(tmp_path):
         assert diverse(space,pair,2,structure,2)[0]==diverse(space,pair,2,structure,2,low)[0]
 
 
+def test_t10_padding_metadata_is_used_during_proxy_pruning(tmp_path):
+    from frontend.near_mem.methods import METHODS
+    from frontend.near_mem.gemm.space import Proxy,families
+    from frontend.near_mem.search import shortlist
+    from frontend.near_mem.sim import make_hardware
+    problem=Problem(1,30,31);chip=make_hardware(tmp_path/'hw',16,64)
+    method=METHODS['t10'];hw=dict(cores=16,sram=64*1024,dram=2**30,tile_min=1)
+    space=lambda skip=None:method.space(problem,skip=skip,**hw)
+    proxy=Proxy(chip)
+    score=lambda p:proxy(problem,p)
+    bound=lambda q:proxy.lower(problem,q)+proxy.distribution(problem,q)
+    ranked,count=shortlist(space,score,4,family,bound,lambda q:families(q,method.loops))
+    assert count and ranked
+    assert all(p.logical_shape==problem.shape and p.execution_shape==(1,32,32) for p,_ in ranked)
+
+
+def test_tp_mesh_padding_is_scored_as_physical_work(tmp_path):
+    from frontend.near_mem.methods import METHODS
+    from frontend.near_mem.gemm.plan import execution_problem
+    from frontend.near_mem.gemm.space import Proxy
+    from frontend.near_mem.sim import make_hardware
+    logical=Problem(1,5,7);chip=make_hardware(tmp_path/'hw',4,64)
+    plan=next(METHODS['tp'].space(logical,cores=4,sram=64*1024,dram=1<<30,direction=0))
+    physical=execution_problem(logical,plan);proxy=Proxy(chip)
+    assert physical.shape==(1,6,8)
+    assert proxy.kernel(logical,plan)==proxy.kernel(physical,plan)
+
+
+def test_m1_tiny_tp_distribution_skips_empty_allgather_slabs(tmp_path):
+    from frontend.near_mem.gemm.distribution import distribute
+    from frontend.near_mem.gemm.plan import execution_problem
+    from frontend.near_mem.methods import METHODS
+    from frontend.near_mem.sim import ROOT,make_hardware
+    if not list((ROOT/'simulator/build/lib').glob('atlasim.*.so')):
+        pytest.skip('Build ATLAS first')
+    logical=Problem(1,5,7)
+    plan=next(METHODS['tp'].space(logical,cores=16,sram=64*1024,dram=1<<30))
+    physical=execution_problem(logical,plan)
+    result=distribute(physical,plan,make_hardware(tmp_path/'hw',16,64),tmp_path/'distribution')
+    assert result['e2e_cycles']>0
+
+
 def test_measure_all_deadline_drops_aborted_candidates():
     from subprocess import TimeoutExpired
     import time

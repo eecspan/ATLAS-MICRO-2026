@@ -242,6 +242,8 @@ def panelize(box, limit, column=False):
     written as long contiguous runs instead of a strided scatter.
     """
     row, col, rows, cols = box
+    if rows <= 0 or cols <= 0:
+        return []
     if column:
         height = min(rows, limit); width = max(1, limit//height)
     else:

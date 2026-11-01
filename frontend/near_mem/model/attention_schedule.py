@@ -6,7 +6,8 @@ relative cyclic shifts. Context segments own disjoint tokens and merge once.
 Read-only KV forwarding and next-round DRAM staging overlap current updates;
 Q/state movement waits for its update. A shared output contract selects the
 reduction owner and optional broadcast after normalization.
-Only final normalized output is written to DRAM; KV owners never change.
+DRAM/WS dataflows may spill online state, but never the score matrix; KV
+owners never change. The same events drive numeric replay and native tasks.
 """
 from dataclasses import dataclass, replace
 from itertools import groupby
@@ -14,6 +15,7 @@ from math import ceil
 
 from .attention import assignments, endpoints
 from ..output import root_index, reduce_steps, broadcast_steps
+from ..tasks import transfers
 
 
 def lane_core(layout, plan, head, request, lane, segment):
@@ -52,6 +54,8 @@ class Event:
     peer: object = None
     other: tuple = ()
     ready: int = None
+    storage: object = None
+    source: object = None
 
 
 class Schedule:
@@ -59,13 +63,18 @@ class Schedule:
         plan.validate(layout,plan.sram_bytes(layout.problem))
         self.layout = layout; self.plan = plan; self.events = []
         self.cache = layout.regions() if cache is None else cache
-        self._build()
+        self.scratch = {}
+        if plan.dataflow == 'dram' or plan.flash:
+            from .attention_flows import build_dram, build_flash
+            (build_dram if plan.dataflow == 'dram' else build_flash)(self)
+        else:
+            self._build()
         self.events.sort(key=lambda e:e.time)
         # The first local consumer can be compute or a transfer to another
         # lane. Waiting there also orders every subsequent receiver's use.
         pending = {}
         for i,e in enumerate(self.events):
-            if e.kind == 'kv_load':
+            if e.kind in ('kv_load','kv_restore'):
                 pending[e.core,e.key] = i
             elif e.kind in ('kv_move','kv_send','update'):
                 key = (e.core,e.other if e.kind == 'update' else e.key)
@@ -84,8 +93,9 @@ class Schedule:
         p=self.layout.problem; actions=[]
         for e in self.events:
             r=e.region; qsize=(r.area*6+r.rows*p.group*8) if r else 0
-            if e.kind in ('q_load','kv_load'):
-                actions.append((e.time,1,e.core,('q' if e.kind=='q_load' else 'kv',e.key),qsize if e.kind=='q_load' else r.area*2))
+            if e.kind in ('q_load','q_restore','kv_load','kv_restore'):
+                kind='q' if e.kind.startswith('q_') else 'kv'
+                actions.append((e.time,1,e.core,(kind,e.key),qsize if kind=='q' else r.area*2))
             elif e.kind in ('q_move','kv_move','kv_send'):
                 kind='q' if e.kind=='q_move' else 'kv'; size=qsize if kind=='q' else r.area*2
                 actions.append((e.time,1,e.peer,(kind,e.key),size))
@@ -93,6 +103,11 @@ class Schedule:
             elif e.kind=='kv_drop':actions.append((e.time,-1,e.core,('kv',e.key),0))
             elif e.kind=='merge':actions.append((e.time+1,-1,e.core,('q',e.key),0))
             elif e.kind=='normalize':actions.append((e.time+1,-1,e.core,('q',e.key),0))
+            elif e.kind=='q_save':actions.append((e.time+2,-1,e.core,('q',e.key),0))
+            elif e.kind in ('q_copy','kv_copy'):
+                size=e.storage.area*2; key=('dma',len(actions))
+                actions.extend([(e.time,1,e.source.core,(key,'src'),size),(e.time+2,-1,e.source.core,(key,'src'),0),
+                                (e.time+1,1,e.storage.core,(key,'dst'),size),(e.time+3,-1,e.storage.core,(key,'dst'),0)])
         live={}; used=[0]*self.layout.cores; peak=0
         for _,sign,core,key,size in sorted(actions,key=lambda a:(a[0],a[1])):
             if sign<0:used[core]-=live.pop((core,key))
@@ -192,40 +207,45 @@ class Schedule:
                                 self.events.append(Event(u,'kv_drop',lane_core(self.layout,plan,h,b,lane,c),key))
                         ends.append(u)
                     t = max(ends)+2
-                    for s in range(pq):
-                        root = root_index(plan.output,pc,pc-1)
-                        dst = (h,b,s,wave,root)
-                        if dst not in qpos:
-                            continue
-                        core = lane_core(self.layout,plan,h,b,qpos[dst],root)
-                        cores = [lane_core(self.layout,plan,h,b,qpos[h,b,s,wave,c],c) for c in range(pc)]
-                        for step,c,d in reduce_steps(list(range(pc)),root):
-                            src = (h,b,s,wave,c); target = (h,b,s,wave,d)
-                            self.events.append(Event(t+3*step,'merge',cores[c],src,qregions[src],cores[d],target))
-                        done = t+3*(pc-1)+1
-                        self.events.append(Event(done,'normalize',core,dst,qregions[dst]))
-                        if plan.output == 'replicated':
-                            for step,src,target in broadcast_steps(cores,root):
-                                self.events.append(Event(done+1+step,'output_send',src,dst,qregions[dst],target))
-                            for target in cores:
-                                self.events.append(Event(done+pc+1,'finish',target,dst,qregions[dst]))
-                        else:
-                            self.events.append(Event(done+1,'finish',core,dst,qregions[dst]))
-                    t += 3*(pc-1)+pc+4
+                    t = self.finish_wave(t,qpos,qregions)
+
+    def finish_wave(self,t,qpos,qregions):
+        plan=self.plan; pq,pc=plan.query_parts,plan.context_parts
+        h,b=next(iter(qpos))[:2]; wave=next(iter(qpos))[3]
+        for s in range(pq):
+            root = root_index(plan.output,pc,pc-1)
+            dst = (h,b,s,wave,root)
+            if dst not in qpos:
+                continue
+            core = lane_core(self.layout,plan,h,b,qpos[dst],root)
+            cores = [lane_core(self.layout,plan,h,b,qpos[h,b,s,wave,c],c) for c in range(pc)]
+            for step,c,d in reduce_steps(list(range(pc)),root):
+                src = (h,b,s,wave,c); target = (h,b,s,wave,d)
+                self.events.append(Event(t+3*step,'merge',cores[c],src,qregions[src],cores[d],target))
+            done = t+3*(pc-1)+1
+            self.events.append(Event(done,'normalize',core,dst,qregions[dst]))
+            if plan.output == 'replicated':
+                for step,src,target in broadcast_steps(cores,root):
+                    self.events.append(Event(done+1+step,'output_send',src,dst,qregions[dst],target))
+                for target in cores:
+                    self.events.append(Event(done+pc+1,'finish',target,dst,qregions[dst]))
+            else:
+                self.events.append(Event(done+1,'finish',core,dst,qregions[dst]))
+        return t+3*(pc-1)+pc+4
 
     def lower(self, graph, query, name):
         p,plan = self.layout.problem,self.plan
         peak=self.buffer_peak()
         if peak>plan.sram_bytes(p):
             raise ValueError(f'Packet lifetime exceeds declared SRAM: {peak} > {plan.sram_bytes(p)}')
-        inputs = []; qviews = {}; outputs = []; outviews = {}
-        for h,b,s,c,r in assignments(self.layout,plan):
-            qname = f'{name}_q_h{h}_b{b}_s{s}_c{c}'
+        inputs = []; outputs = []; outviews = {}
+        for i,r in enumerate(endpoints(self.layout,plan)[0]):
+            qname = f'{name}_q_{i}'
             local = next((x for src in query if src.core == r.core and
                           (x := src.intersect(r)) is not None and x.area == r.area),None)
             if local is None:
                 graph.tensor(r.core,qname,[r.rows,r.cols]); local = replace(r,name=qname)
-            inputs.append(local); qviews[h,b,s,c] = local
+            inputs.append(local)
         for r in endpoints(self.layout,plan)[1]:
             h = r.col//(p.group*p.head_dim); b = r.row//p.queries
             s = (r.row%p.queries)//ceil(p.queries/plan.query_parts)
@@ -233,15 +253,56 @@ class Schedule:
             graph.tensor(out.core,out.name,[out.rows,out.cols])
             outputs.append(out); outviews[h,b,s,out.core] = out
         graph.convert(name+'_query_layout',query,inputs)
-        timeline = graph.timeline(); coverage = tiles = 0
-        kv = {e.key:e.region for e in self.events if e.kind == 'kv_load'}
+        # Scratch is separate from the persistent KV cache and is released at
+        # the operator boundary. Mixed Q/state packets use FP16-sized storage
+        # units: FP16 Q, FP32 U/m/l, without rounding their byte counts away.
+        scratch=[]
+        for (core,label),shape in self.scratch.items():
+            graph.tensor(core,name+'_'+label,shape)
+            scratch.append((core,name+'_'+label))
+        def physical(r):
+            return replace(r,name=name+'_'+r.name) if (r.core,r.name) in self.scratch else r
+        timeline = graph.timeline(); coverage = tiles = query_noc = 0
+        kv = {e.key:e.region for e in self.events if e.kind in ('kv_load','kv_restore')}
+        qloads={}
+        for e in self.events:
+            if e.kind=='q_load':qloads.setdefault((e.time,e.key[:-1]),[]).append(e)
+        for (t,_),events in qloads.items():
+            if plan.flash:
+                # A fixed line all-gather of the unique Q slabs. No full Q
+                # replica is written to DRAM before the fused computation.
+                members=[e.core for e in events]
+                for src,_ in transfers(inputs,[events[0].region]):
+                    root=members.index(src.core) if src.core in members else 0
+                    timeline.memory(t,src)
+                    timeline.send(t+1,src.core,members[root],src.area*2)
+                    query_noc+=src.area*2*(src.core!=members[root])
+                    for step,a,b in broadcast_steps(members,root):
+                        timeline.send(t+2+step,a,b,src.area*2)
+                        query_noc+=src.area*2
+            else:
+                for e in events:
+                    for src,_ in transfers(inputs,[replace(e.region,core=e.core)]):
+                        timeline.memory(t,src)
+                        timeline.send(t+1,src.core,e.core,src.area*2)
+                        query_noc+=src.area*2*(src.core!=e.core)
         for e in self.events:
             t,r = e.time,e.region
             if e.kind == 'q_load':
-                h,b,s,w,c = e.key; src = qviews[h,b,s,c]
-                timeline.memory(t,src.crop(r.row,r.col,r.rows,r.cols))
+                pass  # emitted above, with the method's load/gather rule
             elif e.kind == 'kv_load':
                 timeline.memory(t,r,ready=e.ready)
+            elif e.kind in ('q_copy','kv_copy'):
+                timeline.memory(t,physical(e.source))
+                timeline.send(t+1,e.source.core,e.storage.core,e.storage.area*2)
+                timeline.memory(t+2,physical(e.storage),True)
+            elif e.kind == 'q_save':
+                timeline.memory(t+1,physical(e.storage),True)
+            elif e.kind in ('q_restore','kv_restore'):
+                src=physical(e.storage)
+                ready=(t+1 if src.core!=e.core else e.ready) if e.kind=='kv_restore' else None
+                timeline.memory(t,src,ready=ready)
+                timeline.send(t+1,src.core,e.core,src.area*2)
             elif e.kind in ('q_move','kv_move','kv_send'):
                 size = r.area*2 if e.kind != 'q_move' else r.area*6+r.rows*p.group*8
                 timeline.send(t,e.core,e.peer,size)
@@ -275,8 +336,14 @@ class Schedule:
                            score_elements_issued=coverage,compute_tiles=tiles,score_dram_bytes=0,
                            historical_kv_write_bytes=0,query_parts=plan.query_parts,context_parts=plan.context_parts,
                            query_shift=plan.query_shift,kv_shift=plan.kv_shift,output=plan.output,
-                           overlap=True,packet_peak_with_scratch=peak)
+                           dataflow=plan.dataflow,overlap=True,packet_peak_with_scratch=peak,
+                           query_load_noc_bytes=query_noc,
+                           kv_remote_load_bytes=sum(e.region.area*2 for e in self.events if e.kind=='kv_move' or
+                               e.kind=='kv_restore' and e.storage.core!=e.core),
+                           rotation_copies=sum(e.kind in ('q_copy','kv_copy') for e in self.events),
+                           rotation_copy_bytes=sum(e.storage.area*2 for e in self.events if e.kind in ('q_copy','kv_copy')))
         graph.release(inputs,keep=query)
+        for core,label in scratch:graph.live[core].pop(label,None)
         return outputs
 
     def replay(self, q, k, v):
@@ -286,10 +353,20 @@ class Schedule:
         oracle for schedule semantics, not part of simulator performance.
         """
         import numpy as np
-        p = self.layout.problem; state = {}; kv = {}; seen = set(); finished = {}
+        p = self.layout.problem; state = {}; kv = {}; seen = set(); finished = {}; backing={}
         assert q.shape == (p.batch,p.queries,p.query_heads,p.head_dim)
         assert k.shape == v.shape == (p.batch,p.context,p.kv_heads,p.head_dim)
         output = np.empty_like(q)
+        def address(r):
+            return r.core,r.name,r.local_row,r.local_col,r.rows,r.cols
+        def read_kv(r,storage):
+            if (storage.core,storage.name) in self.scratch:
+                label,value=backing[address(storage)]
+                assert label==(r.row,r.col,r.rows,r.cols)
+                return value
+            b=r.row//p.context; h=r.col//(2*p.head_dim); lo=r.row-b*p.context
+            assert storage in self.cache or any(storage.intersect(x)==storage for x in self.cache)
+            return lo,k[b,lo:lo+r.rows,h],v[b,lo:lo+r.rows,h]
         def merge(a,b):
             m = np.maximum(a[0],b[0]); finite = np.isfinite(m)
             x = np.zeros_like(m); y = np.zeros_like(m)
@@ -308,6 +385,20 @@ class Schedule:
                 elif e.kind == 'kv_load':
                     h,b,*_ = e.key; lo = r.row-b*p.context
                     kv[at] = (lo,k[b,lo:lo+r.rows,h],v[b,lo:lo+r.rows,h])
+                elif e.kind == 'kv_restore':
+                    kv[at]=read_kv(r,e.storage)
+                elif e.kind == 'kv_copy':
+                    backing[address(e.storage)]=((r.row,r.col,r.rows,r.cols),read_kv(r,e.source))
+                elif e.kind == 'q_save':
+                    backing[address(e.storage)]=(e.key,state.pop(at))
+                elif e.kind == 'q_restore':
+                    label,value=backing[address(e.storage)]
+                    assert label==e.key
+                    state[at]=value
+                elif e.kind == 'q_copy':
+                    label,value=backing[address(e.source)]
+                    assert label==e.key
+                    backing[address(e.storage)]=(label,value)
                 elif e.kind in ('q_move','kv_move'):
                     table = state if e.kind == 'q_move' else kv
                     table[e.peer,e.key] = table.pop(at)

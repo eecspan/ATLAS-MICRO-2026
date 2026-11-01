@@ -5,7 +5,7 @@ from math import isqrt
 
 from ..gemm.compiler import compile_kernel
 from ..tasks import Region, coalesce, transfers, unique, window
-from ..gemm.plan import Problem
+from ..gemm.plan import Problem, execution_problem
 from ..sim import strides
 
 
@@ -46,27 +46,29 @@ class Gemm:
 
     def bind(self, cores, sram, capacity):
         """Compile the mapping for a chip; touches no graph state."""
+        self.execution_problem = execution_problem(self.problem,self.plan)
         if self.gated and self.problem.n % 2:
             raise ValueError('Gated projection needs equal gate/up widths')
         if self.native:
             self.side = isqrt(cores)
             if self.side*self.side != cores or self.side < 2:
                 raise ValueError('The original ATLAS collective requires an even square mesh')
-            m,n,k = self.problem.shape
-            if n % self.side or k % self.side or (self.gated and n % (2*self.side)):
-                raise ValueError('Native K/N partitions require exact divisibility')
+            m,n,k = self.execution_problem.shape
+            if n % self.side or k % self.side:
+                raise ValueError('Native K/N partitions require mesh-divisible execution dimensions')
         else:
             self.program = compile_kernel(self.problem, self.plan, sram, capacity)
             # Static parameter packing: each even N tile contains corresponding
             # gate/up halves. All partial sums retain the ordinary GEMM layout.
-            self.fused_gate = self.gated and self.program.gate_tile % 2 == 0
+            self.fused_gate = (self.gated and self.program.gate_tile % 2 == 0
+                               and self.execution_problem.n == self.problem.n)
         return self
 
     def prepare(self, graph, name):
         """Allocate persistent weights before any activation scratch."""
         self.bind(graph.cores, graph.sram, graph.capacity); self.name = name
         if self.native:
-            m,n,k = self.problem.shape; shape = [k//self.side, n//self.side]
+            m,n,k = self.execution_problem.shape; shape = [k//self.side, n//self.side]
             for core in range(graph.cores):
                 graph.tensor(core, name+'_B', shape, column=True)
         else:
@@ -80,25 +82,45 @@ class Gemm:
         if not self.native:
             p = self.program
             return program_regions(p, 'A'), [next(t for t in c['tensor'] if t['name'] == 'A') for c in p.placements]
-        m,_,k = self.problem.shape; local_k = k//self.side; regions = []
+        m,_,k = self.execution_problem.shape; logical_k = self.problem.k; local_k = k//self.side; regions = []
         for core in range(cores):
             row,col = divmod(core, self.side)
             kc = row if self.direction == 0 else col
-            regions.append(Region(core, 'A', 0, kc*local_k, m, local_k))
+            start = kc*local_k; width = max(0,min(local_k,logical_k-start))
+            if width:
+                regions.append(Region(core, 'A', 0, start, self.problem.m, width))
         return regions, [dict(shape=[m,local_k], strides=strides([m,local_k]))]*cores
 
     def output_layout(self, cores):
         """Final output regions (after any gate), as returned by ``compile``."""
         m,n,_ = self.problem.shape
         if self.native:
-            width = n//self.side//(2 if self.gated else 1)
-            return [Region(core, 'C', 0, (core % self.side if self.direction == 0 else core//self.side)*width, m, width)
-                    for core in range(cores)]
+            _,execution_n,_ = self.execution_problem.shape
+            local_n=execution_n//self.side
+            fused=self._native_fused_gate(local_n)
+            regions=self._native_output_regions(cores,fused)
+            return unique(window(regions,0,0,m,n//2)) if self.gated and not fused else regions
         regions = program_regions(self.program, 'C')
         if self.fused_gate:
             return [replace(r, col=r.col//2, cols=r.cols//2, local_col=r.local_col//2) for r in regions]
         # An unfused gate pairs values at the owners of the gate half.
         return unique(window(regions, 0, 0, m, n//2)) if self.gated else regions
+
+    def _native_fused_gate(self, local_n):
+        """Whether ATLAS's packed reduce can keep both logical gate halves local."""
+        return self.gated and self.execution_problem.n==self.problem.n and local_n%2==0
+
+    def _native_output_regions(self, cores, gated):
+        _,execution_n,_=self.execution_problem.shape
+        local_n=execution_n//self.side
+        width=local_n//2 if gated else local_n
+        columns=self.problem.n//2 if gated else self.problem.n
+        regions=[]
+        for core in range(cores):
+            col=(core%self.side if self.direction==0 else core//self.side)*width
+            extent=max(0,min(width,columns-col))
+            if extent:regions.append(Region(core,'C',0,col,self.problem.m,extent))
+        return regions
 
     def compile(self, graph, source, rope_width=0):
         if self.native:
@@ -115,8 +137,14 @@ class Gemm:
                 if t['name'] in ('A', 'B'):
                     continue
                 graph.tensor(core, self.name+'_'+t['name'], t['shape'], t['strides'])
-                if t['name'] == out and self.fused_gate and core in active:
+                if t['name'] == out and self.fused_gate:
                     graph.tensor(core, self.name+'_G'+p.suffix, [t['shape'][0], t['shape'][1]//2])
+                    # A padded FlashGEMM mesh row still executes and writes its
+                    # physical gate tile, even when that row has no logical
+                    # output. Keep that scratch allocated for the kernel, then
+                    # release it with the other non-output tensors below.
+                    if core not in active:
+                        scratch.append((core, self.name+'_G'+p.suffix))
                 if t['name'] != out or self.fused_gate or core not in active:
                     scratch.append((core, self.name+'_'+t['name']))
         def epilogue(action):
@@ -148,13 +176,14 @@ class Gemm:
         from frontend.auto.generalize import expand_gemm
         from frontend.auto.collectives import allreduce_tasks
         from frontend.model_parser import Operator, OperatorType
-        m,n,k = self.problem.shape; side = self.side
+        m,n,k = self.execution_problem.shape; side = self.side
         local_k, local_n = k//side, n//side
+        fused_gate=self._native_fused_gate(local_n)
         inputs, names = bind_input(graph, self.name+'_A', source, *self.input_layout(graph.cores))
         raw = []; outputs = []
         for core in range(graph.cores):
             partial = graph.tensor(core, self.name+'_partial', [m,local_n])
-            result = graph.tensor(core, self.name+'_C', [m,local_n//(2 if self.gated else 1)]) if reduce else partial
+            result = graph.tensor(core, self.name+'_C', [m,local_n//(2 if fused_gate else 1)]) if reduce else partial
             op = Operator(name=self.name, op_type=OperatorType.GEMM, B=1, M=m, N=local_n, K=local_k)
             tm,tn,tk = self.plan.tile
             native = make_gemm_description(op, 2, (tm,tk,tn), names[core], partial['name'], self.name+'_B')
@@ -163,26 +192,33 @@ class Gemm:
                 nc = core % side if self.direction == 0 else core//side
                 outputs.append(Region(core, partial['name'], 0, nc*local_n, m, local_n))
         if reduce:
-            outputs = [replace(r, name=result['name']) for r in self.output_layout(graph.cores)]
+            regions=(self._native_output_regions(graph.cores,fused_gate) if self.gated and not fused_gate
+                     else self.output_layout(graph.cores))
+            outputs = [replace(r, name=result['name']) for r in regions]
         graph.add(self.name, raw, dict(category='gemm', native=True, tile=self.plan.tile))
         if not reduce:
             graph.release(inputs, keep=source)
             return outputs
         op, raw = allreduce_tasks(partial, result, self.name, m, 0, local_n, 2, 1,
-                                 self.direction, side, graph.flit, [0]*graph.cores, gated=self.gated)
-        graph.add(self.name+'_reduce', raw, dict(category='collective', native=True, gated=self.gated),
+                                 self.direction, side, graph.flit, [0]*graph.cores, gated=fused_gate)
+        graph.add(self.name+'_reduce', raw, dict(category='collective', native=True, gated=fused_gate),
                   kind='communication', operator=op)
         graph.release(inputs, keep=source)
         graph.release([Region(core, partial['name'], 0,0,m,local_n) for core in range(graph.cores)])
+        if self.gated and not fused_gate:
+            return gate(graph, outputs, self.problem.m, self.problem.n//2, self.name+'_gate')
         return outputs
 
 
     def qkv(self, graph, source, layout, cache, rope=False):
         p = layout.problem
-        if not self.native or p.kv_heads > 1:
+        if not self.native or p.kv_heads > 1 or self.plan.logical_shape is not None:
             # Head-partitioned KV cannot use the native packed-KV collective,
             # which assumes every core holds all heads in one row partition.
-            output = self.compile(graph, source,rope_width=p.hidden if rope else 0)
+            output = self.compile(graph, source,rope_width=p.hidden if rope and not self.native else 0)
+            if rope and self.native:
+                query = window(output, 0, 0, p.batch*p.queries, p.hidden)
+                pointwise(graph,self.name+'_rope_q',query,6)
             layout.append(graph, output, cache, self.name+'_kv_append')
             query = window(output, 0, 0, p.batch*p.queries, p.hidden)
             return query, output

@@ -17,11 +17,12 @@ Baselines keep only their own dataflow: T10 rotates on chip over one
 plan-independent DRAM layout with its fixed ``mnk`` loop; FlashGEMM
 all-gathers single-copy blocks.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from math import isqrt
 
 from .gemm import flash
+from .gemm.plan import Problem
 from .gemm.space import LOOPS, candidates, divisors
 from .model.attention import plans as attention_plans
 from .sim import hardware
@@ -38,6 +39,8 @@ class Method:
     flash: bool = False
     native: bool = False
     tp: bool = False
+    # Each method owns its fused dataflow; proxy/lowering/output policies are shared.
+    attention_mode: str = 'native'
     loops: tuple = LOOPS
 
     def space(self, problem, cores, sram, dram, tile_min=8, tile_policy='all', layer_policy='elk', skip=None,
@@ -47,29 +50,86 @@ class Method:
         if self.flash:
             return flash.candidates(problem, cores, sram, tile_min, tile_policy)
         if self.tp:
+            execution = problem.shape
             if direction is None:
                 parts, transpose = [(pm, cores//pm, 1) for pm in divisors(cores)], False
+                if not any(problem.m % pm == 0 and problem.n % (cores//pm) == 0
+                           for pm in divisors(cores)):
+                    # Standalone TP uses M/N replication groups. If no group
+                    # covers a small tail exactly, pad only M/N to the nearest
+                    # legal group; the plan records and simulates that work.
+                    choices = []
+                    for pm in divisors(cores):
+                        pn = cores//pm
+                        m = ((problem.m+pm-1)//pm)*pm
+                        n = ((problem.n+pn-1)//pn)*pn
+                        choices.append(((m*n, m-problem.m+n-problem.n), (m,n,problem.k)))
+                    execution = min(choices)[1]
             elif isqrt(cores)**2 == cores:
-                parts, transpose = [(1, isqrt(cores), isqrt(cores))], direction == 0
+                side = isqrt(cores)
+                parts, transpose = [(1, side, side)], direction == 0
+                # The graph TP baseline fixes K/N to the mesh axes. Pad just
+                # those axes; M is not split and keeps its logical extent.
+                execution = (problem.m,
+                             ((problem.n+side-1)//side)*side,
+                             ((problem.k+side-1)//side)*side)
             else:
                 raise ValueError('The TP grid needs a square mesh')
-            return candidates(problem, cores, sram, TP_TILE_MIN, 'all', layer_policy, dram, False, skip,
-                              loops=('mnk',), parts=parts, transpose=transpose)
+            adapted_skip = _padding_skip(skip, problem.shape, execution)
+            work = Problem(*execution, problem.dtype_bytes)
+            plans = candidates(work, cores, sram, TP_TILE_MIN, 'all', layer_policy, dram, False, adapted_skip,
+                               loops=('mnk',), parts=parts, transpose=transpose)
+            if execution == problem.shape:
+                return plans
+            return (_padding_metadata(p, problem.shape, execution) for p in plans)
         # A local method with rotation adds only rotating plans (no-rotation
         # plans belong to ``local``); a global layout keeps both.
         own = self.rotation and self.layout == 'local'
-        drop = (lambda q: not q.layers or bool(skip and skip(q))) if own else skip
-        return candidates(problem, cores, sram, tile_min, tile_policy, layer_policy, dram, self.rotation, drop, single_b,
-                          self.receive, self.layout, self.loops)
+        execution = problem.shape
+        if self.layout == 'global':
+            side = isqrt(cores)
+            if side*side != cores:
+                raise ValueError('T10 requires a square mesh')
+            if problem.m == 1:
+                # A remains single-copy and is striped by K; B/C use N to
+                # occupy every DRAM bank. A's remote reads are charged later.
+                execution = (1, ((problem.n+cores-1)//cores)*cores,
+                             ((problem.k+cores-1)//cores)*cores)
+            elif any(n % side for n in problem.shape):
+                execution = tuple(((n+side-1)//side)*side for n in problem.shape)
+        adapted_skip = _padding_skip(skip, problem.shape, execution)
+        drop = (lambda q: not q.layers or bool(adapted_skip and adapted_skip(q))) if own else adapted_skip
+        work = Problem(*execution, problem.dtype_bytes)
+        plans = candidates(work, cores, sram, tile_min, tile_policy, layer_policy, dram, self.rotation, drop, single_b,
+                           self.receive, self.layout, self.loops)
+        if execution == problem.shape:
+            return plans
+        return (_padding_metadata(p, problem.shape, execution) for p in plans)
 
     def attention(self, layout, sram):
-        """Fused-attention plans this method adds to the native context splits."""
-        if self.name != 'ours':
-            return []
-        return [p for p in attention_plans(layout, sram, True) if (p.query_parts, p.context_parts) != (1, 1)]
+        """Method-local fused space; no implicit TP fallback for the DRAM ring."""
+        if self.attention_mode == 'ours':
+            return list(attention_plans(layout, sram, True))
+        if self.attention_mode in ('t10', 'dram'):
+            return list(attention_plans(layout, sram, dataflow=self.attention_mode))
+        if self.attention_mode == 'flash':
+            return [p for flow in ('flash_os','flash_ws') for p in attention_plans(layout,sram,dataflow=flow)]
+        if self.attention_mode == 'native':
+            return list(attention_plans(layout, sram, False))
+        raise ValueError(f'Unknown attention mode: {self.attention_mode}')
 
 
 TP_TILE_MIN = (8, 8, 512)  # ATLAS's native minimum tile (m, n, k)
+
+
+def _padding_metadata(plan, logical, execution):
+    return replace(plan, logical_shape=logical, execution_shape=execution)
+
+
+def _padding_skip(skip, logical, execution):
+    if skip is None or logical == execution:
+        return skip
+    return lambda prefix: skip(_padding_metadata(prefix, logical, execution))
 
 METHODS = {m.name: m for m in (
     Method('tp', 'tensor parallel: replicated inputs, M/N (single GEMM) or fixed K/N TP grid, mnk, native tiles',
@@ -77,13 +137,14 @@ METHODS = {m.name: m for m in (
     Method('atlas', 'unmodified upstream ATLAS GEMM generator and tile explorer (a check of tp)', native=True),
     Method('local', 'our spatial/tile/loop space without rotation: Ps incl. split-K, tiles, six loop orders',
            includes=('tp',)),
-    Method('ours', 'adds temporal rotation (Pt) of A/B/C and of fused-attention KV tiles', True, ('tp', 'local')),
+    Method('ours', 'adds temporal rotation (Pt) of A/B/C and of fused-attention Q/KV tiles', True, ('tp', 'local'),
+           attention_mode='ours'),
     Method('dram', 'DRAM-level rotation: rotated A/B/C blocks are forwarded DRAM to DRAM and re-read',
-           True, ('tp', 'local'), receive='dram_land'),
+           True, receive='dram_land', attention_mode='dram'),
     Method('t10', 'improved T10: on-chip Ps/Pt rotation over one plan-independent global DRAM layout, mnk loop',
-           True, layout='global', loops=('mnk',)),
+           True, layout='global', loops=('mnk',), attention_mode='t10'),
     Method('flash', 'FlashGEMM: single-copy blocks, per-K-tile row/column all-gathers overlapped with compute',
-           flash=True),
+           flash=True, attention_mode='flash'),
 )}
 
 

@@ -32,7 +32,7 @@ from ..gemm.plan import load
 from ..gemm.space import Proxy, structure
 from ..methods import METHODS, propose, target, union
 from ..output import variants as output_variants
-from ..model.attention import AttentionPlan, KVLayout, plans as attention_plans
+from ..model.attention import AttentionPlan, KVLayout
 from ..model.attention_proxy import AttentionProxy
 from ..model.kernels import Gemm
 from ..model.transformer import (Workload, build, configuration, decode_configuration, edge_regions, edges,
@@ -249,9 +249,8 @@ def run(workload, chip, out, method='ours', budget=4, workers=WORKERS, tile_min=
     # Weights are preplaced once, like the native TP shards; replicating them
     # would trade unbilled DRAM capacity for speed.
     hw = dict(target(chip, tile_min), single_b=True); layout = KVLayout(workload.attention, hw['cores'])
-    names = (*METHODS[method].includes, method)
-    options = {'attention': list(dict.fromkeys([*attention_plans(layout, hw['sram'], False),
-                                                *(p for m in names for p in METHODS[m].attention(layout, hw['sram']))]))}
+    # Each method supplies its own fused dataflow on the shared execution backend.
+    options = {'attention': METHODS[method].attention(layout, hw['sram'])}
     if not options['attention']:
         raise ValueError('No SRAM-feasible attention plan')
     proxy = Proxy(chip); report = {}

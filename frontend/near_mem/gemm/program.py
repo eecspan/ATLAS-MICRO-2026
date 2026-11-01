@@ -31,26 +31,34 @@ class Program:
         from .ownership import Ownership
         p=self.plan
         if p.layout=='global':
-            return GlobalLayout(self.problem,p.cores).regions(tensor)
-        regions=[]
-        if tensor=='C':
-            for phase in self.phases:
-                for core,actions in enumerate(phase):
-                    for a in actions:
-                        if a['op']=='store' and a.get('final'):
-                            regions.append(Region(core,'C',a['key'][0]*p.tile[0],a['key'][1]*p.tile[1],
-                                                  *a['extent'],*a['base']))
-                        elif a['op']=='forward' and a.get('final'):  # a landed C copied home
-                            regions.append(Region(a['dst'],'C',a['key'][0]*p.tile[0],a['key'][1]*p.tile[1],
-                                                  *a['extent'],*a['base']))
+            regions=GlobalLayout(self.problem,p.cores).regions(tensor)
         else:
-            own=Ownership(self.problem,p);axes=DEPENDENCIES[tensor];shape=[own.base[d] for d in axes]
-            for core in range(p.cores):
-                blocks=own.tensor_blocks(core,tensor)
-                indices=[sorted({b[i] for b in blocks}) for i in range(2)]
-                for block in blocks:
-                    regions.append(Region(core,tensor,block[0]*shape[0],block[1]*shape[1],*shape,
-                                          indices[0].index(block[0])*shape[0],indices[1].index(block[1])*shape[1]))
+            regions=[]
+            if tensor=='C':
+                for phase in self.phases:
+                    for core,actions in enumerate(phase):
+                        for a in actions:
+                            if a['op']=='store' and a.get('final'):
+                                regions.append(Region(core,'C',a['key'][0]*p.tile[0],a['key'][1]*p.tile[1],
+                                                      *a['extent'],*a['base']))
+                            elif a['op']=='forward' and a.get('final'):  # a landed C copied home
+                                regions.append(Region(a['dst'],'C',a['key'][0]*p.tile[0],a['key'][1]*p.tile[1],
+                                                      *a['extent'],*a['base']))
+            else:
+                own=Ownership(self.problem,p);axes=DEPENDENCIES[tensor];shape=[own.base[d] for d in axes]
+                for core in range(p.cores):
+                    blocks=own.tensor_blocks(core,tensor)
+                    indices=[sorted({b[i] for b in blocks}) for i in range(2)]
+                    for block in blocks:
+                        regions.append(Region(core,tensor,block[0]*shape[0],block[1]*shape[1],*shape,
+                                              indices[0].index(block[0])*shape[0],indices[1].index(block[1])*shape[1]))
+        if p.logical_shape is not None:
+            m,n,k=p.logical_shape;rows,cols={'A':(m,k),'B':(k,n),'C':(m,n),'G':(m,n//2)}[tensor]
+            clipped=[]
+            for r in regions:
+                nr=min(r.rows,max(0,rows-r.row));nc=min(r.cols,max(0,cols-r.col))
+                if nr and nc:clipped.append(r.crop(r.row,r.col,nr,nc))
+            regions=clipped
         return coalesce(regions)
 
     def lower(self, flit, final_ops=None):
@@ -60,8 +68,13 @@ class Program:
     def replay(self, a, b):
         import numpy as np
         p=self.problem;plan=self.plan
-        if a.shape!=(p.m,p.k) or b.shape!=(p.k,p.n):
+        logical=plan.logical_shape or p.shape
+        if a.shape!=(logical[0],logical[2]) or b.shape!=(logical[2],logical[1]):
             raise ValueError('Input shape mismatch')
+        if logical!=p.shape:
+            padded_a=np.zeros((p.m,p.k),dtype=a.dtype);padded_a[:logical[0],:logical[2]]=a
+            padded_b=np.zeros((p.k,p.n),dtype=b.dtype);padded_b[:logical[2],:logical[1]]=b
+            a,b=padded_a,padded_b
         sram=[{v:{} for v in ('A','B','C','partial')} for _ in range(plan.cores)]
         dram=[{} for _ in range(plan.cores)]
         output=np.zeros((p.m,p.n));written=np.zeros((p.m,p.n),dtype=int)
@@ -123,4 +136,4 @@ class Program:
         assert macs==p.m*p.n*p.k
         copies=plan.ps[2]//prod(plan.c) if plan.output=='replicated' else 1
         assert np.all(written==copies)
-        return output
+        return output[:logical[0],:logical[1]]

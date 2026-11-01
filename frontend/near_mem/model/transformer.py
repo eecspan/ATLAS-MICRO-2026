@@ -151,10 +151,16 @@ def tune_native(workload, chip, out, workers=WORKERS):
     kernels = {}
     for name,problem in workload.problems.items():
         m,n,k = problem.shape
-        if n % side or k % side:
-            raise ValueError('Native K/N shape must divide mesh side')
-        tm,tk,tn = best_tile((m,n//side,k//side),chip,out/name,workers)['tiling_factors']
-        kernels[name] = Gemm(problem,Plan((1,side,side),(tm,tn,tk)),True,**roles(workload,name))
+        gated=name=='expand'
+        n_multiple=side*(2 if gated else 1)
+        execution=(m,((n+n_multiple-1)//n_multiple)*n_multiple,
+                   ((k+side-1)//side)*side)
+        em,en,ek=execution
+        tm,tk,tn = best_tile((em,en//side,ek//side),chip,out/name,workers)['tiling_factors']
+        plan=Plan((1,side,side),(tm,tn,tk))
+        if execution!=problem.shape:
+            plan=Plan((1,side,side),(tm,tn,tk),logical_shape=problem.shape,execution_shape=execution)
+        kernels[name] = Gemm(problem,plan,True,**roles(workload,name))
     return kernels
 
 

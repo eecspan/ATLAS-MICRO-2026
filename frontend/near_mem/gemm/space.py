@@ -17,7 +17,7 @@ import yaml
 
 from ..sim import hardware
 
-from .plan import Plan, Problem, DEPENDENCIES
+from .plan import Plan, Problem, DEPENDENCIES, execution_problem
 
 
 LOOPS=tuple(''.join(o) for o in permutations('mnk'))
@@ -132,6 +132,7 @@ class Proxy:
 
     def __call__(self,problem,p):
         """Standalone score: the kernel plus single-copy input replication."""
+        problem=execution_problem(problem,p)
         return self.kernel(problem,p)+self.distribution(problem,p)
 
     @property
@@ -155,6 +156,7 @@ class Proxy:
 
     def distribution(self,problem,p):
         # Initial single-copy distribution: each replica receives (r-1)/r.
+        problem=execution_problem(problem,p)
         if getattr(p,'kind',None)=='flash' or p.layout=='global':return 0
         lm,ln,lk=(n//s for n,s in zip(problem.shape,p.ps))
         received=(lm*lk/prod(p.a)*(1-prod(p.a)/p.ps[1])+lk*ln/prod(p.b)*(1-prod(p.b)/p.ps[0]))*problem.dtype_bytes
@@ -162,6 +164,7 @@ class Proxy:
 
     def kernel(self,problem,p):
         """Kernel score with inputs already in place (graph edges are scored apart)."""
+        problem=execution_problem(problem,p)
         if getattr(p,'kind',None)=='flash':
             from .flash import score
             return score(problem,p,self.mac,self.dram_bw,self.arch['noc']['flit_size'])
@@ -225,6 +228,7 @@ class Proxy:
         layer order minimizing sum(outer*(radix-1)*weight) sorts layers by
         weight, largest first (exchange argument).
         """
+        problem=execution_problem(problem,p)
         if getattr(p,'kind',None)=='flash':return self.kernel(problem,p)
         lm,ln,lk=local=tuple(n//s for n,s in zip(problem.shape,p.ps));dtype=problem.dtype_bytes
         weight={v:dtype*prod(local[d]/parts[i] for i,d in enumerate(DEPENDENCIES[v])) for v,parts in p.temporal.items()}

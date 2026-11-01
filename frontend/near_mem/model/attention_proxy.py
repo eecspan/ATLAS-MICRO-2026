@@ -4,6 +4,9 @@ Compute/SRAM use hardware rates; NoC uses busiest ports and XY mesh links;
 DRAM uses burst-rounded bytes at peak bandwidth on a per-core FIFO. Reads
 wait at their declared first use, including cross-iteration prefetch. This
 is a ranking proxy, not Ramulator/BookSim or a measured cycle count.
+SRAM traffic comes only from explicit buffer tasks, like the ATLAS backend;
+DRAM reads/writes do not infer extra staging-port accesses. This shared DMA
+staging abstraction does not remove the compiler's buffer capacity checks.
 """
 from collections import Counter
 from functools import lru_cache
@@ -38,7 +41,7 @@ class AttentionProxy:
         candidates = list(dict.fromkeys(candidates))
         if budget <= 0:return candidates
         ranked,_ = shortlist(lambda _: iter(candidates),lambda p:self.score(problem,p,placed),budget,
-                             family=lambda p:(p.query_parts,p.context_parts,p.output))
+                             family=lambda p:(p.dataflow,p.query_parts,p.context_parts,p.output))
         return [p for p,_ in ranked]
 
     def tasks(self, raw):

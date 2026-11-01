@@ -10,7 +10,7 @@ from copy import deepcopy
 from dataclasses import asdict
 from itertools import product
 import multiprocessing
-from math import prod
+from math import prod, isqrt
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -42,6 +42,19 @@ def partitions(problem,cores):
     for pm in divisors(cores):
         pn=cores//pm
         if problem.m%pm==0 and problem.n%pn==0:yield pm,pn,1
+
+
+def legal_partitions(problem,cores):
+    """Use native exact M/N partitions, padding only if none covers the shape."""
+    parts=list(partitions(problem,cores))
+    if parts:
+        return problem,parts
+    side=isqrt(cores)
+    if side*side!=cores:
+        return problem,[]
+    shape=tuple(((n+side-1)//side)*side for n in problem.shape)
+    padded=Problem(*shape,problem.dtype_bytes)
+    return padded,list(partitions(padded,cores))
 
 
 def tiles(shape, sram, dtype=2):
@@ -95,8 +108,10 @@ def tune(problem,chip,out,workers=WORKERS):
     """
     chip=Path(chip).resolve();out=Path(out).resolve();out.mkdir(parents=True,exist_ok=True)
     arch,capacity,_=hardware(chip)
+    logical=problem
+    problem,spatial=legal_partitions(problem,arch['core_num'])
     kernels=[]
-    for ps in partitions(problem,arch['core_num']):
+    for ps in spatial:
         shape=tuple(n//s for n,s in zip(problem.shape,ps))
         try:placement=matrix_placement(shape,problem.dtype_bytes,capacity)
         except ValueError:continue
@@ -107,6 +122,8 @@ def tune(problem,chip,out,workers=WORKERS):
         if measured['e2e_cycles']!=best['latency']:
             raise AssertionError('Single-core native tuning differs from full-chip replay')
         tm,tk,tn=best['tiling_factors'];plan=Plan(ps,(tm,tn,tk))
+        if problem.shape!=logical.shape:
+            plan=Plan(ps,(tm,tn,tk),logical_shape=logical.shape,execution_shape=problem.shape)
         assert measured['flop_count']==2*prod(problem.shape)+prod(problem.shape)//tk
         bound=measured['e2e_cycles']+received_bytes(problem,plan)/arch['noc']['flit_size']
         kernels.append((bound,plan,measured,folder))
@@ -119,7 +136,7 @@ def tune(problem,chip,out,workers=WORKERS):
         dump(out/'results.json',rows)
     if not rows:raise ValueError('No legal native M/N partition under the configured capacities')
     best=min(rows,key=lambda r:r['result']['e2e_cycles'])
-    dump(out/'manifest.json',dict(problem=asdict(problem),sha256=fingerprint(chip),
+    dump(out/'manifest.json',dict(problem=asdict(logical),execution_problem=asdict(problem),sha256=fingerprint(chip),
          baseline=f'Original ATLAS MNK generator; upstream explorer on the proxy top-{BUDGET} native tiles',
          spatial='All legal M/N partitions, no split-K; an explicit standalone harness policy',
          tile_minima_MKN=list(MINIMA),inputs='single DRAM copy; replicas charged by linear mesh all-gather; bound-pruned partitions',one_core_tuning_full_chip_verified=True))

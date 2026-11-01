@@ -11,7 +11,7 @@ rotate Q with online state, paired K/V, or both. The common schedule provides
 numeric replay and ATLAS lowering, including the resulting output layout.
 """
 from dataclasses import dataclass, replace
-from math import ceil, gcd
+from math import ceil, gcd, isqrt
 
 from ..tasks import Region, window
 from ..gemm.space import divisors
@@ -154,8 +154,9 @@ class AttentionPlan:
     """Spatial query/context partitions and temporal packet shifts.
 
     A query packet carries Q and its online (m,l,U) state. A KV packet carries
-    paired K/V. Shifts are logical lanes inside a context segment, never DRAM
-    remappings. A zero query shift reproduces the original search domain.
+    paired K/V. Shifts are logical lanes inside a context segment. The DRAM
+    dataflow lands temporary copies without changing persistent KV homes;
+    Flash dataflows gather instead of shifting either packet.
     """
     query_parts: int = 1
     context_parts: int = 1
@@ -164,6 +165,15 @@ class AttentionPlan:
     query_shift: int = 0
     kv_shift: int = 1
     output: str = 'sharded'
+    dataflow: str = 'ring'
+
+    @property
+    def global_query(self):
+        return self.dataflow in ('t10', 'flash_os', 'flash_ws')
+
+    @property
+    def flash(self):
+        return self.dataflow.startswith('flash_')
 
     def sram_bytes(self, problem):
         q = min(self.query_tile, ceil(problem.queries/self.query_parts))*problem.group
@@ -171,46 +181,65 @@ class AttentionPlan:
         d = problem.head_dim
         # Two Q/state banks, score scratch, output scratch and four KV banks
         # (local owner staging plus incoming/outgoing packets at ragged edges).
-        return 16*q*d + 16*q + 16*k*d + 4*q*k
+        # A gather retains every lane's KV contribution, including the next
+        # gathered panel. A DRAM ring retains only computation/transfer tiles.
+        total=16*q*d + 16*q + 16*k*d*(self.query_parts if self.flash else 1) + 4*q*k
+        if self.dataflow=='dram':
+            # Read/send/store is a three-stage DMA pipeline, independent of
+            # the two local compute banks. Q/state copies follow their writes.
+            total+=max(8*k*d,(12*q*d+16*q) if self.query_shift else 0)
+        return total
 
     def validate(self, layout, sram):
         root_index(self.output,self.context_parts,self.context_parts-1)
+        if self.dataflow not in ('ring', 'dram', 't10', 'flash_os', 'flash_ws'):
+            raise ValueError('Unknown fused attention dataflow')
         p = self.query_parts
         if min(p, self.context_parts, self.query_tile) < 1 or self.kv_tile < 0:
             raise ValueError('Attention tile/partition sizes must be positive')
-        if p*self.context_parts > layout.group_cores or p > layout.problem.queries:
+        if p*self.context_parts > layout.group_cores or (p > layout.problem.queries and self.dataflow != 'dram'):
             raise ValueError('Attention partitions exceed cores or query length')
         if not 0 <= self.query_shift < p or not 0 <= self.kv_shift <= max(1,p-1):
             raise ValueError('Invalid rotation shift')
-        if gcd(self.query_shift-self.kv_shift,p) != 1:
+        if self.flash and (self.query_shift or self.kv_shift):
+            raise ValueError('Flash attention gathers operands; it does not rotate them')
+        if not self.flash and gcd(self.query_shift-self.kv_shift,p) != 1:
             raise ValueError('Relative rotation must cover every Q/KV pair')
+        if self.dataflow == 'dram' and layout.group_cores > 1 and p == 1:
+            raise ValueError('DRAM baseline requires an actual rotation')
         if self.sram_bytes(layout.problem) > sram:
             raise ValueError('Fused attention live SRAM exceeds capacity')
 
 
-def plans(layout, sram, rotation=True, joint=True):
+def plans(layout, sram, rotation=True, joint=True, dataflow='ring'):
     """Nested spaces: context parallelism, KV rotation, then Q/joint rotation.
 
     Search relative unit shifts in both orientations and their single-side
     limits; this is a finite subset, not every coprime rotation schedule.
     """
     p = layout.problem
-    for pq in divisors(layout.group_cores) if rotation else (1,):
-        if pq > p.queries:
+    flash = dataflow.startswith('flash_')
+    grid = max(d for d in divisors(layout.group_cores) if d <= min(isqrt(layout.group_cores),p.queries))
+    for pq in (grid,) if flash else divisors(layout.group_cores) if rotation else (1,):
+        if pq > p.queries and dataflow != 'dram':
+            continue
+        if dataflow == 'dram' and layout.group_cores > 1 and pq == 1:
             continue
         shifts = [(0,1)]
-        if joint and rotation and pq > 1:
+        if flash:
+            shifts = [(0,0)]
+        elif joint and rotation and pq > 1 and p.queries > 1:
             shifts = list(dict.fromkeys(shifts+[(1,0)]+[(a,(a+d)%pq) for a in range(1,pq) for d in (-1,1)]))
-        for pc in divisors(layout.group_cores//pq):
+        for pc in (layout.group_cores//pq,) if flash else divisors(layout.group_cores//pq):
             local = ceil(p.queries/pq)
             for tq in sorted({min(local,x) for x in (1,4,8,16,32,64,128)}):
                 # Tile rule and SRAM accounting are identical for every method.
-                for kv in (0, *(1 << i for i in range(p.context.bit_length(), -1, -1))):
-                    plan = AttentionPlan(pq,pc,tq,kv)
-                    if plan.sram_bytes(p) <= sram:
-                        for a,b in shifts:
-                            yield replace(plan,query_shift=a,kv_shift=b)
-                        break
+                for a,b in shifts:
+                    for kv in (0, *(1 << i for i in range(p.context.bit_length(), -1, -1))):
+                        plan = AttentionPlan(pq,pc,tq,kv,a,b,dataflow=dataflow)
+                        if plan.sram_bytes(p) <= sram:
+                            yield plan
+                            break
 
 
 def assignments(layout, plan):
@@ -229,6 +258,18 @@ def assignments(layout, plan):
                     yield head,request,s,c,Region(core,'',request*p.queries+s*groups,head*width,rows,width)
 
 
+def query_homes(layout):
+    """A single, plan-independent copy of Q, row-sharded within each head group."""
+    p = layout.problem; width = p.group*p.head_dim
+    for head in range(p.kv_heads):
+        start,_ = layout.head_group(head)
+        for b in range(p.batch):
+            for c in range(layout.group_cores):
+                lo,hi = p.queries*c//layout.group_cores,p.queries*(c+1)//layout.group_cores
+                if hi > lo:
+                    yield Region(start+c,'',b*p.queries+lo,head*width,hi-lo,width)
+
+
 def endpoints(layout, plan):
     from .attention_schedule import packets, lane_core
     blocks = list(assignments(layout,plan)); output = []
@@ -237,11 +278,11 @@ def endpoints(layout, plan):
             continue
         cores=[]
         for segment in range(plan.context_parts):
-            rounds = max(map(len,packets(layout,plan,h,b,segment)))
+            rounds = 1 if plan.dataflow == 'dram' else max(map(len,packets(layout,plan,h,b,segment)))
             lane = (s+rounds*(plan.query_parts-1)*plan.query_shift)%plan.query_parts
             cores.append(lane_core(layout,plan,h,b,lane,segment))
         output.extend(replace(r,core=core) for core in destinations(plan.output,cores,plan.context_parts-1))
-    return [r for *_,r in blocks],output
+    return list(query_homes(layout)) if plan.global_query else [r for *_,r in blocks],output
 
 
 def compile_attention(graph, layout, plan, query, cache, name='attention'):

@@ -13,7 +13,7 @@ from copy import deepcopy
 
 from .layout import GlobalLayout
 from .ownership import Ownership
-from .plan import DEPENDENCIES
+from .plan import DEPENDENCIES, execution_problem
 from .program import Program
 from ..sim import span, strides
 from ..output import reduce_steps, broadcast_steps, root_index
@@ -28,6 +28,7 @@ def compile_kernel(problem, plan, sram_bytes, dram_bytes):
 
 
 def compile_plan(problem, plan, sram_bytes, dram_bytes, overlap=True):
+    problem=execution_problem(problem,plan)
     own=Ownership(problem,plan)
     p=plan;core_count=p.cores
     shifted={v:prod(parts)>1 for v,parts in p.temporal.items()}

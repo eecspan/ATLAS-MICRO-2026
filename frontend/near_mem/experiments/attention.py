@@ -1,12 +1,12 @@
-"""Single fused attention: native context splits plus one method's plans.
+"""Single fused attention: each method evaluates its own attention space.
 
 Q is stored once, row-sharded over all cores; KV uses the common static
 head-partitioned layout. Moving or replicating Q to the cores a plan needs is
 part of the measured graph, as is writing the output. A task-based proxy
 shortlists candidates before simulation; --budget 0 validates exhaustively.
-The common context-split space is extended by each method's additional
-attention plans. Each run writes only its own cycles;
-``experiments.compare`` turns separate runs into speedups.
+Each method supplies its own fused dataflow over the shared static KV layout.
+Each run writes only its own cycles; ``experiments.compare`` turns separate
+runs into speedups.
 """
 import argparse
 from dataclasses import asdict
@@ -15,7 +15,7 @@ from pathlib import Path
 import time
 
 from ..methods import METHODS
-from ..model.attention import Attention, KVLayout, build_attention, plans
+from ..model.attention import Attention, KVLayout, build_attention
 from ..model.attention_proxy import AttentionProxy
 from ..search import measure_all
 from ..sim import WORKERS, dump, hardware
@@ -35,9 +35,10 @@ def run(problem, chip, out, method='ours', workers=WORKERS, budget=32):
     out.mkdir(parents=True, exist_ok=True)
     arch, _, _ = hardware(chip); sram = arch['core']['buffer']['buffer_size']*1024
     layout = KVLayout(problem, arch['core_num'])
-    native = list(plans(layout, sram, False))
-    names = (*METHODS[method].includes, method)
-    space = list(dict.fromkeys(native+[p for m in names for p in METHODS[m].attention(layout, sram)]))
+    # No method inherits another method's attention candidates implicitly.
+    space = METHODS[method].attention(layout, sram)
+    if not space:
+        raise ValueError(f'No SRAM-feasible fused attention plan for {method}')
     proxy = AttentionProxy(chip)
     candidates = proxy.select(problem,space,budget)
     rows = measure_all(candidates, lambda p: measure(problem, chip, out/'runs', p), workers)

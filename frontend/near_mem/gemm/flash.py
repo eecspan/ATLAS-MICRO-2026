@@ -13,19 +13,20 @@ when no such plan fits the SRAM (small-SRAM chips) do we split N into panels,
 re-gathering A for each, which is the minimal change that makes it run. The
 paper's skipped ring and DRAM bypass are hardware and are not modelled.
 """
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from itertools import product
 from math import ceil, isqrt
 
-from ..tasks import Timeline
+from ..tasks import Timeline, coalesce
 from .layout import GlobalLayout
-from .plan import FlashPlan
+from .plan import FlashPlan, Problem, execution_problem
 from .space import divisors
 
 
 class Geometry:
     """Per-step extents. ``ms`` rows and ``ks`` K columns are one core's slab."""
     def __init__(self, problem, plan):
+        problem = execution_problem(problem, plan)
         s = self.side = isqrt(plan.cores); m, n, k = problem.shape; self.dtype = problem.dtype_bytes
         if s*s != plan.cores or m % s or n % s or k % s:
             raise ValueError('FlashGEMM needs a square mesh and mesh-divisible dimensions')
@@ -53,14 +54,29 @@ class Geometry:
 
 
 def candidates(problem, cores, sram, tile_min=16, tile_policy='powers'):
-    """The paper's plans (whole local N); N panels only if none fits the SRAM."""
-    plans = list(_candidates(problem, cores, sram, tile_min, tile_policy, [None]))
-    if plans or isqrt(cores)**2 != cores or problem.n % isqrt(cores):
-        return iter(plans)
-    ln = problem.n//isqrt(cores)
-    values = [v for v in divisors(ln) if v >= min(ln, tile_min) and v < ln]
-    panels = values if tile_policy == 'all' else [v for v in values if v & (v-1) == 0]
-    return _candidates(problem, cores, sram, tile_min, tile_policy, panels)
+    """FlashGEMM plans; zero-pad mesh tails to keep its regular equal blocks.
+
+    Padded MACs and DRAM traffic are included in both proxy ranking and the
+    simulator. Padding is only used to make an otherwise invalid mesh shape
+    executable; the dataflow and tile search remain FlashGEMM's own.
+    """
+    side = isqrt(cores)
+    if side*side != cores:
+        return iter(())
+    logical = problem.shape
+    execution = tuple(((n+side-1)//side)*side for n in logical)
+    work = Problem(*execution, problem.dtype_bytes)
+    plans = list(_candidates(work, cores, sram, tile_min, tile_policy, [None]))
+    if plans or work.n % side:
+        selected = plans
+    else:
+        local_n = work.n//side
+        values = [v for v in divisors(local_n) if v >= min(local_n, tile_min) and v < local_n]
+        panels = values if tile_policy == 'all' else [v for v in values if v & (v-1) == 0]
+        selected = list(_candidates(work, cores, sram, tile_min, tile_policy, panels))
+    if execution != logical:
+        selected = [replace(p, logical_shape=logical, execution_shape=execution) for p in selected]
+    return iter(selected)
 
 
 def _candidates(problem, cores, sram, tile_min, tile_policy, panels):
@@ -85,6 +101,7 @@ def _candidates(problem, cores, sram, tile_min, tile_policy, panels):
 
 def score(problem, plan, mac, dram_bw, flit):
     """Proxy: per round the slowest of compute share, DRAM slab reads and one gather hop."""
+    problem = execution_problem(problem, plan)
     g = Geometry(problem, plan); t = g.dtype; s = g.side; R = g.round
     mt, kt, nt = plan.m_tile, plan.k_tile, g.nt
     compute = ceil(mt*nt*kt/mac)
@@ -103,6 +120,7 @@ class FlashProgram:
     """Placement, boundary regions and native tasks of one plan."""
     def __init__(self, problem, plan, sram, dram):
         from ..sim import span, strides
+        problem = execution_problem(problem, plan)
         self.problem = problem; self.plan = plan; g = self.g = Geometry(problem, plan)
         if g.sram > sram:
             raise ValueError(f'SRAM capacity exceeded: {g.sram} > {sram}')
@@ -126,7 +144,15 @@ class FlashProgram:
         return self.g.nt
 
     def regions(self, tensor):
-        return self.layout.regions(tensor)
+        regions=self.layout.regions(tensor)
+        if self.plan.logical_shape is None:
+            return regions
+        m,n,k=self.plan.logical_shape;rows,cols={'A':(m,k),'B':(k,n),'C':(m,n)}[tensor]
+        clipped=[]
+        for r in regions:
+            nr=min(r.rows,max(0,rows-r.row));nc=min(r.cols,max(0,cols-r.col))
+            if nr and nc:clipped.append(r.crop(r.row,r.col,nr,nc))
+        return coalesce(clipped)
 
     def steps(self):
         """``(q, j, x, t)``: M panel, N panel, K tile and the round its slabs are read."""

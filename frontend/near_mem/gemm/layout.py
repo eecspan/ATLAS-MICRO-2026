@@ -16,24 +16,36 @@ class GlobalLayout:
         if self.side*self.side != cores:
             raise ValueError('The global layout needs a square mesh')
         self.shapes = dict(A=(problem.m, problem.k), B=(problem.k, problem.n), C=(problem.m, problem.n))
-        if any(n % self.side for shape in self.shapes.values() for n in shape):
-            raise ValueError('The global layout needs mesh-divisible dimensions')
-        if problem.n % (2*self.side) == 0:
+        # Decode GEMMs with M=1 have no row parallelism. Keep one DRAM copy,
+        # stripe A along K and B/C along N across all banks. Readers then pay
+        # the real remote-access cost for A; this does not silently replicate it.
+        if problem.m == 1:
+            self.grids = {name: (1, cores) for name in self.shapes}
+        else:
+            self.grids = {name: (self.side, self.side) for name in self.shapes}
+        if any(n % part for name, shape in self.shapes.items()
+               for n, part in zip(shape, self.grids[name])):
+            raise ValueError('The global layout needs dimensions divisible by its per-tensor grid')
+        if problem.n % (2*self.grids['C'][1]) == 0:
             self.shapes['G'] = (problem.m, problem.n//2)  # fused gated-FFN output
+            self.grids['G'] = self.grids['C']
 
     def block(self, tensor):
         rows, cols = self.shapes[tensor]
-        return rows//self.side, cols//self.side
+        gr, gc = self.grids[tensor]
+        return rows//gr, cols//gc
 
     def pieces(self, tensor, row, col, rows, cols):
         """``(home, local_base, extent)`` of each home block a window touches."""
         h, w = self.block(tensor)
+        gr, gc = self.grids[tensor]
         for r in range(row//h, (row+rows-1)//h+1):
             for c in range(col//w, (col+cols-1)//w+1):
                 r0, r1 = max(row, r*h), min(row+rows, (r+1)*h)
                 c0, c1 = max(col, c*w), min(col+cols, (c+1)*w)
-                yield r*self.side+c, [r0-r*h, c0-c*w], [r1-r0, c1-c0]
+                yield r*gc+c, [r0-r*h, c0-c*w], [r1-r0, c1-c0]
 
     def regions(self, tensor):
         h, w = self.block(tensor)
-        return [Region(core, tensor, core//self.side*h, core % self.side*w, h, w) for core in range(self.side**2)]
+        gr, gc = self.grids[tensor]
+        return [Region(core, tensor, core//gc*h, core % gc*w, h, w) for core in range(gr*gc)]

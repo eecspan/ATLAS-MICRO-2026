@@ -57,6 +57,11 @@ class Plan:
     # (a TP partition's mesh direction, see ``Ownership``).
     transpose: bool = False
     output: str = 'sharded'
+    # Optional zero-padded GEMM extent used by a baseline whose regular mesh
+    # mapping cannot cover the logical shape. The padded work is simulated;
+    # replay pads A/B with zeros and crops C back to ``logical_shape``.
+    logical_shape: tuple[int, int, int] | None = None
+    execution_shape: tuple[int, int, int] | None = None
 
     @property
     def temporal(self):
@@ -207,6 +212,25 @@ class FlashPlan:
     cores: int = 16
     kind: str = 'flash'
     n_tile: int | None = None
+    logical_shape: tuple[int, int, int] | None = None
+    execution_shape: tuple[int, int, int] | None = None
+
+
+def execution_problem(problem, plan):
+    """Return the physical GEMM shape represented by ``plan``.
+
+    Normally this is the logical problem. Baselines can carry an explicit
+    padded extent; keeping it on the immutable plan makes proxy ranking,
+    simulation, and result manifests use the same work.
+    """
+    shape = getattr(plan, 'execution_shape', None)
+    if shape is None or tuple(shape) == problem.shape:
+        return problem
+    logical = getattr(plan, 'logical_shape', None)
+    if logical is None or tuple(logical) != problem.shape or len(shape) != 3 or any(
+            type(n) is not int or n < old for n, old in zip(shape, problem.shape)):
+        raise ValueError('Padded plans must record their logical and execution GEMM shapes')
+    return Problem(*shape, problem.dtype_bytes)
 
 
 def load(data):
