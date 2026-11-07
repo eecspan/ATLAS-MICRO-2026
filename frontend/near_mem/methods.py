@@ -10,9 +10,10 @@ native ``mnk`` kernel and ATLAS's native tile rule. A single GEMM may split M
 or N; in a graph every GEMM uses the fixed K/N mesh grid of ATLAS's TP
 deployment along its ``direction``. ``atlas`` runs the unmodified upstream
 GEMM generator and tile explorer (``gemm.native``); it only checks that
-``tp`` loses nothing and is not a baseline of its own. ``space`` yields the
-plans a method adds; ``includes`` lists the smaller methods whose plans it
-also proposes, so spaces nest (tp ⊂ local ⊂ ours) by construction.
+``tp`` loses nothing and is not a baseline of its own. ``space`` yields a
+method's whole space. ``ours`` is the full Ps/Pt space, Pt = 1 included, with
+both mesh orientations of every partition, so the TP grid is one of its
+points; ``local`` is the same space restricted to Pt = 1 (an ablation).
 Baselines keep only their own dataflow: T10 rotates on chip over one
 plan-independent DRAM layout with its fixed ``mnk`` loop; FlashGEMM
 all-gathers single-copy blocks.
@@ -33,7 +34,6 @@ class Method:
     name: str
     description: str
     rotation: bool = False
-    includes: tuple = ()
     receive: str = 'sram_consume'
     layout: str = 'local'
     flash: bool = False
@@ -45,7 +45,7 @@ class Method:
 
     def space(self, problem, cores, sram, dram, tile_min=8, tile_policy='all', layer_policy='elk', skip=None,
               single_b=False, direction=None):
-        """Plans this method adds; see ``gemm.space.candidates`` for ``skip`` and ``single_b``.
+        """This method's plans; see ``gemm.space.candidates`` for ``skip`` and ``single_b``.
         ``direction`` is a graph GEMM's TP mesh direction (None for a single GEMM)."""
         if self.flash:
             return flash.candidates(problem, cores, sram, tile_min, tile_policy)
@@ -82,9 +82,6 @@ class Method:
             if execution == problem.shape:
                 return plans
             return (_padding_metadata(p, problem.shape, execution) for p in plans)
-        # A local method with rotation adds only rotating plans (no-rotation
-        # plans belong to ``local``); a global layout keeps both.
-        own = self.rotation and self.layout == 'local'
         execution = problem.shape
         if self.layout == 'global':
             side = isqrt(cores)
@@ -98,10 +95,13 @@ class Method:
             elif any(n % side for n in problem.shape):
                 execution = tuple(((n+side-1)//side)*side for n in problem.shape)
         adapted_skip = _padding_skip(skip, problem.shape, execution)
-        drop = (lambda q: not q.layers or bool(adapted_skip and adapted_skip(q))) if own else adapted_skip
         work = Problem(*execution, problem.dtype_bytes)
-        plans = candidates(work, cores, sram, tile_min, tile_policy, layer_policy, dram, self.rotation, drop, single_b,
-                           self.receive, self.layout, self.loops)
+        # Both mesh orientations of a partition: the TP grid's transposed
+        # numbering is a point of our space, not a separate method.
+        orient = (False, True) if self.layout == 'local' and isqrt(cores)**2 == cores else (False,)
+        plans = (p for t in orient for p in candidates(
+            work, cores, sram, tile_min, tile_policy, layer_policy, dram, self.rotation, adapted_skip, single_b,
+            self.receive, self.layout, self.loops, transpose=t))
         if execution == problem.shape:
             return plans
         return (_padding_metadata(p, problem.shape, execution) for p in plans)
@@ -135,10 +135,9 @@ METHODS = {m.name: m for m in (
     Method('tp', 'tensor parallel: replicated inputs, M/N (single GEMM) or fixed K/N TP grid, mnk, native tiles',
            tp=True),
     Method('atlas', 'unmodified upstream ATLAS GEMM generator and tile explorer (a check of tp)', native=True),
-    Method('local', 'our spatial/tile/loop space without rotation: Ps incl. split-K, tiles, six loop orders',
-           includes=('tp',)),
-    Method('ours', 'adds temporal rotation (Pt) of A/B/C and of fused-attention Q/KV tiles', True, ('tp', 'local'),
-           attention_mode='ours'),
+    Method('local', 'ablation: our space at Pt = 1 (Ps incl. split-K and mesh orientation, tiles, six loop orders)'),
+    Method('ours', 'our full space: Ps and temporal rotation Pt of A/B/C (Pt = 1 included) and of fused-attention '
+           'Q/KV tiles', True, attention_mode='ours'),
     Method('dram', 'DRAM-level rotation: rotated A/B/C blocks are forwarded DRAM to DRAM and re-read',
            True, receive='dram_land', attention_mode='dram'),
     Method('t10', 'improved T10: on-chip Ps/Pt rotation over one plan-independent global DRAM layout, mnk loop',
@@ -153,24 +152,3 @@ def target(chip, tile_min=8, tile_policy='all', layer_policy='elk'):
     arch, dram, _ = hardware(chip)
     return dict(cores=arch['core_num'], sram=arch['core']['buffer']['buffer_size']*1024, dram=dram,
                 tile_min=tile_min, tile_policy=tile_policy, layer_policy=layer_policy)
-
-
-def propose(problem, hw, pick, name):
-    """Ranked proposals of method ``name`` and of every method it includes.
-
-    ``pick(space, method)`` maps a space ``skip -> plans`` to
-    ``([(plan, score)], scanned)``, as ``search.shortlist`` does. Returns the
-    lists and the plans scored, per method.
-    """
-    if METHODS[name].native:
-        raise ValueError('The ATLAS space is generated by gemm.native')
-    ranked = {}; scanned = {}
-    for m in (METHODS[x] for x in (*METHODS[name].includes, name)):
-        ranked[m.name], scanned[m.name] = pick(lambda skip=None, m=m: m.space(problem, skip=skip, **hw), m)
-    return ranked, scanned
-
-
-def union(ranked, name, count=None):
-    """Candidates of a method: the first ``count`` of it and of every included method."""
-    names = (*METHODS[name].includes, name)
-    return list(dict.fromkeys(p for x in names for p, _ in ranked[x][:count]))

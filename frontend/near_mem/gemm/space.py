@@ -267,6 +267,6 @@ def families(prefix,loops=LOOPS):
 
 
 def structure(p):
-    """Spatial and rotation decision of a plan, independent of tiles and loops."""
+    """Spatial (incl. mesh orientation) and rotation decision of a plan, independent of tiles and loops."""
     if getattr(p,'kind',None)=='flash':return (p.dataflow,p.b_resident)
-    return (p.ps,p.a,p.b,p.c)
+    return (p.ps,p.transpose,p.a,p.b,p.c)

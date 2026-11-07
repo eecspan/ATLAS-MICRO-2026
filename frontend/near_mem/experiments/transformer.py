@@ -32,7 +32,7 @@ import time
 
 from ..gemm.plan import load
 from ..gemm.space import Proxy, structure
-from ..methods import METHODS, propose, target, union
+from ..methods import METHODS, target
 from ..output import variants as output_variants
 from ..model.attention import AttentionPlan, KVLayout
 from ..model.attention_proxy import AttentionProxy
@@ -283,10 +283,12 @@ def run(workload, chip, out, method='ours', budget=4, workers=WORKERS, tile_min=
         for name, problem in workload.problems.items():
             score = lambda p: (k := proxy.kernel(problem, p), k+proxy.distribution(problem, p))
             bound = lambda q: (k := proxy.lower(problem, q), k+proxy.distribution(problem, q))
-            ranked, scanned = propose(problem, dict(hw, direction=roles(workload, name)['direction']),
-                                      lambda space, m: diverse(space, score, budget, structure, tiles, bound), method)
-            options[name] = [dict(plan=asdict(p), native=False, **roles(workload, name)) for p in union(ranked, method)]
-            report[name] = dict(scanned=scanned, chosen={k: [asdict(p) for p, _ in v] for k, v in ranked.items()})
+            space = lambda skip=None: METHODS[method].space(problem, skip=skip, direction=roles(workload, name)['direction'], **hw)
+            chosen, scanned = diverse(space, score, budget, structure, tiles, bound)
+            # Simulate in proxy (kernel score) order, so a deadline cuts the tail.
+            ranked = sorted((p for p, _ in chosen), key=lambda p: proxy.kernel(problem, p))
+            options[name] = [dict(plan=asdict(p), native=False, **roles(workload, name)) for p in ranked]
+            report[name] = dict(scanned=scanned, chosen=[asdict(p) for p in ranked])
     chain = Chain(exp, hw, proxy, workers, attention_budget, stop and started+deadline/2)
     options, proposals, configs = chain.propose({k: options[k] for k in ORDER}, width, keep)
     best = min(exp.measure_many(configs, method+'_joint', workers, stop, abort=False), key=cycles)

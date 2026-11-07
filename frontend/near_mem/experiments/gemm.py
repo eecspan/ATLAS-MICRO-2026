@@ -24,7 +24,7 @@ from ..gemm.lower import measure
 from ..gemm.native import tune
 from ..gemm.plan import Plan, Problem, load
 from ..gemm.space import Proxy, families, family
-from ..methods import METHODS, propose, target, union
+from ..methods import METHODS, target
 from ..search import best, measure_all, shortlist
 from ..sim import WORKERS, dump, fingerprint
 
@@ -34,9 +34,8 @@ def search(problem, chip, out, method, budget, workers, hw, proxy, provenance, d
     bound = lambda q: proxy.lower(problem, q)+proxy.distribution(problem, q)
     pick = lambda space, m: shortlist(space, lambda p: proxy(problem, p), budget, family, bound,
                                       lambda q: families(q, m.loops))
-    ranked, generated = propose(problem, hw, pick, method)
-    score = {p: s for v in ranked.values() for p, s in v}
-    space = sorted(union(ranked, method), key=score.get)
+    ranked, generated = pick(lambda skip=None: METHODS[method].space(problem, skip=skip, **hw), METHODS[method])
+    space = [p for p, _ in ranked]  # ascending proxy score
     evaluate = partial(measure, problem, chip=chip, folder=out/'runs', provenance=provenance, deadline=deadline)
     rows = measure_all(space, evaluate, workers, processes=True, deadline=deadline)
     dump(out/'results.json', rows)

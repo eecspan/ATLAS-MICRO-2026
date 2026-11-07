@@ -18,7 +18,7 @@ Attention 和 GEMM 共用两阶段评估：proxy 排序，ATLAS 模拟器复核�
 
 刚性网格 baseline 遇到边界维度时，只用零填充补齐到各自规则布局要求，并按补齐后的完整 MAC 与 DRAM 流量排序和模拟；计划同时记录逻辑形状和执行形状。原生 ATLAS 单算子若没有精确 M/N 分区就补齐；TP 单算子在没有合法 M/N 网格时补齐到一个合法网格，整图 TP/原生 TP 只补固定网格要求的 K/N 轴；FlashGEMM 将 M/N/K 补齐到 mesh side。T10 的 `M=1` 用单份一维 DRAM 布局：A 沿 K 切分，B/C 沿 N 切分到所有 bank，不复制 A，远端访问由模拟器计费；其他不对齐维度才补齐到其规则网格。可自然改用其他空间轴的方案不强制 padding。
 
-`dram` 只表示 DRAM 端轮转，不自动退回 `tp` 或 `local`。`ours` 保留 `tp/local` 作为可行的回退子空间；如果要单独比较 DRAM 与 SRAM 轮转，应分别运行这些方法，而不是把回退混进 DRAM baseline。
+`ours` 是完整的 Ps/Pt 空间：Pt=1（不轮转）是其中的点，Ps 同时枚举 mesh 的两个方向，所以 TP 网格自然是 `ours` 的子集，不再拼接其他方法的候选；整个空间一次扫描、一次 shortlist，按 proxy 排名送入模拟器。`local` 只作消融（`ours` 限定 Pt=1），单独运行。`dram` 只表示 DRAM 端轮转，不退回 `tp` 或 `local`；比较 DRAM 与 SRAM 轮转时各自单独运行。
 
 DRAM 搬运生成源 DRAM 读、NoC 发送/接收、目标 DRAM 写；与 ATLAS 一致，SRAM 计发送读和接收写，不额外计源端 staging 写及目标端 staging 读。搬运仍占 SRAM 缓冲，临时 DRAM 副本仍占容量；此 DMA 中转抽象可统一修订。历史 KV 的 owner 和内容不因轮转改变。
 

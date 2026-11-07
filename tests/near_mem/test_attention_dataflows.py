@@ -109,7 +109,6 @@ def test_method_spaces_keep_their_dataflows_and_dram_never_falls_back(capacity):
         for plan in space:
             plan.validate(layout,capacity)
             assert Schedule(layout,plan).buffer_peak()<=plan.sram_bytes(p)
-    assert not METHODS['dram'].includes
     assert all(p.query_parts>1 for p in METHODS['dram'].attention(layout,16384))
     assert any(p.query_shift for p in METHODS['t10'].attention(layout,16384))
     assert any(p.query_shift and p.kv_shift for p in METHODS['t10'].attention(layout,16384))
