@@ -11,15 +11,17 @@ chain proposes the ``keep`` best complete graphs, which are simulated whole.
 The chain score misses overlap between operators, so a coordinate descent
 then simulates, in parallel, every graph that changes one decision to one of
 its few best standalone options, keeps the best, and repeats up to
-``passes`` times while it improves. ``deadline`` caps the wall-clock seconds:
-after it no further whole graph starts and running ones are aborted (the first
-joint graphs always complete), so all methods can be held to one limit. Weights are stored once for every method:
+``passes`` times while it improves. ``deadline`` caps the wall-clock seconds,
+so all methods can be held to one limit: standalone options are measured in
+proxy order until half of it (each operator's best-ranked option always
+completes; unmeasured options are dropped), and after it no further whole
+graph starts and running ones are aborted (the first joint graphs always
+complete). Weights are stored once for every method:
 an M split must rotate B. Each run writes only its own cycles;
 ``experiments.compare`` turns separate runs into speedups.
 """
 import argparse
 from copy import deepcopy
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
 import hashlib
 import json
@@ -129,8 +131,8 @@ class Chain:
     Each option is simulated once with its inputs already in its own layout;
     each layout edge is scored from its exact per-core traffic.
     """
-    def __init__(self, exp, hw, proxy, workers, attention_budget=32):
-        self.exp = exp; self.hw = hw; self.proxy = proxy; self.workers = workers
+    def __init__(self, exp, hw, proxy, workers, attention_budget=32, deadline=None):
+        self.exp = exp; self.hw = hw; self.proxy = proxy; self.workers = workers; self.deadline = deadline
         self.cycles = {}; self.ports = {}; self.edge_scores = {}
         self.attention_proxy = AttentionProxy(exp.chip); self.attention_budget = attention_budget
         self.attention_report = {}
@@ -140,11 +142,11 @@ class Chain:
                  entry['gated'])
         return k.bind(self.hw['cores'], self.hw['sram'], self.hw['dram'])
 
-    def simulate(self, name, choice):
+    def simulate(self, name, choice, deadline=None):
         w = self.exp.workload
         if name == 'attention':
             return standalone_attention.measure(w.attention, self.exp.chip, self.exp.out/'attention',
-                                                choice, placed=True)['result']['e2e_cycles']
+                                                choice, placed=True, deadline=deadline)['result']['e2e_cycles']
         key = hashlib.sha256(json.dumps([name, choice], sort_keys=True).encode()).hexdigest()[:20]
         folder = self.exp.out/'operators'/key
         graph = Graph(self.exp.chip); kernel = self.kernel(name, choice).prepare(graph, name)
@@ -153,7 +155,17 @@ class Chain:
             graph.tensor(core, 'x', t['shape'], t['strides'])
         kernel.compile(graph, [replace(r, name='x') for r in regions],
                        rope_width=w.attention.hidden if w.rope and name == 'qkv' else 0)
-        return graph.simulate(folder)['result']['e2e_cycles']
+        return graph.simulate(folder, deadline=deadline)['result']['e2e_cycles']
+
+    def measure(self, jobs, deadline):
+        """Standalone cycles of ``(name, choice)`` jobs, in order, until ``deadline``."""
+        run = lambda i: self.simulate(*jobs[i], deadline=deadline)
+        try:
+            rows = measure_all(range(len(jobs)), lambda i: (i, run(i)), self.workers, deadline=deadline)
+        except TimeoutExpired:
+            rows = []
+        for i, value in rows:
+            self.cycles[jobs[i][0], token(jobs[i][1])] = value
 
     def prepare(self, options):
         """Measure every distinct option once; drop illegal and behaviourally equal options."""
@@ -178,11 +190,17 @@ class Chain:
                                                                self.attention_budget,placed=True)
             self.attention_report = dict(plans=len(candidates),measured=len(options['attention']),
                                          proxy_budget=self.attention_budget)
-        jobs = list({(name, token(c)): (name, c) for name, choices in options.items() for c in choices
-                     if (name, token(c)) not in self.cycles}.items())
-        with ThreadPoolExecutor(max_workers=self.workers) as pool:
-            for (key, _), value in zip(jobs, pool.map(lambda job: self.simulate(*job[1]), jobs)):
-                self.cycles[key] = value
+        # Options are in proxy order. Each operator's first option always
+        # completes; the others are measured until the deadline, then dropped.
+        # Interleave operators by rank so a deadline cuts every operator's tail.
+        ranked = sorted(((rank, name, c) for name, choices in options.items() for rank, c in enumerate(choices)),
+                        key=lambda x: x[0])
+        jobs = list({(name, token(c)): (rank, name, c) for rank, name, c in ranked
+                     if (name, token(c)) not in self.cycles}.values())
+        self.measure([(n, c) for r, n, c in jobs if r == 0], None)
+        self.measure([(n, c) for r, n, c in jobs if r > 0], self.deadline)
+        options = {name: [c for c in choices if (name, token(c)) in self.cycles] for name, choices in options.items()}
+        self.measured = {name: len(choices) for name, choices in options.items()}
         # Options with equal measured cycles and equal boundary layouts behave
         # the same in every graph (e.g. loop orders of a one-tile kernel).
         def behaviour(name, c):
@@ -269,11 +287,11 @@ def run(workload, chip, out, method='ours', budget=4, workers=WORKERS, tile_min=
                                       lambda space, m: diverse(space, score, budget, structure, tiles, bound), method)
             options[name] = [dict(plan=asdict(p), native=False, **roles(workload, name)) for p in union(ranked, method)]
             report[name] = dict(scanned=scanned, chosen={k: [asdict(p) for p, _ in v] for k, v in ranked.items()})
-    chain = Chain(exp, hw, proxy, workers, attention_budget)
+    chain = Chain(exp, hw, proxy, workers, attention_budget, stop and started+deadline/2)
     options, proposals, configs = chain.propose({k: options[k] for k in ORDER}, width, keep)
     best = min(exp.measure_many(configs, method+'_joint', workers, stop, abort=False), key=cycles)
     best = descend(exp, best, chain.neighbours(options, refine), method, passes, workers, stop)
-    dump(exp.out/'search.json', dict(gemm=report, attention=chain.attention_report, joint=[dict(score=score, configuration=cfg)
+    dump(exp.out/'search.json', dict(gemm=report, attention=chain.attention_report, measured=chain.measured, joint=[dict(score=score, configuration=cfg)
                                                           for (score, _), cfg in zip(proposals, configs)],
                                       budget=budget, tiles=tiles, passes=passes, width=width, keep=keep, refine=refine))
     summary = dict(experiment='transformer', workload=asdict(workload), chip=str(Path(chip).resolve()), method=method,

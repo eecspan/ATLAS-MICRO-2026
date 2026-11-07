@@ -10,7 +10,7 @@
 | `output.py` | GEMM 与 attention 共用的归约输出方式：分片、汇聚到组端点、组内复制；整图搜索结合下游布局选择 |
 | `search.py` | 通用搜索：`shortlist`、`diverse`（均支持下界剪枝）、`beam`、`anneal`、`measure_all` |
 | `methods.py` | 方法注册表：`tp`（TP 基线）、`atlas`（上游检查）、`local`、`ours`、`dram`、`t10`、`flash`；新增 baseline 在此加一项 |
-| `experiments/` | 实验入口：`gemm`、`attention`、`transformer`（每次一个方法）；`attention_space` 对照新旧融合调度空间；`compare` 计算加速比，`motivation` 汇总已有结果 |
+| `experiments/` | 实验入口：`gemm`、`attention`、`transformer`（每次一个方法）；`inference` 按固定 batch/输入/输出折算整段推理；`attention_space` 对照新旧融合调度空间；`compare` 计算加速比，`motivation` 汇总已有结果 |
 
 Attention 和 GEMM 共用两阶段评估：proxy 排序，ATLAS 模拟器复核。Attention proxy 复用实际 lowering 任务，按硬件吞吐与依赖估算；单算子 `--budget`、整图 `--attention-budget` 默认 32，额外保留不同空间/输出族的代表，0 表示穷举。
 
@@ -22,12 +22,15 @@ Attention 和 GEMM 共用两阶段评估：proxy 排序，ATLAS 模拟器复核�
 
 DRAM 搬运生成源 DRAM 读、NoC 发送/接收、目标 DRAM 写；与 ATLAS 一致，SRAM 计发送读和接收写，不额外计源端 staging 写及目标端 staging 读。搬运仍占 SRAM 缓冲，临时 DRAM 副本仍占容量；此 DMA 中转抽象可统一修订。历史 KV 的 owner 和内容不因轮转改变。
 
+快速实验口径（`inference`，各方法一致）：prefill 每个请求按 512-token chunk 切分（末块补齐），GEMM 的 M=chunk 与 batch 无关，attention 取各 chunk 前缀长度的平均值；decode 用给定 batch，attention 取中间生成位置的长度。每个阶段只搜索并模拟一层代表点，再乘步数和层数。这是私下取数的方式，论文按分段流程描述（静态片段按 token 桶，attention 按 KV 长度区间重规划）。
+
 General task 的 DRAM 读可用 `ready_iter` 声明首次使用位置。后端将原有 Ramulator 批次延迟放入每核一条串行服务队列，允许预取跨 iteration，在首次使用及算子结束时等待。批次内仍由 Ramulator 建模，批次间不做请求重排，NoC 仍由 BookSim 模拟；这是保守的批次服务模型，不是逐请求异步 DRAM 后端。未注解的任务保留原有逐步等待语义。GEMM 只在双缓冲空闲时提前读取，attention 由 packet 生命周期检查 staging 与轮转缓冲容量。
 
 ```bash
 .venv/bin/python -m frontend.near_mem.experiments.gemm --help
 .venv/bin/python -m frontend.near_mem.experiments.attention --help
 .venv/bin/python -m frontend.near_mem.experiments.transformer --help
+.venv/bin/python -m frontend.near_mem.experiments.inference --help
 .venv/bin/python -m frontend.near_mem.experiments.compare results/near_mem/...
 .venv/bin/python -m pytest -q tests/near_mem
 ```

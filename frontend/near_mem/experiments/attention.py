@@ -23,11 +23,11 @@ from ..sim import WORKERS, dump, hardware
 cycles = lambda row: row['result']['e2e_cycles']
 
 
-def measure(problem, chip, out, plan, placed=False):
+def measure(problem, chip, out, plan, placed=False, deadline=None):
     """Simulate one plan. Q starts row-sharded, or, if ``placed``, already where the plan reads it."""
     graph = build_attention(problem,chip,plan,placed)
     name = '_'.join(map(str, asdict(plan).values()))+('_placed' if placed else '')
-    return dict(plan=asdict(plan), result=graph.simulate(Path(out)/name)['result'])
+    return dict(plan=asdict(plan), result=graph.simulate(Path(out)/name, deadline=deadline)['result'])
 
 
 def run(problem, chip, out, method='ours', workers=WORKERS, budget=32):

@@ -1,0 +1,33 @@
+# mesh64 with 4x DRAM bandwidth per core (0.5TBps) and 128 B NoC links (2x).
+# Compute and SRAM as mesh64: 1,920 MAC and 256 KiB per core, 8x8 mesh.
+architecture:
+  frequency: 1000
+  core_num: 64
+  core:
+    controller:
+      power: 0.1813
+      area: 0.9163
+    matrix:
+      mac_num: 1920
+      power: 0.7813
+      area: 3.2814
+    vector:
+      vec_num: 120
+      power: 0.0942
+      area: 0.3125
+    buffer:
+      buffer_size: 256
+      read_bw: 8192.0
+      write_bw: 8192.0
+      power: 0.3179
+      area: 0.9865
+  dram:
+    config_path: configs/architecture/dram/cloud/cloud_0.5TBps.yaml
+    power: 0.6666
+    area: 1.2495
+  noc:
+    topology: mesh
+    config_path: configs/architecture/noc/8x8_mesh
+    flit_size: 128
+    power: 0.1189
+    area: 1.6493

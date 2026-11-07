@@ -1,0 +1,36 @@
+# 64-core variant of the main chip at equal chip totals: the same 122,880
+# MAC/cycle, 8 TB/s DRAM and 16 MiB SRAM split over an 8x8 mesh, with the
+# NoC bisection kept at 512 B/cycle (64 B links instead of 128 B). Per core:
+# 1,920 MAC, 0.125 TB/s DRAM, 256 KiB SRAM. The DRAM/compute balance point
+# stays at M = 30 rows; only the parallel granularity changes.
+architecture:
+  frequency: 1000
+  core_num: 64
+  core:
+    controller:
+      power: 0.1813
+      area: 0.9163
+    matrix:
+      mac_num: 1920
+      power: 0.7813
+      area: 3.2814
+    vector:
+      vec_num: 120
+      power: 0.0942
+      area: 0.3125
+    buffer:
+      buffer_size: 256
+      read_bw: 8192.0
+      write_bw: 8192.0
+      power: 0.3179
+      area: 0.9865
+  dram:
+    config_path: configs/architecture/dram/cloud/cloud_0.125TBps.yaml
+    power: 0.6666
+    area: 1.2495
+  noc:
+    topology: mesh
+    config_path: configs/architecture/noc/8x8_mesh
+    flit_size: 64
+    power: 0.1189
+    area: 1.6493

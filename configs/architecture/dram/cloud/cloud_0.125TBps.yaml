@@ -1,0 +1,29 @@
+Frontend:
+  impl: HBFrontend
+  clock_ratio: 1
+
+MemorySystem:
+  impl: GenericDRAM
+  clock_ratio: 1
+
+  DRAM:
+    impl: HBDRAM
+    org:
+      preset: HBDRAM_16Gb_1024pin_512col
+      channel: 2
+    timing:
+      preset: HBDRAM_500Mbps
+
+  Controller:
+    impl: Generic
+    Scheduler:
+      impl: FRFCFS
+    RefreshManager:
+      impl: AllBank
+    RowPolicy:
+      impl: OpenRowPolicy
+    plugins:
+
+  AddrMapper:
+    impl: OneLevelInterleave
+    channel_lowest_bit: 5
