@@ -40,10 +40,11 @@ def broadcast_steps(group, root):
 
 
 def variants(plan):
-    """Boundary choices for a shortlisted plan, shared by all graph methods.
+    """Boundary choices for a shortlisted plan of a joint-boundary method.
 
-    Global-layout baselines keep their prescribed layout; without a residual
-    reduction group the current contract has no extra choices.
+    Only methods whose plans move DRAM residency (``Method.boundary``) expand
+    them; baselines keep the contract their dataflow prescribes. Without a
+    residual reduction group the current contract has no extra choices.
     """
     from .gemm.plan import Plan
     from .model.attention import AttentionPlan

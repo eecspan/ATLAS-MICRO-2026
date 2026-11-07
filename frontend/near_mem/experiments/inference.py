@@ -38,6 +38,7 @@ def main():
                         ('keep', 8), ('tiles', 2), ('refine', 3), ('attention-budget', 32)]:
         ap.add_argument('--'+name, type=int, default=value)
     ap.add_argument('--deadline', type=float, help='common wall-clock cap per phase in seconds')
+    ap.add_argument('--no-joint', action='store_true', help='ablation: no joint boundary search')
     a = ap.parse_args()
     if min(a.batch, a.input, a.generate, a.chunk, a.layers) < 1:
         ap.error('Counts must be positive')
@@ -48,10 +49,10 @@ def main():
         point, steps = points(a.batch, a.input, a.generate, a.chunk)[phase]
         workload = Workload(**point, **shape)
         s = transformer.run(workload, a.chip, a.output/phase, a.method, a.budget, a.workers, a.tile_min, a.passes,
-                            a.width, a.keep, a.tiles, a.refine, a.deadline, a.attention_budget)
+                            a.width, a.keep, a.tiles, a.refine, a.deadline, a.attention_budget, not a.no_joint)
         result[phase] = dict(workload=asdict(workload), layer_cycles=s['cycles'], steps=steps,
                              cycles=s['cycles']*steps*a.layers, hit_deadline=s['hit_deadline'])
-    summary = dict(experiment='inference', method=a.method, chip=str(a.chip.resolve()),
+    summary = dict(experiment='inference', method=s['method'], chip=str(a.chip.resolve()),
                    workload=dict(batch=a.batch, input=a.input, generate=a.generate, chunk=a.chunk,
                                  layers=a.layers, phases=list(phases), **shape),
                    phases=result, cycles=sum(r['cycles'] for r in result.values()))

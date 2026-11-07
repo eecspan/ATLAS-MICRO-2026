@@ -8,10 +8,12 @@ schedule of ATLAS's collectives while the previous step computes. ``os``
 keeps C stationary and gathers A along rows and B along columns, per M panel
 of the C block. ``ws`` keeps B stationary: A slabs are transposed to the row
 of their K block and gathered along it, and partial C is reduce-scattered
-along columns. As in the paper, a step holds the whole local N extent; only
-when no such plan fits the SRAM (small-SRAM chips) do we split N into panels,
-re-gathering A for each, which is the minimal change that makes it run. The
-paper's skipped ring and DRAM bypass are hardware and are not modelled.
+along columns. As in the paper, a step holds the whole local M and N
+extents and only the K tile is searched; only when no K tile fits the whole
+local M is M split minimally (the largest M tile some K tile fits, keeping B
+resident under WS when it fits), and only if no M tile fits do we split N
+into panels, re-gathering A for each. Both OS and WS are proposed and the simulator picks.
+The paper's skipped ring and DRAM bypass are hardware and are not modelled.
 """
 from dataclasses import asdict, replace
 from itertools import product
@@ -73,7 +75,7 @@ def candidates(problem, cores, sram, tile_min=16, tile_policy='powers'):
         local_n = work.n//side
         values = [v for v in divisors(local_n) if v >= min(local_n, tile_min) and v < local_n]
         panels = values if tile_policy == 'all' else [v for v in values if v & (v-1) == 0]
-        selected = list(_candidates(work, cores, sram, tile_min, tile_policy, panels))
+        selected = list(_candidates(work, cores, sram, tile_min, tile_policy, sorted(panels, reverse=True)))
     if execution != logical:
         selected = [replace(p, logical_shape=logical, execution_shape=execution) for p in selected]
     return iter(selected)
@@ -86,17 +88,29 @@ def _candidates(problem, cores, sram, tile_min, tile_policy, panels):
         return values if tile_policy == 'all' else [v for v in values if v & (v-1) == 0 or v == n]
     if s*s != cores or m % s or n % s or k % s:
         return
+    def fits(plan):
+        try:
+            g = Geometry(problem, plan)
+        except ValueError:
+            return False
+        return g.sram <= sram and not (plan.b_resident and g.panels == 1)
     for dataflow, mts, kts in (('os', tiles(m//s), [s*x for x in tiles(k//s)]),
                                ('ws', [s*x for x in tiles(m//s)], tiles(k//s))):
-        for resident in (False, True) if dataflow == 'ws' else (False,):  # families arrive contiguously
-            for mt, kt, nt in product(mts, kts, panels):
-                plan = FlashPlan(dataflow, mt, kt, resident, cores, n_tile=nt)
-                try:
-                    g = Geometry(problem, plan)
-                except ValueError:
-                    continue
-                if g.sram <= sram and not (resident and g.panels == 1):
-                    yield plan
+        # First-level tiling is along K only: keep the largest M tile (and N
+        # panel) for which some K tile fits, i.e. the whole local M whenever
+        # possible; WS keeps B resident whenever that fits.
+        for nt in panels:
+            for mt in sorted(mts, reverse=True):
+                plans = [next((q for r in ((True, False) if dataflow == 'ws' else (False,))
+                               for q in [FlashPlan(dataflow, mt, kt, r, cores, n_tile=nt)] if fits(q)), None)
+                         for kt in kts]
+                plans = [q for q in plans if q]
+                if plans:
+                    yield from plans
+                    break
+            else:
+                continue
+            break
 
 
 def score(problem, plan, mac, dram_bw, flit):

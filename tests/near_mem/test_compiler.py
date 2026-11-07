@@ -86,6 +86,19 @@ def test_flashgemm_program(dataflow,mt,kt,resident,nt):
     assert manifest['logical_dram_write_bytes']==32*32*2
 
 
+def test_flashgemm_tiles_only_k_when_the_whole_local_m_fits():
+    from frontend.near_mem.gemm.flash import Geometry, candidates
+    # OS fits the whole local M: only K tiles vary.
+    problem=Problem(512,4096,14336);plans=list(candidates(problem,16,1<<20,16,'all'))
+    assert {p.dataflow for p in plans}=={'os','ws'}
+    os_plans=[p for p in plans if p.dataflow=='os']
+    assert all(Geometry(problem,p).panels==1 and p.n_tile is None for p in os_plans)
+    assert len({p.k_tile for p in os_plans})>1
+    # WS cannot hold the whole local M with any K tile: M is split minimally,
+    # one M tile shared by every proposed K tile.
+    assert len({p.m_tile for p in plans if p.dataflow=='ws'})==1
+
+
 def test_flashgemm_panels_only_when_the_paper_plan_does_not_fit():
     from frontend.near_mem.gemm.flash import candidates
     assert {p.n_tile for p in candidates(Problem(64,64,64),16,1024**2,4)}=={None}

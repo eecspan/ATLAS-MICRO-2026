@@ -1,5 +1,6 @@
 """Output ownership is searched jointly with consumers, using real traffic."""
 from dataclasses import asdict, replace
+import json
 from math import prod
 
 import numpy as np
@@ -91,3 +92,23 @@ def test_transformer_search_includes_output_contracts(tmp_path):
     assert {c['plan']['output'] for c in options['output']}>= {'sharded','replicated'}
     assert {c.output for c in options['attention']}>= {'sharded','first','replicated'}
     assert any('output' in c['plan'] for c in options['output'])
+
+
+def test_baseline_boundary_keeps_its_contract_and_one_graph(tmp_path):
+    from frontend.near_mem.experiments.transformer import Chain, Experiment
+    from frontend.near_mem.methods import METHODS, target
+    from frontend.near_mem.gemm.space import Proxy
+    from frontend.near_mem.model.transformer import Workload
+    assert {m for m, x in METHODS.items() if x.boundary} == {'ours', 'local', 'dram'}
+    chip=make_hardware(tmp_path/'hw',4,64); w=Workload(1,8,8,4,1,8,32)
+    exp=Experiment(w,chip,tmp_path/'search'); chain=Chain(exp,target(chip),Proxy(chip),2,boundary=False)
+    gemm=lambda ps,tile,gated=False: dict(plan=asdict(Plan(ps,tile)),native=False,direction=0,gated=gated)
+    options=dict(qkv=[gemm((1,2,2),(8,24,8)),gemm((1,4,1),(8,12,32))],attention=[AttentionPlan(1,4,2,2)],
+                 output=[gemm((1,2,2),(4,8,8))],expand=[gemm((1,2,2),(8,32,8),True)],
+                 contract=[gemm((1,2,2),(8,16,16))])
+    options,proposals,configs=chain.propose(options,64,8)
+    assert {c['plan']['output'] for c in options['output']}=={'sharded'}
+    assert {c.output for c in options['attention']}=={'sharded'}
+    assert len(proposals)==len(configs)==1
+    fastest=min(options['qkv'],key=lambda c:chain.cycles['qkv',json.dumps(c,sort_keys=True)])
+    assert configs[0]['kernels']['qkv']==fastest

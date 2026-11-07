@@ -1,13 +1,19 @@
 """One steady-state Transformer layer: one method's graph, measured by ATLAS.
 
-Every method chooses its graph the same way. Each operator has a few options:
+Each operator has a few options:
 for a GEMM the method's proxy proposals (``tp``: the fixed TP grid along the
 GEMM's mesh direction, tiles only), for attention the shared context splits
 plus the method's additions. ``atlas`` uses the upstream natively tuned TP
 GEMMs and collectives instead (a check of ``tp``). Every option is simulated
 alone with its inputs in place, and every layout conversion between adjacent
-choices is scored from its busiest port or mesh link. Beam search over this
-chain proposes the ``keep`` best complete graphs, which are simulated whole.
+choices is scored from its busiest port or mesh link. Methods whose plans
+move DRAM residency (``Method.boundary``: ours, local, dram) also expand the
+output contract of every reduction and search the graph jointly: beam search
+over this chain proposes the ``keep`` best complete graphs, which are
+simulated whole. Baselines keep the boundary their dataflow prescribes, so
+each operator takes its fastest standalone option and the graph is simulated
+once (relayouts at mismatched boundaries are still charged); ``--no-joint``
+gives ours the same treatment as an ablation.
 The chain score misses overlap between operators, so a coordinate descent
 then simulates, in parallel, every graph that changes one decision to one of
 its few best standalone options, keeps the best, and repeats up to
@@ -131,8 +137,9 @@ class Chain:
     Each option is simulated once with its inputs already in its own layout;
     each layout edge is scored from its exact per-core traffic.
     """
-    def __init__(self, exp, hw, proxy, workers, attention_budget=32, deadline=None):
+    def __init__(self, exp, hw, proxy, workers, attention_budget=32, deadline=None, boundary=True):
         self.exp = exp; self.hw = hw; self.proxy = proxy; self.workers = workers; self.deadline = deadline
+        self.boundary = boundary
         self.cycles = {}; self.ports = {}; self.edge_scores = {}
         self.attention_proxy = AttentionProxy(exp.chip); self.attention_budget = attention_budget
         self.attention_report = {}
@@ -170,6 +177,8 @@ class Chain:
     def prepare(self, options):
         """Measure every distinct option once; drop illegal and behaviourally equal options."""
         def boundaries(name, choice):
+            if not self.boundary:
+                return [choice]  # the dataflow's own boundary
             if name == 'attention':
                 return output_variants(choice)
             if choice['native']:
@@ -250,9 +259,14 @@ class Chain:
         return alternatives
 
     def propose(self, options, width, keep):
-        """Measure the options alone; the ``keep`` best complete graphs of the chain as configurations."""
+        """Measure the options alone; the ``keep`` best complete graphs of the chain as configurations.
+        Without joint boundary search, the one graph of every operator's fastest option."""
         options = self.prepare(options)
-        proposals = self.search(options, width, keep)
+        if self.boundary:
+            proposals = self.search(options, width, keep)
+        else:
+            best = {n: min(c, key=lambda x: self.cycles[n, token(x)]) for n, c in options.items()}
+            proposals = [(sum(self.cycles[n, token(c)] for n, c in best.items()), best)]
         configs = [dict(kernels={k: c[k] for k in self.exp.workload.problems}, attention=asdict(c['attention']))
                    for _, c in proposals]
         return options, proposals, configs
@@ -262,8 +276,10 @@ ORDER = ('qkv', 'attention', 'output', 'expand', 'contract')
 
 
 def run(workload, chip, out, method='ours', budget=4, workers=WORKERS, tile_min=8, passes=2, width=64, keep=8, tiles=2,
-        refine=3, deadline=None, attention_budget=32):
+        refine=3, deadline=None, attention_budget=32, joint=True):
     exp = Experiment(workload, chip, out); started = time.monotonic(); stop = deadline and started+deadline
+    joint = joint and METHODS[method].boundary
+    label = method if joint == METHODS[method].boundary else method+'_nojoint'
     # Weights are preplaced once, like the native TP shards; replicating them
     # would trade unbilled DRAM capacity for speed.
     hw = dict(target(chip, tile_min), single_b=True); layout = KVLayout(workload.attention, hw['cores'])
@@ -289,14 +305,16 @@ def run(workload, chip, out, method='ours', budget=4, workers=WORKERS, tile_min=
             ranked = sorted((p for p, _ in chosen), key=lambda p: proxy.kernel(problem, p))
             options[name] = [dict(plan=asdict(p), native=False, **roles(workload, name)) for p in ranked]
             report[name] = dict(scanned=scanned, chosen=[asdict(p) for p in ranked])
-    chain = Chain(exp, hw, proxy, workers, attention_budget, stop and started+deadline/2)
+    chain = Chain(exp, hw, proxy, workers, attention_budget, stop and started+deadline/2, joint)
     options, proposals, configs = chain.propose({k: options[k] for k in ORDER}, width, keep)
-    best = min(exp.measure_many(configs, method+'_joint', workers, stop, abort=False), key=cycles)
-    best = descend(exp, best, chain.neighbours(options, refine), method, passes, workers, stop)
+    best = min(exp.measure_many(configs, label+('_joint' if joint else '_graph'), workers, stop, abort=False), key=cycles)
+    if joint:
+        best = descend(exp, best, chain.neighbours(options, refine), label, passes, workers, stop)
     dump(exp.out/'search.json', dict(gemm=report, attention=chain.attention_report, measured=chain.measured, joint=[dict(score=score, configuration=cfg)
                                                           for (score, _), cfg in zip(proposals, configs)],
-                                      budget=budget, tiles=tiles, passes=passes, width=width, keep=keep, refine=refine))
-    summary = dict(experiment='transformer', workload=asdict(workload), chip=str(Path(chip).resolve()), method=method,
+                                      budget=budget, tiles=tiles, passes=passes, width=width, keep=keep, refine=refine,
+                                      joint_boundary=joint))
+    summary = dict(experiment='transformer', workload=asdict(workload), chip=str(Path(chip).resolve()), method=label,
                    best=best, cycles=cycles(best), seconds=time.monotonic()-started, deadline=deadline,
                    hit_deadline=bool(stop and time.monotonic() > stop), sha256=exp.provenance)
     dump(exp.out/'summary.json', summary)
@@ -314,6 +332,7 @@ def main():
                         ('width', 64), ('keep', 8), ('tiles', 2), ('refine', 3), ('attention-budget', 32)]:
         parser.add_argument('--'+name, type=int, default=value)
     parser.add_argument('--deadline', type=float, help='common wall-clock cap in seconds (no graph starts later)')
+    parser.add_argument('--no-joint', action='store_true', help='ablation: no joint boundary search')
     a = parser.parse_args()
     if min(a.batch, a.context, a.query_heads, a.kv_heads, a.head_dim, a.ffn, a.budget, a.workers,
            a.tile_min, a.width, a.keep, a.tiles) < 1 or min(a.passes, a.refine) < 0:
@@ -321,7 +340,7 @@ def main():
     workload = Workload(a.batch, a.context if a.mode == 'prefill' else 1, a.context, a.query_heads, a.kv_heads,
                         a.head_dim, a.ffn)
     run(workload, a.chip, a.output, a.method, a.budget, a.workers, a.tile_min, a.passes, a.width, a.keep, a.tiles, a.refine,
-        a.deadline,a.attention_budget)
+        a.deadline,a.attention_budget,not a.no_joint)
 
 
 if __name__ == '__main__':

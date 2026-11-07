@@ -14,6 +14,9 @@ GEMM generator and tile explorer (``gemm.native``); it only checks that
 method's whole space. ``ours`` is the full Ps/Pt space, Pt = 1 included, with
 both mesh orientations of every partition, so the TP grid is one of its
 points; ``local`` is the same space restricted to Pt = 1 (an ablation).
+Only our spaces (``boundary``) move DRAM residency per plan, so only they
+choose reduction outputs jointly with their neighbours in a graph; every
+baseline keeps the boundary its dataflow prescribes.
 Baselines keep only their own dataflow: T10 rotates on chip over one
 plan-independent DRAM layout with its fixed ``mnk`` loop; FlashGEMM
 all-gathers single-copy blocks.
@@ -34,6 +37,8 @@ class Method:
     name: str
     description: str
     rotation: bool = False
+    # Joint boundary search in a graph: output contracts and neighbour-aware selection.
+    boundary: bool = False
     receive: str = 'sram_consume'
     layout: str = 'local'
     flash: bool = False
@@ -135,11 +140,12 @@ METHODS = {m.name: m for m in (
     Method('tp', 'tensor parallel: replicated inputs, M/N (single GEMM) or fixed K/N TP grid, mnk, native tiles',
            tp=True),
     Method('atlas', 'unmodified upstream ATLAS GEMM generator and tile explorer (a check of tp)', native=True),
-    Method('local', 'ablation: our space at Pt = 1 (Ps incl. split-K and mesh orientation, tiles, six loop orders)'),
+    Method('local', 'ablation: our space at Pt = 1 (Ps incl. split-K and mesh orientation, tiles, six loop orders)',
+           boundary=True),
     Method('ours', 'our full space: Ps and temporal rotation Pt of A/B/C (Pt = 1 included) and of fused-attention '
-           'Q/KV tiles', True, attention_mode='ours'),
+           'Q/KV tiles', True, True, attention_mode='ours'),
     Method('dram', 'DRAM-level rotation: rotated A/B/C blocks are forwarded DRAM to DRAM and re-read',
-           True, receive='dram_land', attention_mode='dram'),
+           True, True, receive='dram_land', attention_mode='dram'),
     Method('t10', 'improved T10: on-chip Ps/Pt rotation over one plan-independent global DRAM layout, mnk loop',
            True, layout='global', loops=('mnk',), attention_mode='t10'),
     Method('flash', 'FlashGEMM: single-copy blocks, per-K-tile row/column all-gathers overlapped with compute',
