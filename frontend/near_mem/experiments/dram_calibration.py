@@ -1,4 +1,4 @@
-"""Calibrate the proxy's DRAM channel model (``Proxy.ROW``/``OVERLAP``) against ATLAS.
+"""Calibrate the proxy's DRAM channel model (``Proxy.CALIBRATION``) against ATLAS.
 
 Simulates single DRAM batches on core 0 of each given chip -- strided runs of
 several lengths and pitches, and mixed multi-tensor read/write batches --
@@ -30,7 +30,7 @@ def cases(seed=0):
                 rng.choice((16, 64, 256)), rng.random() < 0.3) for _ in range(rng.randint(2, 4))]
 
 
-def features(proxy, batch, bases):
+def features(proxy, batch, bases, row=37.0):
     """Bursts and opened rows of the busiest channel (the proxy's own address map)."""
     bits = proxy.channels.bit_length()-1; low = proxy.interleave; bursts = {}; rows = {}
     for (run, pitch, lines, _), base in zip(batch, bases):
@@ -40,7 +40,7 @@ def features(proxy, batch, bases):
                 c = (t >> low) % proxy.channels
                 bursts.setdefault(c, set()).add(t)
                 rows.setdefault(c, set()).add((((t >> (low+bits)) << low) | (t & ((1 << low)-1)))//proxy.columns)
-    c = max(bursts, key=lambda c: len(bursts[c])*proxy.burst/proxy.channel_bw+Proxy.ROW*len(rows[c]))
+    c = max(bursts, key=lambda c: len(bursts[c])*proxy.burst/proxy.channel_bw+row*len(rows[c]))
     return len(bursts[c])*proxy.burst/proxy.channel_bw, len(rows[c])
 
 

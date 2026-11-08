@@ -161,6 +161,19 @@ def transfers(problem,p):
     return out
 
 
+@lru_cache(None)
+def hbdram_columns(preset):
+    """Bursts per DRAM row of an HBDRAM organization preset, read from the
+    simulator's own preset table (names do not always encode it)."""
+    from ..sim import ROOT
+    source=(ROOT/'simulator/src/dram/ramulator2/src/dram/impl/HB-DRAM.cpp').read_text()
+    found=re.search(r'\{"'+re.escape(preset)+r'",\s*\{[^{]*\{([^}]*)\}',source)
+    if not found:raise ValueError(f'Unknown HBDRAM preset {preset}')
+    levels=[eval(x) for x in found[1].split(',')]  # channel, bankgroup, bank, row, column
+    if levels[1]*levels[2]!=1:raise ValueError('The DRAM channel model assumes one bank per channel')
+    return levels[4]
+
+
 class Proxy:
     """Roofline/traffic proposal score only; never presented as measured cycles."""
     def __init__(self,chip):
@@ -174,16 +187,33 @@ class Proxy:
         # Address geometry of the channel model (``access``): channels, the
         # channel interleave bit above the burst offset, and bursts per row.
         mapper=yaml.safe_load(paths[1].read_text())['MemorySystem']['AddrMapper']
+        if mapper.get('impl')!='OneLevelInterleave':raise ValueError('The DRAM channel model assumes OneLevelInterleave')
         self.channels=dram['org']['channel'];self.interleave=mapper.get('channel_lowest_bit',0)
-        columns=re.search(r'_(\d+)col',dram['org']['preset'])
-        self.columns=int(columns[1]) if columns else 128
+        self.columns=dram['org'].get('column') or hbdram_columns(dram['org']['preset'])
         self.channel_bw=self.dram_bw/self.channels
+        self.timing=dram['timing']['preset']
 
-    # Calibrated per DRAM timing preset with ``experiments.dram_calibration``
-    # on single-bank HBDRAM channels (2-32 channels, 0.125-2 TB/s per core):
-    # each row opened in the busiest channel costs ``ROW`` cycles beyond its
-    # bursts, and a batch hides ``OVERLAP`` cycles of the first access.
-    ROW,OVERLAP=37.1,17.2
+    @property
+    def row_cost(self):
+        return self.calibration[0]
+
+    @property
+    def overlap(self):
+        return self.calibration[1]
+
+    @property
+    def calibration(self):
+        if self.timing not in self.CALIBRATION:
+            raise ValueError(f'Calibrate the DRAM channel model for {self.timing} (experiments.dram_calibration)')
+        return self.CALIBRATION[self.timing]
+
+    # ``(ROW, OVERLAP)`` per DRAM timing preset, fitted by
+    # ``experiments.dram_calibration`` on single-bank HBDRAM channels (2-32
+    # channels, 0.125-2 TB/s per core): each row opened in the busiest channel
+    # costs ROW cycles (at 1 GHz) beyond its bursts, and a batch hides OVERLAP
+    # cycles of the first access. Channel count, bandwidth, interleave and row
+    # width come from the configuration and need no recalibration.
+    CALIBRATION={'HBDRAM_500Mbps':(37.1,17.2)}
 
     @lru_cache(None)
     def access(self,run,lines,pitch):
@@ -191,7 +221,7 @@ class Proxy:
         contiguous bytes, ``pitch`` bytes apart, from an interleave-aligned base.
 
         Requests are bursts; the busiest channel serves its bursts at the
-        channel's share of the bandwidth and pays ``ROW`` per opened row
+        channel's share of the bandwidth and pays ``row_cost`` per opened row
         (OneLevelInterleave mapping, open-row policy). Never below the bytes
         at peak bandwidth, so ``lower`` remains a bound.
         """
@@ -201,8 +231,8 @@ class Proxy:
             for t in range(start//self.burst,(start+run+self.burst-1)//self.burst):
                 channel=(t>>low)%self.channels;row=(((t>>(low+bits))<<low)|(t&((1<<low)-1)))//self.columns
                 bursts[channel]=bursts.get(channel,0)+1;rows.setdefault(channel,set()).add(row)
-        busiest=max(bursts[c]*self.burst/self.channel_bw+self.ROW*len(rows[c]) for c in bursts)
-        return max(run*lines/self.dram_bw,busiest-self.OVERLAP)
+        busiest=max(bursts[c]*self.burst/self.channel_bw+self.row_cost*len(rows[c]) for c in bursts)
+        return max(run*lines/self.dram_bw,busiest-self.overlap)
 
     def tile(self,rows,cols,shape,column,dtype=2):
         """Proxy cycles of one ``rows x cols`` window of a 2-D DRAM tensor ``shape``
