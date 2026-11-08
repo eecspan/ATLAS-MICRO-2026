@@ -27,16 +27,14 @@ def packets(layout, plan, head, request, segment, cache=None):
     """Per-lane lists of owner-local tiles, clipping both shard and segment edges."""
     p = layout.problem; count = plan.query_parts*plan.context_parts
     step = plan.kv_tile or ceil(p.context/count)
-    cache = layout.regions() if cache is None else cache
+    regions = layout.slices(head, request, cache)
     result = []
     for lane in range(plan.query_parts):
         part = segment*plan.query_parts+lane
         lo = request*p.context+p.context*part//count
         hi = request*p.context+p.context*(part+1)//count
         pieces = []
-        for r in cache:
-            if r.col != head*2*p.head_dim:
-                continue
+        for r in regions:
             a,b = max(lo,r.row),min(hi,r.row+r.rows)
             for row in range(a,b,step):
                 pieces.append(r.crop(row,r.col,min(step,b-row),r.cols))

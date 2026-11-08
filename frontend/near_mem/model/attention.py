@@ -65,6 +65,7 @@ class KVLayout:
         # Per-core KV rows: a core serves one head and ``base`` or ``base+1``
         # tokens of every request's context.
         self.capacity = problem.batch*(self.base + bool(self.extra))
+        self._slices = {}
 
     def head_group(self, head):
         """Contiguous core range ``[start, end)`` owning ``head``."""
@@ -119,6 +120,16 @@ class KVLayout:
                     regions.append(Region(core, name, request*p.context+start,
                                           head*2*p.head_dim, length, 2*p.head_dim, slot, 0))
         return regions
+
+    def slices(self, head, request, cache=None):
+        """The regions of ``cache`` (default ``regions()``) holding one (head, request) context."""
+        key = id(cache)
+        if key not in self._slices:
+            index = {}
+            for r in self.regions() if cache is None else cache:
+                index.setdefault((r.col//(2*self.problem.head_dim), r.row//self.problem.context), []).append(r)
+            self._slices[key] = (cache, index)  # holds ``cache``, so its id stays unique
+        return self._slices[key][1].get((head, request), [])
 
     def allocate(self, graph, name='kv'):
         """Create the physical KV tensor on every core and return its regions."""

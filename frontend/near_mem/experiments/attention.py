@@ -40,7 +40,7 @@ def run(problem, chip, out, method='ours', workers=WORKERS, budget=32):
     if not space:
         raise ValueError(f'No SRAM-feasible fused attention plan for {method}')
     proxy = AttentionProxy(chip)
-    candidates = proxy.select(problem,space,budget)
+    candidates = proxy.select(problem,space,budget,workers=workers)
     rows = measure_all(candidates, lambda p: measure(problem, chip, out/'runs', p), workers)
     dump(out/'results.json', rows)
     selected = min(rows, key=cycles)

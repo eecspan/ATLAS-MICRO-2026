@@ -9,13 +9,18 @@ DRAM reads/writes do not infer extra staging-port accesses. This shared DMA
 staging abstraction does not remove the compiler's buffer capacity checks.
 """
 from collections import Counter
-from functools import lru_cache
+from concurrent.futures import ProcessPoolExecutor
+from functools import lru_cache, partial
 from math import ceil, isqrt, prod
 
 from ..gemm.space import Proxy
 from ..search import shortlist
 from ..tasks import route
 from .attention import build_attention
+
+
+def _score(chip, problem, placed, plan):
+    return AttentionProxy(chip).score(problem, plan, placed)
 
 
 class AttentionProxy:
@@ -32,15 +37,22 @@ class AttentionProxy:
     def __call__(self, problem, layout, plan):
         return self.score(problem, plan)
 
-    def select(self, problem, candidates, budget=32, placed=False):
+    def select(self, problem, candidates, budget=32, placed=False, workers=1):
         """Top budget plus one per spatial/output family, so edges retain choices.
 
         Zero budget is the exhaustive validation path. All methods use the
         same score and budget; final choices always come from the simulator.
+        Scores are independent, so ``workers`` processes compute them; the
+        selection is identical to the serial one.
         """
         candidates = list(dict.fromkeys(candidates))
         if budget <= 0:return candidates
-        ranked,_ = shortlist(lambda _: iter(candidates),lambda p:self.score(problem,p,placed),budget,
+        if workers > 1 and len(candidates) > 1:
+            with ProcessPoolExecutor(min(workers, len(candidates))) as pool:
+                scores = dict(zip(candidates, pool.map(partial(_score, self.chip, problem, placed), candidates)))
+        else:
+            scores = {p: self.score(problem, p, placed) for p in candidates}
+        ranked,_ = shortlist(lambda _: iter(candidates),scores.__getitem__,budget,
                              family=lambda p:(p.dataflow,p.query_parts,p.context_parts,p.output))
         return [p for p,_ in ranked]
 

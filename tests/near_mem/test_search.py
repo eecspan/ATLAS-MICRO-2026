@@ -115,3 +115,36 @@ def test_measure_all_deadline_drops_aborted_candidates():
     assert rows[0]==0 and len(rows)<50
     with pytest.raises(TimeoutExpired):
         measure_all(range(3),lambda x:(_ for _ in ()).throw(TimeoutExpired('x',0)),2,deadline=stop)
+
+
+def test_proxy_transfer_counts_match_the_compiled_program():
+    from collections import Counter
+    from frontend.near_mem.gemm.space import transfers
+    problem=Problem(16,16,16)
+    for receive in ('sram_consume','dram_land'):
+        for p in candidates(problem,4,1<<30,4,'all','elk',1<<30,True,receive=receive):
+            if p.ps[2]//(p.c[0]*p.c[1])>1:continue  # split-K finalization is charged apart
+            counted=Counter((a['tensor'],a['op']) for row in compile_plan(problem,p,1<<30,1<<30).phases
+                            for a in row[0] if a['op'] in ('load','store'))
+            expected=transfers(problem,p)
+            assert (counted['A','load'],counted['B','load'])==(expected['A'][0],expected['B'][0]),p
+
+
+def test_proxy_split_k_finalization_counts_the_busiest_rank():
+    from collections import Counter
+    from math import ceil, prod
+    from frontend.near_mem.gemm.space import transfers
+    from frontend.near_mem.output import variants
+    problem=Problem(8,8,16)
+    for base in candidates(problem,4,1<<30,4,'all','elk',1<<30,True):
+        residual=base.ps[2]//prod(base.c)
+        if residual<=1:continue
+        for p in variants(base):
+            per=[Counter() for _ in range(p.cores)]
+            for row in compile_plan(problem,p,1<<30,1<<30).phases:
+                for core,ops in enumerate(row):
+                    per[core].update(a['op'] for a in ops if a.get('tensor')=='C' and a['op'] in ('load','store'))
+            loads,stores=transfers(problem,p)['C']
+            tiles=(problem.m//p.ps[0]//p.tile[0])*(problem.n//p.ps[1]//p.tile[1])//prod(p.c)
+            final=tiles if p.output!='sharded' else ceil(tiles/residual)
+            assert (max(c['load'] for c in per),max(c['store'] for c in per))==(loads+tiles,stores+final),p

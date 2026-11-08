@@ -10,9 +10,9 @@
 | `output.py` | GEMM 与 attention 共用的归约输出方式：分片、汇聚到组端点、组内复制；只有我们的空间在整图中结合下游布局选择 |
 | `search.py` | 通用搜索：`shortlist`、`diverse`（均支持下界剪枝）、`beam`、`anneal`、`measure_all` |
 | `methods.py` | 方法注册表：`tp`（TP 基线）、`atlas`（上游检查）、`local`、`ours`、`dram`、`t10`、`flash`；新增 baseline 在此加一项 |
-| `experiments/` | 实验入口：`gemm`、`attention`、`transformer`（每次一个方法）；`inference` 按固定 batch/输入/输出折算整段推理；`attention_space` 对照新旧融合调度空间；`compare` 计算加速比，`motivation` 汇总已有结果 |
+| `experiments/` | 实验入口：`gemm`、`attention`、`transformer`（每次一个方法）；`inference` 按固定 batch/输入/输出折算整段推理；`attention_space` 对照新旧融合调度空间；`compare` 计算加速比，`motivation` 汇总已有结果；`dram_calibration` 为 proxy 的 DRAM 通道模型标定系数 |
 
-Attention 和 GEMM 共用两阶段评估：proxy 排序，ATLAS 模拟器复核。Attention proxy 复用实际 lowering 任务，按硬件吞吐与依赖估算；单算子 `--budget`、整图 `--attention-budget` 默认 32，额外保留不同空间/输出族的代表，0 表示穷举。
+Attention 和 GEMM 共用两阶段评估：proxy 排序，ATLAS 模拟器复核。GEMM proxy 的 DRAM 项按编译器实际的 tile 读写次数，经通道模型计费（最忙通道的 burst 数与打开的行数，系数按 DRAM 时序预设用 `experiments.dram_calibration` 标定一次，换通道数不必重标）。proxy 不区分 mesh 方向，所以只扫描一个方向，候选再补上转置的孪生方案，交给边界打分和整图模拟区分。Attention proxy 复用实际 lowering 任务，按硬件吞吐与依赖估算；单算子 `--budget`、整图 `--attention-budget` 默认 32，额外保留不同空间/输出族的代表，0 表示穷举。
 
 各方法已有独立的 fused-attention 数据流：TP 按 context 并行；ours 允许 Q/在线状态、KV 及联合 SRAM 轮转；DRAM 按完整逻辑块落盘轮转；T10 在固定 DRAM 放置上做 SRAM 轮转，并计入实际 NUMA 访问；FlashGEMM 用固定 query/context 网格、线性收集后计算，比较 Q/状态常驻与 KV panel 常驻两种循环。后两者是数据流的融合迁移扩展。所有方法共用 proxy 和模拟器；均不将 score 矩阵写入 DRAM。具体规则维护在[统一约定](../../../Distributed_DRAM_SRAM/near_mem_gemm/docs/约定.md)。
 

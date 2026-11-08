@@ -27,8 +27,10 @@ an M split must rotate B. Each run writes only its own cycles;
 ``experiments.compare`` turns separate runs into speedups.
 """
 import argparse
+from concurrent.futures import ProcessPoolExecutor
 from copy import deepcopy
 from dataclasses import asdict, replace
+from functools import partial
 import hashlib
 import json
 from math import isqrt
@@ -53,6 +55,32 @@ from . import attention as standalone_attention
 cycles = lambda row: row['result']['e2e_cycles']
 
 
+def simulate_graph(workload, chip, config, folder, deadline=None):
+    """Build and simulate one whole graph; a process-pool job (lowering is Python-bound)."""
+    run = build(workload, chip, config).simulate(folder, deadline=deadline)
+    return run['result'], run['graph']
+
+
+def simulate_operator(workload, chip, hw, out, name, choice, deadline=None):
+    """Standalone cycles of one operator option with its inputs already in place."""
+    if name == 'attention':
+        return standalone_attention.measure(workload.attention, chip, out/'attention', choice, placed=True,
+                                            deadline=deadline)['result']['e2e_cycles']
+    key = hashlib.sha256(json.dumps([name, choice], sort_keys=True).encode()).hexdigest()[:20]
+    graph = Graph(chip); kernel = bind_kernel(workload, hw, name, choice).prepare(graph, name)
+    regions, tensors = kernel.input_layout(graph.cores)
+    for core, t in enumerate(tensors):
+        graph.tensor(core, 'x', t['shape'], t['strides'])
+    kernel.compile(graph, [replace(r, name='x') for r in regions],
+                   rope_width=workload.attention.hidden if workload.rope and name == 'qkv' else 0)
+    return graph.simulate(out/'operators'/key, deadline=deadline)['result']['e2e_cycles']
+
+
+def bind_kernel(workload, hw, name, entry):
+    k = Gemm(workload.problems[name], load(entry['plan']), entry['native'], entry['direction'], entry['gated'])
+    return k.bind(hw['cores'], hw['sram'], hw['dram'])
+
+
 class Experiment:
     """Measures each distinct whole-graph configuration once per run."""
     def __init__(self, workload, chip, out):
@@ -60,19 +88,16 @@ class Experiment:
         self.out.mkdir(parents=True, exist_ok=True)
         self.provenance = fingerprint(chip); self.rows = []; self.seen = {}
 
-    def measure(self, config, label, record=True, deadline=None):
-        key = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()[:20]
-        if key not in self.seen:
-            folder = self.out/'runs'/key
-            run = build(self.workload, self.chip, config).simulate(folder, deadline=deadline)
-            self.seen[key] = (run['result'], run['graph'], folder)
-        result, manifest, folder = self.seen[key]
+    @staticmethod
+    def key(config):
+        return hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()[:20]
+
+    def row(self, config, label):
+        key = self.key(config); result, manifest, folder = self.seen[key]
         row = dict(label=label, key=key, configuration=config, result=result,
                    peak_dram_bytes=max(manifest['peak_dram_bytes']), path=str(folder),
                    layout_noc_bytes=sum(e['noc_data_bytes'] for e in manifest['edges']),
                    layout_write_bytes=sum(e['dram_write_bytes'] for e in manifest['edges']))
-        if record:
-            self.record(row)
         return row
 
     def record(self, row):
@@ -81,13 +106,40 @@ class Experiment:
 
     def measure_many(self, configs, label, workers, deadline=None, abort=True):
         """Measure independent graphs in parallel, in order, until ``deadline``;
-        with ``abort`` graphs still running at the deadline are dropped."""
-        unique = {json.dumps(cfg, sort_keys=True): cfg for cfg in configs}
-        rows = measure_all(unique, lambda key: self.measure(unique[key], label, False, deadline if abort else None),
-                           workers, deadline=deadline)
+        with ``abort`` graphs still running at the deadline are dropped.
+        Each distinct graph is simulated once per run; repeats reuse its row."""
+        unique = {self.key(cfg): cfg for cfg in configs}
+        todo = [k for k in unique if k not in self.seen]
+        if todo:
+            job = partial(_graph_job, self.workload, self.chip, self.out/'runs', unique, deadline if abort else None)
+            try:
+                done = measure_all(todo, job, workers, processes=True, deadline=deadline)
+            except TimeoutExpired:
+                done = []
+            for key, result, manifest in done:
+                self.seen[key] = (result, manifest, self.out/'runs'/key)
+        rows = [self.row(cfg, label) for key, cfg in unique.items() if key in self.seen]
+        if not rows:
+            raise TimeoutExpired('graph', 0)
         for row in rows:
             self.record(row)
         return rows
+
+
+def _boundary(workload, hw, name, entry):
+    try:
+        k = bind_kernel(workload, hw, name, entry)
+    except ValueError:
+        return None
+    return k.input_layout(hw['cores'])[0], k.output_layout(hw['cores'])
+
+
+def _operator_job(workload, chip, hw, out, jobs, deadline, i):
+    return i, simulate_operator(workload, chip, hw, out, *jobs[i], deadline=deadline)
+
+
+def _graph_job(workload, chip, runs, unique, deadline, key):
+    return (key, *simulate_graph(workload, chip, unique[key], runs/key, deadline))
 
 
 def variants(config, edit, choices):
@@ -141,34 +193,35 @@ class Chain:
         self.exp = exp; self.hw = hw; self.proxy = proxy; self.workers = workers; self.deadline = deadline
         self.boundary = boundary
         self.cycles = {}; self.ports = {}; self.edge_scores = {}
+        self.kernels = {}
         self.attention_proxy = AttentionProxy(exp.chip); self.attention_budget = attention_budget
         self.attention_report = {}
 
     def kernel(self, name, entry):
-        k = Gemm(self.exp.workload.problems[name], load(entry['plan']), entry['native'], entry['direction'],
-                 entry['gated'])
-        return k.bind(self.hw['cores'], self.hw['sram'], self.hw['dram'])
+        return bind_kernel(self.exp.workload, self.hw, name, entry)
 
-    def simulate(self, name, choice, deadline=None):
-        w = self.exp.workload
-        if name == 'attention':
-            return standalone_attention.measure(w.attention, self.exp.chip, self.exp.out/'attention',
-                                                choice, placed=True, deadline=deadline)['result']['e2e_cycles']
-        key = hashlib.sha256(json.dumps([name, choice], sort_keys=True).encode()).hexdigest()[:20]
-        folder = self.exp.out/'operators'/key
-        graph = Graph(self.exp.chip); kernel = self.kernel(name, choice).prepare(graph, name)
-        regions, tensors = kernel.input_layout(graph.cores)
-        for core, t in enumerate(tensors):
-            graph.tensor(core, 'x', t['shape'], t['strides'])
-        kernel.compile(graph, [replace(r, name='x') for r in regions],
-                       rope_width=w.attention.hidden if w.rope and name == 'qkv' else 0)
-        return graph.simulate(folder, deadline=deadline)['result']['e2e_cycles']
+    def bound(self, name, entry):
+        """A GEMM option's ``(A, C)`` boundary layouts, compiled once per run; None if illegal."""
+        key = (name, token(entry))
+        if key not in self.kernels:
+            self.kernels[key] = _boundary(self.exp.workload, self.hw, name, entry)
+        return self.kernels[key]
+
+    def compile(self, options):
+        """Compile every GEMM option once, in parallel (compiling dominates large meshes)."""
+        jobs = list({(n, token(c)): (n, c) for n, choices in options.items() if n != 'attention' for c in choices
+                     if (n, token(c)) not in self.kernels}.values())
+        if jobs:
+            with ProcessPoolExecutor(max(1, min(self.workers, len(jobs)))) as pool:
+                found = pool.map(_boundary, *zip(*((self.exp.workload, self.hw, n, c) for n, c in jobs)))
+                for (n, c), value in zip(jobs, found):
+                    self.kernels[n, token(c)] = value
 
     def measure(self, jobs, deadline):
         """Standalone cycles of ``(name, choice)`` jobs, in order, until ``deadline``."""
-        run = lambda i: self.simulate(*jobs[i], deadline=deadline)
+        job = partial(_operator_job, self.exp.workload, self.exp.chip, self.hw, self.exp.out, jobs, deadline)
         try:
-            rows = measure_all(range(len(jobs)), lambda i: (i, run(i)), self.workers, deadline=deadline)
+            rows = measure_all(range(len(jobs)), job, self.workers, processes=True, deadline=deadline)
         except TimeoutExpired:
             rows = []
         for i, value in rows:
@@ -186,17 +239,15 @@ class Chain:
             return [dict(choice,plan=asdict(p)) for p in output_variants(load(choice['plan']))]
         options = {name:[c for choice in choices for c in boundaries(name,choice)]
                    for name,choices in options.items()}
-        def legal(name, c):
-            try:
-                return name == 'attention' or self.kernel(name, c) is not None
-            except ValueError:
-                return False
+        self.compile(options)
+        legal = lambda name, c: name == 'attention' or self.bound(name, c) is not None
         options = {name: list({token(c): c for c in choices if legal(name, c)}.values())
                    for name, choices in options.items()}
         if 'attention' in options:
             candidates = options['attention']
             options['attention'] = self.attention_proxy.select(self.exp.workload.attention,candidates,
-                                                               self.attention_budget,placed=True)
+                                                               self.attention_budget,placed=True,
+                                                               workers=self.workers)
             self.attention_report = dict(plans=len(candidates),measured=len(options['attention']),
                                          proxy_budget=self.attention_budget)
         # Options are in proxy order. Each operator's first option always
@@ -221,14 +272,19 @@ class Chain:
     def port(self, name, choice):
         op = name.split('.')[0]; key = (name, None if choice is None else token(choice))
         if key not in self.ports:
-            bound = choice if op == 'attention' or choice is None else self.kernel(op, choice)
-            self.ports[key] = port(self.exp.workload, self.hw['cores'], name, bound)
+            if op in ('attention', 'kv') or choice is None:
+                self.ports[key] = port(self.exp.workload, self.hw['cores'], name, choice)
+            else:
+                self.ports[key] = self.bound(op, choice)[name.endswith('.C')]
         return self.ports[key]
 
     def edge(self, src, dst, alias, a, b):
-        key = (src, dst, a and token(a), b and token(b))
+        """Score of one layout edge; it depends only on the two port layouts,
+        so options sharing a layout share one ``traffic`` evaluation."""
+        source, target = self.port(src, a), self.port(dst, b)
+        key = (dst, alias, tuple(source), tuple(target))
         if key not in self.edge_scores:
-            regions = edge_regions(self.exp.workload, self.hw['cores'], dst, self.port(src, a), self.port(dst, b))
+            regions = edge_regions(self.exp.workload, self.hw['cores'], dst, source, target)
             self.edge_scores[key] = self.proxy.edge(traffic(*regions, alias, isqrt(self.hw['cores'])))
         return self.edge_scores[key]
 
@@ -275,6 +331,28 @@ class Chain:
 ORDER = ('qkv', 'attention', 'output', 'expand', 'contract')
 
 
+def propose_gemm(workload, chip, method, hw, budget, tiles, name):
+    """Proxy proposals of one graph GEMM, in proxy order; ``(entries, scanned)``.
+
+    Graph inputs arrive through layout edges whose cost depends on the
+    neighbours. Rank by the kernel alone and, in the same scan, by kernel
+    plus single-copy distribution, so plans that need no input replication
+    (the ones that make edges cheap) are always proposed too. The proxy does
+    not see the mesh orientation, so one orientation is scanned and each
+    proposal is followed by its transposed twin; only edges and the
+    simulator tell them apart.
+    """
+    problem = workload.problems[name]; proxy = Proxy(chip); m = METHODS[method]
+    score = lambda p: (k := proxy.kernel(problem, p), k+proxy.distribution(problem, p))
+    bound = lambda q: (k := proxy.lower(problem, q), k+proxy.distribution(problem, q))
+    space = lambda skip=None: m.space(problem, skip=skip, direction=roles(workload, name)['direction'], orient=False, **hw)
+    chosen, scanned = diverse(space, score, budget, structure, tiles, bound)
+    ranked = sorted((p for p, _ in chosen), key=lambda p: proxy.kernel(problem, p))
+    if m.oriented(hw['cores']):
+        ranked = [q for p in ranked for q in (p, replace(p, transpose=True))]
+    return [dict(plan=asdict(p), native=False, **roles(workload, name)) for p in ranked], scanned
+
+
 def run(workload, chip, out, method='ours', budget=4, workers=WORKERS, tile_min=8, passes=2, width=64, keep=8, tiles=2,
         refine=3, deadline=None, attention_budget=32, joint=True):
     exp = Experiment(workload, chip, out); started = time.monotonic(); stop = deadline and started+deadline
@@ -292,19 +370,13 @@ def run(workload, chip, out, method='ours', budget=4, workers=WORKERS, tile_min=
         kernels = tune_native(workload, chip, exp.out/'native_tuning', workers)
         options.update({k: [v] for k, v in configuration(kernels, options['attention'][0])['kernels'].items()})
     else:
-        # Graph inputs arrive through layout edges whose cost depends on the
-        # neighbours. Rank by the kernel alone and, in the same scan, by kernel
-        # plus single-copy distribution, so plans that need no input
-        # replication (the ones that make edges cheap) are always proposed too.
-        for name, problem in workload.problems.items():
-            score = lambda p: (k := proxy.kernel(problem, p), k+proxy.distribution(problem, p))
-            bound = lambda q: (k := proxy.lower(problem, q), k+proxy.distribution(problem, q))
-            space = lambda skip=None: METHODS[method].space(problem, skip=skip, direction=roles(workload, name)['direction'], **hw)
-            chosen, scanned = diverse(space, score, budget, structure, tiles, bound)
-            # Simulate in proxy (kernel score) order, so a deadline cuts the tail.
-            ranked = sorted((p for p, _ in chosen), key=lambda p: proxy.kernel(problem, p))
-            options[name] = [dict(plan=asdict(p), native=False, **roles(workload, name)) for p in ranked]
-            report[name] = dict(scanned=scanned, chosen=[asdict(p) for p in ranked])
+        # The GEMM scans are independent: one process each.
+        names = list(workload.problems)
+        with ProcessPoolExecutor(max(1, min(workers, len(names)))) as pool:
+            found = pool.map(partial(propose_gemm, workload, chip, method, hw, budget, tiles), names)
+            for name, (entries, scanned) in zip(names, found):
+                options[name] = entries  # in proxy order, so a deadline cuts the tail
+                report[name] = dict(scanned=scanned, chosen=[e['plan'] for e in entries])
     chain = Chain(exp, hw, proxy, workers, attention_budget, stop and started+deadline/2, joint)
     options, proposals, configs = chain.propose({k: options[k] for k in ORDER}, width, keep)
     best = min(exp.measure_many(configs, label+('_joint' if joint else '_graph'), workers, stop, abort=False), key=cycles)

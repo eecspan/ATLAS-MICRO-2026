@@ -113,20 +113,22 @@ def _candidates(problem, cores, sram, tile_min, tile_policy, panels):
             break
 
 
-def score(problem, plan, mac, dram_bw, flit):
-    """Proxy: per round the slowest of compute share, DRAM slab reads and one gather hop."""
+def score(problem, plan, proxy):
+    """Proxy: per round the slowest of compute share, DRAM slab reads and one
+    gather hop. Slab reads and output stores use the proxy's DRAM channel
+    model on the single-copy A (row-major), B (column-major) and C blocks."""
     problem = execution_problem(problem, plan)
-    g = Geometry(problem, plan); t = g.dtype; s = g.side; R = g.round
+    g = Geometry(problem, plan); t = g.dtype; s = g.side; R = g.round; flit = proxy.arch['noc']['flit_size']
     mt, kt, nt = plan.m_tile, plan.k_tile, g.nt
-    compute = ceil(mt*nt*kt/mac)
-    if plan.dataflow == 'os':
-        reads, hop = (g.ms*g.ks+g.ks*nt)*t, max(g.ms*g.ks, g.ks*nt)*t
-    else:
-        reads, hop = g.ms*g.ks*t+(0 if plan.b_resident else kt*nt*t), g.ms*g.ks*t
-    step = R*max(compute/R, reads/R/dram_bw, hop/flit)+R
+    blocks = dict(A=(g.lm, g.lk), B=(g.lk, g.ln), C=(g.lm, g.ln))
+    compute = ceil(mt*nt*kt/proxy.mac)
+    read_b = 0 if plan.b_resident else proxy.tile(g.ks, nt, blocks['B'], True, t)
+    reads = proxy.tile(g.ms, g.ks, blocks['A'], False, t)+read_b
+    hop = (max(g.ms*g.ks, g.ks*nt) if plan.dataflow == 'os' else g.ms*g.ks)*t
+    step = R*max(compute/R, reads/R, hop/flit)+R
     panels = g.panels*g.npanels
-    output = g.lm*g.ln*t/dram_bw+(panels*(s-1)*g.ms*nt*t/flit if plan.dataflow == 'ws' else 0)
-    resident = g.lk*g.ln*t/dram_bw if plan.b_resident else 0
+    output = panels*proxy.tile(g.ms, nt, blocks['C'], False, t)+(panels*(s-1)*g.ms*nt*t/flit if plan.dataflow == 'ws' else 0)
+    resident = g.lk*g.ln*t/proxy.dram_bw if plan.b_resident else 0
     return (panels*g.ktiles+1)*step+output+resident
 
 

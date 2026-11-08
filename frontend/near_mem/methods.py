@@ -48,8 +48,12 @@ class Method:
     attention_mode: str = 'native'
     loops: tuple = LOOPS
 
+    def oriented(self, cores):
+        """Whether this method's plans come in both mesh orientations."""
+        return not (self.flash or self.tp) and self.layout == 'local' and isqrt(cores)**2 == cores
+
     def space(self, problem, cores, sram, dram, tile_min=8, tile_policy='all', layer_policy='elk', skip=None,
-              single_b=False, direction=None):
+              single_b=False, direction=None, orient=True):
         """This method's plans; see ``gemm.space.candidates`` for ``skip`` and ``single_b``.
         ``direction`` is a graph GEMM's TP mesh direction (None for a single GEMM)."""
         if self.flash:
@@ -102,9 +106,11 @@ class Method:
         adapted_skip = _padding_skip(skip, problem.shape, execution)
         work = Problem(*execution, problem.dtype_bytes)
         # Both mesh orientations of a partition: the TP grid's transposed
-        # numbering is a point of our space, not a separate method.
-        orient = (False, True) if self.layout == 'local' and isqrt(cores)**2 == cores else (False,)
-        plans = (p for t in orient for p in candidates(
+        # numbering is a point of our space, not a separate method. With
+        # ``orient=False`` only the row-major numbering is enumerated; the
+        # proxy ignores the orientation, so callers add twins after ranking
+        # (``oriented``).
+        plans = (p for t in ((False, True) if orient and self.oriented(cores) else (False,)) for p in candidates(
             work, cores, sram, tile_min, tile_policy, layer_policy, dram, self.rotation, adapted_skip, single_b,
             self.receive, self.layout, self.loops, transpose=t))
         if execution == problem.shape:

@@ -31,7 +31,7 @@ def test_parallel_neighbors_have_identical_serial_results(tmp_path):
     workload,first = small_configuration();second = deepcopy(first)
     second['attention'] = asdict(AttentionPlan(2,2))
     serial = Experiment(workload,chip,tmp_path/'serial')
-    expected = [serial.measure(cfg,'serial')['result'] for cfg in (first,second)]
+    expected = [serial.measure_many([cfg],'serial',1)[0]['result'] for cfg in (first,second)]
     parallel = Experiment(workload,chip,tmp_path/'parallel')
     actual = parallel.measure_many([first,second,deepcopy(first)],'parallel',2)
     assert len(actual) == 2
