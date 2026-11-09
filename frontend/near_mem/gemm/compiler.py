@@ -260,15 +260,20 @@ def compile_plan(problem, plan, sram_bytes, dram_bytes, overlap=True):
     owners={}
     for core in range(core_count):
         for key in done(core):owners.setdefault(key,[]).append(core)
+    # Last C store/forward of every tile, in program order (one scan instead
+    # of one per tile: long programs of small tiles made this quadratic).
+    last_write={}
+    for row in phases:
+        for ops in row:
+            for a in ops:
+                if a.get('tensor')=='C' and a['op'] in ('store','forward'):last_write[tuple(a['key'])]=a
     groups={}
     for key,cores in sorted(owners.items()):
         if len(cores)==1:
             # No residual split-K: the last write (a store, or for a landed C
             # the copy that brings it home) already is final. Do not
             # reread/rewrite it merely to mark the output in the oracle.
-            writes=[a for row in phases for ops in row for a in ops
-                    if a.get('tensor')=='C' and a['op'] in ('store','forward') and tuple(a['key'])==key]
-            writes[-1]['final']=True
+            last_write[key]['final']=True
             continue
         groups.setdefault(tuple(cores),[]).append(key)
     waves=[[(cores,keys[i:i+(1 if p.output in ('first','last') else len(cores))])
