@@ -11,6 +11,7 @@ from ..tasks import Graph, Region
 from .ownership import Ownership
 from .plan import DEPENDENCIES
 from ..sim import FIELDS
+from ..resources import add, empty
 
 
 def replica_groups(problem, plan, tensor):
@@ -46,13 +47,16 @@ def distribute(problem, plan, chip, out, deadline=None):
             graph.tensor(core, v, shape, dtype=problem.dtype_bytes, column=v == 'B')
         groups += replicas
     if not groups:
-        return {k: 0 for k in FIELDS}
+        return dict({k: 0 for k in FIELDS}, resources=empty())
     graph.allgather('distribute', groups)
-    return graph.simulate(out, deadline=deadline)['result']
+    run = graph.simulate(out, deadline=deadline)
+    return dict(run['result'], resources=run['graph']['resources']['total'])
 
 
 def charge(kernel, distribution):
-    """Distribution precedes the kernel, so their cycles add."""
+    """Distribution precedes the kernel, so their cycles and resources add."""
     result = dict(kernel, kernel_cycles=kernel['e2e_cycles'], distribution_cycles=distribution['e2e_cycles'])
     result['e2e_cycles'] += distribution['e2e_cycles']
+    if 'resources' in kernel:
+        result['resources'] = add(add(empty(), kernel['resources']), distribution.get('resources', {}))
     return result

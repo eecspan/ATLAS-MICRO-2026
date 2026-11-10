@@ -48,6 +48,7 @@ from ..model.kernels import Gemm
 from ..model.transformer import (Workload, build, configuration, decode_configuration, edge_regions, edges,
                                  port, roles, tune_native)
 from ..search import beam, diverse, measure_all
+from ..resources import report as resource_report
 from ..sim import WORKERS, dump, fingerprint
 from ..tasks import Graph, traffic
 from . import attention as standalone_attention
@@ -97,7 +98,8 @@ class Experiment:
         row = dict(label=label, key=key, configuration=config, result=result,
                    peak_dram_bytes=max(manifest['peak_dram_bytes']), path=str(folder),
                    layout_noc_bytes=sum(e['noc_data_bytes'] for e in manifest['edges']),
-                   layout_write_bytes=sum(e['dram_write_bytes'] for e in manifest['edges']))
+                   layout_write_bytes=sum(e['dram_write_bytes'] for e in manifest['edges']),
+                   resources=manifest['resources'])
         return row
 
     def record(self, row):
@@ -388,7 +390,8 @@ def run(workload, chip, out, method='ours', budget=4, workers=WORKERS, tile_min=
                                       joint_boundary=joint))
     summary = dict(experiment='transformer', workload=asdict(workload), chip=str(Path(chip).resolve()), method=label,
                    best=best, cycles=cycles(best), seconds=time.monotonic()-started, deadline=deadline,
-                   hit_deadline=bool(stop and time.monotonic() > stop), sha256=exp.provenance)
+                   hit_deadline=bool(stop and time.monotonic() > stop), sha256=exp.provenance,
+                   **resource_report(best['resources']['total'], cycles(best), chip))
     dump(exp.out/'summary.json', summary)
     print(json.dumps({k: summary[k] for k in ('method', 'cycles', 'seconds')}, indent=2), flush=True)
     return summary

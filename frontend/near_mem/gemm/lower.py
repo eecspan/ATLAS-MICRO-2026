@@ -172,8 +172,12 @@ def lower_tasks(program, flit_size, final_ops=None):
 
 
 def lower(program, out, flit_size):
+    from math import isqrt
+    from ..resources import count
     out=Path(out).resolve();out.mkdir(parents=True,exist_ok=True)
     raw, manifest=program.lower(flit_size)
+    tensors=[{t['name']:t for t in placement['tensor']} for placement in program.placements]
+    manifest['resources']=count(raw,False,tensors,flit_size,isqrt(len(raw)))
     length=len(raw[0])
     for core,execution in enumerate(raw):
         (out/f'core_{core}.yaml').write_text(json.dumps(dict(iteration=length,execution=execution)))
@@ -213,7 +217,8 @@ def measure(problem,plan,chip,folder,provenance,deadline=None):
     key=hashlib.sha256(json.dumps(asdict(plan),sort_keys=True).encode()).hexdigest()[:24]
     out=Path(folder)/key
     run=simulate(problem,plan,chip,out,provenance=provenance,deadline=deadline)
-    result=charge(run['result'],distribute(problem,plan,chip,out/'distribution',deadline))
+    result=charge(dict(run['result'],resources=run['manifest']['resources']),
+                  distribute(problem,plan,chip,out/'distribution',deadline))
     (out/'result.json').write_text(json.dumps(result,indent=2))
     return dict(key=key,plan=asdict(plan),result=result,path=str(out))
 

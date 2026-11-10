@@ -9,6 +9,7 @@
 | `model/` | 模型算子：`attention`（静态 KV 与空间）、`attention_schedule`（公共融合调度、回放与 lowering）、`attention_flows`（DRAM/Flash 专属事件生成）、`attention_proxy`（共用排序）、`kernels`（GEMM 图接口及 norm/gate/residual）、`transformer`（建图与边界布局） |
 | `output.py` | GEMM 与 attention 共用的归约输出方式：分片、汇聚到组端点、组内复制；只有我们的空间在整图中结合下游布局选择 |
 | `search.py` | 通用搜索：`shortlist`、`diverse`（均支持下界剪枝）、`beam`、`anneal`、`measure_all` |
+| `resources.py` | 资源统计：按 ATLAS 实际执行的任务（含原生 collective）计 MAC、向量、SRAM/DRAM 字节、NoC 字节与字节·跳数；利用率与能耗估算 |
 | `methods.py` | 方法注册表：`tp`（TP 基线）、`atlas`（上游检查）、`local`、`ours`、`dram`、`t10`、`flash`；新增 baseline 在此加一项 |
 | `experiments/` | 实验入口：`gemm`、`attention`、`transformer`（每次一个方法）；`inference` 按固定 batch/输入/输出折算整段推理；`attention_space` 对照新旧融合调度空间；`compare` 计算加速比，`motivation` 汇总已有结果；`dram_calibration` 为 proxy 的 DRAM 通道模型标定系数 |
 
@@ -19,6 +20,8 @@ Attention 和 GEMM 共用两阶段评估：proxy 排序，ATLAS 模拟器复核�
 刚性网格 baseline 遇到边界维度时，只用零填充补齐到各自规则布局要求，并按补齐后的完整 MAC 与 DRAM 流量排序和模拟；计划同时记录逻辑形状和执行形状。原生 ATLAS 单算子若没有精确 M/N 分区就补齐；TP 单算子在没有合法 M/N 网格时补齐到一个合法网格，整图 TP/原生 TP 只补固定网格要求的 K/N 轴；FlashGEMM 将 M/N/K 补齐到 mesh side。T10 的 `M=1` 用单份一维 DRAM 布局：A 沿 K 切分，B/C 沿 N 切分到所有 bank，不复制 A，远端访问由模拟器计费；其他不对齐维度才补齐到其规则网格。可自然改用其他空间轴的方案不强制 padding。
 
 `ours` 是完整的 Ps/Pt 空间：Pt=1（不轮转）是其中的点，Ps 同时枚举 mesh 的两个方向，所以 TP 网格自然是 `ours` 的子集，不再拼接其他方法的候选；整个空间一次扫描、一次 shortlist，按 proxy 排名送入模拟器。`local` 只作消融（`ours` 限定 Pt=1），单独运行。`dram` 只表示 DRAM 端轮转，不退回 `tp` 或 `local`；比较 DRAM 与 SRAM 轮转时各自单独运行。
+
+资源与能耗：每次整图/单算子模拟都在 `graph.json` 的 `resources`（总量与逐算子）里记下按任务统计的事件数，GEMM 单算子含单份输入分发；`summary.json` 给出 `resources`、`utilization`（计算、DRAM、NoC 相对芯片峰值）与 `energy_j`。能耗 = 事件数 × 单次能耗 + 静态功率 × 时间，系数取公开值：DRAM 0.66 pJ/bit（堆叠 DRAM，ATLAS/Helios 引用）、SRAM 0.019 pJ/bit 与 0.43 pJ/FLOP（Helios）、NoC 0.61 pJ/bit/hop（Tangram），静态功率取配置部件功率的 10%（同 DeepStack）。DRAM 字节是逻辑访问量，行缓冲效应只体现在周期里；能耗只用于报告，不参与搜索。`inference` 把每层的量乘以步数和层数。
 
 传递顺序：同一轴上两个张量周期不同（如 X 周期 4、W 周期 2）时，若该轴的共享层在最外、单独层紧随其后（只在这一轴轮转的计划按 ELK 规则即是如此），按 T10 的均匀环：长周期张量每步沿整个环移一格，短周期张量每 q 步移一次，起点为 `x_long + q*x_short`，每一跳都在环上相邻核之间；其余情况沿用各 gcd 层的混合进制顺序。两种顺序访问相同的块、传输量相同，只差链路负载。论文中把传递顺序写成计划的一部分（传递组上的循环顺序，起点由放置决定）。
 

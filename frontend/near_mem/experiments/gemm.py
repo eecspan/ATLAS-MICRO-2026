@@ -26,6 +26,7 @@ from ..gemm.plan import Plan, Problem, load
 from ..gemm.space import Proxy, families, family
 from ..methods import METHODS, target
 from ..search import best, measure_all, shortlist
+from ..resources import report
 from ..sim import WORKERS, dump, fingerprint
 
 
@@ -67,6 +68,8 @@ def run(problem, chip, out, method='ours', budget=16, workers=WORKERS, tile_min=
                    cycles=selected['result']['e2e_cycles'], roofline=proxy.roofline(problem),
                    seconds=time.monotonic()-start, deadline=deadline,
                    hit_deadline=bool(stop and time.monotonic() > stop), sha256=provenance)
+    if 'resources' in selected['result']:  # the upstream ``atlas`` check carries no task counts
+        summary.update(report(selected['result']['resources'], summary['cycles'], chip))
     dump(out/'summary.json', summary)
     print(json.dumps({k: summary[k] for k in ('method', 'cycles', 'roofline', 'seconds')}, indent=2), flush=True)
     return summary

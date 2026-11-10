@@ -487,9 +487,17 @@ class Graph:
                 payload = dict(iteration=len(task), execution=task) if entry['kind'] == 'mpmd-general' else task
                 (folder/f'core_{core}.yaml').write_text(json.dumps(payload))
             operators.append(op)
+        from .resources import add, count, empty
+        # Resource counts from the exact payloads, native collectives included.
+        per = {e['name']: count(e['raw'], e['kind'] == 'communication', self.tensors, self.flit, isqrt(self.cores))
+               for e in self.operations}
+        total = empty()
+        for part in per.values():
+            add(total, part)
         manifest = dict(peak_dram_bytes=self.peak, dram_capacity_per_core=self.capacity,
                         edges=self.edges, operators=[{k:v for k,v in op.items() if k not in ('raw','operator')}
-                                                   for op in self.operations])
+                                                   for op in self.operations],
+                        resources=dict(total=total, operators=per))
         (out/'graph.json').write_text(json.dumps(manifest, indent=2))
         placement = dict(core_tensor=[dict(core_id=i, tensor=list(t.values())) for i,t in enumerate(self.tensors)])
         dump(out/'operators.yaml',dict(operator=operators)); dump(out/'placement.yaml',placement)
