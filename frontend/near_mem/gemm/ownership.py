@@ -3,6 +3,17 @@
 This is a numerical correctness oracle, NOT a latency evaluator or a replacement
 for lowering actual loads, stores, buffers and NoC messages into native ATLAS.
 It makes unequal periods and C rotation precise before backend migration.
+
+Transfer order. Per axis, the periods of its two tensors form gcd layers: a
+shared layer (both rotate) and, for unequal periods, a solo layer (only the
+longer-period tensor). In general each layer moves its own mixed-radix digit,
+so the solo layer jumps by the shared radix. When an axis's shared layer is
+the outermost and its solo layer the next (the order the ELK rule gives a
+plan whose only rotations are on that axis), the axis instead follows T10's
+uniform rings: the longer tensor moves one core per step on its whole ring
+and the shorter one every ``q`` steps (rotating paces); every core starts at
+``x_long + q*x_short``. Both orders visit the same blocks with the same
+transfers; the uniform one keeps every hop between ring neighbours.
 """
 from itertools import product
 from math import isqrt, prod
@@ -21,6 +32,7 @@ class Ownership:
             s=isqrt(len(coords));coords=[coords[(j%s)*s+j//s] for j in range(len(coords))]
         self.coords=coords
         self.ids={c:i for i,c in enumerate(self.coords)}
+        self.uniform=self._uniform()
         self.base=tuple(n//(sp*tp) for n,sp,tp in zip(problem.shape,plan.ps,plan.periods))
         self.strides={v:{} for v in DEPENDENCIES}
         for v in DEPENDENCIES:
@@ -29,6 +41,20 @@ class Ownership:
                 if v in layer.tensors:
                     self.strides[v][i]=stride
                     stride*=layer.radix
+
+    def _uniform(self):
+        """``(shared, solo, long, short, p, q)`` of the axis on uniform rings, or None."""
+        order=self.plan.layer_order or tuple(range(len(self.layers)))
+        if len(order)<2:return None
+        shared,solo=self.layers[order[0]],self.layers[order[1]]
+        if shared.axis!=solo.axis or len(shared.tensors)!=2 or len(solo.tensors)!=1:return None
+        long=solo.tensors[0];short=next(v for v in shared.tensors if v!=long)
+        return order[0],order[1],long,short,shared.radix,solo.radix
+
+    def ring(self, core, tensor):
+        """Position of the long tensor on its whole uniform ring of length p*q."""
+        i,_,_,_,p,q=self.uniform
+        return (self.coords[core][REPLICA_AXIS[tensor]]//self.strides[tensor][i])%(p*q)
 
     def digit(self, core, layer, tensor):
         return (self.coords[core][REPLICA_AXIS[tensor]]//self.strides[tensor][layer])%self.layers[layer].radix
@@ -46,25 +72,41 @@ class Ownership:
 
     def block(self, core, state):
         ds=self.digits(core,state)
-        return tuple(c*p+self.axis_index(ds,d) for d,(c,p) in enumerate(zip(self.coords[core],self.plan.periods)))
+        index=[self.axis_index(ds,d) for d in range(3)]
+        if self.uniform:
+            # Steps taken on the uniform axis during its single traversal.
+            i,j,long,short,p,q=self.uniform
+            step=state[i]*q+(state[j]+state[i])%q
+            index[self.layers[i].axis]=(self.ring(core,long)+q*self.digit(core,i,short)+step)%(p*q)
+        return tuple(c*p+x for c,p,x in zip(self.coords[core],self.plan.periods,index))
 
     def neighbor(self, core, layer, tensor, delta):
-        """Move only this tensor's mixed-radix replica digit; preserve other axes."""
+        """Move only this tensor's replica position (its layer digit, or its whole
+        uniform ring); preserve other axes."""
         c=list(self.coords[core]);d=REPLICA_AXIS[tensor]
+        if self.uniform and layer in self.uniform[:2] and tensor==self.uniform[2]:
+            i=self.uniform[0];size=self.uniform[4]*self.uniform[5]
+            old=self.ring(core,tensor);c[d]+=((old+delta)%size-old)*self.strides[tensor][i]
+            return self.ids[tuple(c)]
         old=self.digit(core,layer,tensor)
         new=(old+delta)%self.layers[layer].radix
         c[d]+=(new-old)*self.strides[tensor][layer]
         return self.ids[tuple(c)]
 
+    def homing(self, state):
+        """Shifts per layer that return every tensor to its initial placement."""
+        counts=[(-s)%layer.radix for s,layer in zip(state,self.layers)]
+        if self.uniform:
+            i,j,_,_,p,q=self.uniform
+            step=state[i]*q+(state[j]+state[i])%q
+            counts[i]=(-state[i])%p;counts[j]=(-(step+counts[i]))%(p*q)
+        return counts
+
     def tensor_blocks(self, core, tensor):
-        initial=self.digits(core,(0,)*len(self.layers))
-        choices=[(initial[i],) if tensor in layer.tensors else range(layer.radix)
-                 for i,layer in enumerate(self.layers)]
+        """Blocks a core holds initially: layers moving ``tensor`` at state 0, all states of the others."""
+        choices=[(0,) if tensor in layer.tensors else range(layer.radix) for layer in self.layers]
         axes=DEPENDENCIES[tensor]
-        blocks=set()
-        for digits in product(*choices):
-            blocks.add(tuple(self.coords[core][d]*self.plan.periods[d]+self.axis_index(digits,d) for d in axes))
-        return sorted(blocks)
+        return sorted({tuple(self.block(core,state)[d] for d in axes) for state in product(*choices)})
 
     def events(self):
         """No implicit bring-back: retain inner-layer phase after each outer step."""

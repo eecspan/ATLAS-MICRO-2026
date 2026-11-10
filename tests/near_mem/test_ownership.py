@@ -64,3 +64,18 @@ def test_rejects_illegal_space_instead_of_approximating_it():
         Plan((1,1,1),(2,2,2),group=(1,2,1)).validate(Problem(16,16,16))
     with pytest.raises(ValueError,match='panel'):
         Plan((2,2,1),(1,1,1),a=(1,2),panel=(1000,1,1)).validate(Problem(16,16,16))
+
+
+def test_unequal_periods_follow_uniform_rings():
+    # The paper's 2x4 example: X (A) rotates over the 4-core row, W (B) over
+    # the 2-core column; core (r,c) computes k_q at step s with q=(c+2r+s)%4.
+    problem=Problem(8,16,16)
+    own=Ownership(problem,Plan((2,4,1),(4,4,4),a=(1,4),b=(2,1)))
+    steps=[state for event,state in own.events() if event=='compute']
+    for s,state in enumerate(steps):
+        assert [own.block(core,state)[2] for core in range(8)]==[(c+2*r+s)%4 for r in range(2) for c in range(4)]
+    # Every A transfer is between ring neighbours of the row.
+    for layer in range(len(own.layers)):
+        assert all(abs(own.neighbor(core,layer,'A',-1)%4-core%4) in (1,3) for core in range(8))
+    rng=np.random.default_rng(5);a=rng.normal(size=(8,16));b=rng.normal(size=(16,16))
+    np.testing.assert_allclose(own.replay(a,b),a@b,atol=1e-12)

@@ -78,7 +78,8 @@ def compile_plan(problem, plan, sram_bytes, dram_bytes, overlap=True):
     shifts=[0]*len(own.layers)
     for event,arg in own.events():
         if event=='shift':shifts[arg]+=1
-    c_moves=sum(n+(-n)%l.radix for n,l in zip(shifts,own.layers) if 'C' in l.tensors)
+    home=own.homing(tuple(n%l.radix for n,l in zip(shifts,own.layers)))
+    c_moves=sum(n+h for n,h,l in zip(shifts,home,own.layers) if 'C' in l.tensors)
     holder=[{v:('C1' if v=='C' and c_moves%2 else v,core) for v in DEPENDENCIES} for core in range(core_count)]
     forwards=[]
 
@@ -235,9 +236,9 @@ def compile_plan(problem, plan, sram_bytes, dram_bytes, overlap=True):
         # homes. C must return to its declared owner before materialization.
         reuse={v:(v=='C' or next_epoch is not None and all(epoch[d]==next_epoch[d] for d in axes))
                for v,axes in DEPENDENCIES.items()}
-        for i,offset in enumerate(state):
+        for i,count in enumerate(own.homing(state)):
             tensors=tuple(v for v in own.layers[i].tensors if reuse[v])
-            for _ in range((-offset)%own.layers[i].radix):
+            for _ in range(count):
                 if tensors:exchange(i,tensors)
         flush=phase()
         for core in range(core_count):
