@@ -983,6 +983,16 @@ void Core::tick() {
         bool dram_finished = !scheduled_dram || clk >= dram_ready_before[cur_iteration + 1];
         if(non_NoC_finished && NoC_finished && !dram_finished)
             cur_task_stats.matrix_bubble_dram_cycles++;
+        // Exposed NoC waits of a general task (its DRAM runs in a separate
+        // queue): on-chip work is done and the NoC, or the NoC and DRAM, still
+        // hold the iteration. Native operators fold both into the iteration
+        // length and keep their pre-estimated DRAM bubble only.
+        if(scheduled_dram && non_NoC_finished && !NoC_finished) {
+            if(dram_finished)
+                cur_task_stats.matrix_bubble_noc_cycles++;
+            else
+                cur_task_stats.matrix_bubble_dram_noc_cycles++;
+        }
         
         // Tick active non-NoC components
         for(const auto& p: pre_estimated_cycles_per_iter) {

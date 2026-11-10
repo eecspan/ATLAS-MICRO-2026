@@ -153,6 +153,8 @@ PYBIND11_MODULE(atlasim, m) {
         .def_readwrite("compute_non_overlap_cycles", &atlasim::Stats::compute_non_overlap_cycles)
         .def_readwrite("matrix_bubble_on_chip_cycles", &atlasim::Stats::matrix_bubble_on_chip_cycles)
         .def_readwrite("matrix_bubble_dram_cycles", &atlasim::Stats::matrix_bubble_dram_cycles)
+        .def_readwrite("matrix_bubble_noc_cycles", &atlasim::Stats::matrix_bubble_noc_cycles)
+        .def_readwrite("matrix_bubble_dram_noc_cycles", &atlasim::Stats::matrix_bubble_dram_noc_cycles)
         .def("matrix_util", &atlasim::Stats::matrix_util)
         .def("vector_util", &atlasim::Stats::vector_util)
         .def("buffer_util", &atlasim::Stats::buffer_util)

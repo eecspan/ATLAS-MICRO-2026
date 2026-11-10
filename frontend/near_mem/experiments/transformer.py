@@ -48,7 +48,7 @@ from ..model.kernels import Gemm
 from ..model.transformer import (Workload, build, configuration, decode_configuration, edge_regions, edges,
                                  port, roles, tune_native)
 from ..search import beam, diverse, measure_all
-from ..resources import report as resource_report
+from ..resources import breakdown, report as resource_report
 from ..sim import WORKERS, dump, fingerprint
 from ..tasks import Graph, traffic
 from . import attention as standalone_attention
@@ -391,7 +391,9 @@ def run(workload, chip, out, method='ours', budget=4, workers=WORKERS, tile_min=
     summary = dict(experiment='transformer', workload=asdict(workload), chip=str(Path(chip).resolve()), method=label,
                    best=best, cycles=cycles(best), seconds=time.monotonic()-started, deadline=deadline,
                    hit_deadline=bool(stop and time.monotonic() > stop), sha256=exp.provenance,
-                   **resource_report(best['resources']['total'], cycles(best), chip))
+                   **resource_report(best['resources']['total'], cycles(best), chip),
+                   breakdown=dict(total=breakdown(best['result']),
+                                  operators={k: breakdown(v) for k, v in best['result']['operators'].items()}))
     dump(exp.out/'summary.json', summary)
     print(json.dumps({k: summary[k] for k in ('method', 'cycles', 'seconds')}, indent=2), flush=True)
     return summary

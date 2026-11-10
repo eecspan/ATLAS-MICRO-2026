@@ -18,7 +18,7 @@ from ..methods import METHODS
 from ..model.attention import Attention, KVLayout, build_attention
 from ..model.attention_proxy import AttentionProxy
 from ..search import measure_all
-from ..resources import report
+from ..resources import breakdown, report
 from ..sim import WORKERS, dump, hardware
 
 cycles = lambda row: row['result']['e2e_cycles']
@@ -48,7 +48,8 @@ def run(problem, chip, out, method='ours', workers=WORKERS, budget=32):
     selected = min(rows, key=cycles)
     summary = dict(experiment='attention', problem=asdict(problem), chip=str(chip), method=method, best=selected,
                    cycles=cycles(selected), plans=len(space), measured=len(candidates), proxy_budget=budget,
-                   seconds=time.monotonic()-started, **report(selected['resources'], cycles(selected), chip))
+                   seconds=time.monotonic()-started, **report(selected['resources'], cycles(selected), chip),
+                   breakdown=breakdown(selected['result']))
     dump(out/'summary.json', summary)
     print(json.dumps({k: summary[k] for k in ('method', 'cycles', 'plans', 'measured', 'proxy_budget')}, indent=2), flush=True)
     return summary

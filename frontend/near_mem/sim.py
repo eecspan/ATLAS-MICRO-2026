@@ -97,6 +97,10 @@ def make_hardware(directory, cores, sram_kib=128, macs=1024, channels=1, flit_si
 
 FIELDS = ('e2e_cycles', 'matrix_cycles', 'vector_cycles', 'buffer_cycles',
           'dram_cycles', 'noc_cycles', 'flop_count', 'memory_access_bytes')
+# One core's busy cycles per component, and the cycles in which an iteration's
+# finished on-chip work waits only for DRAM, only for the NoC, or for both.
+BREAKDOWN = ('e2e_cycles', 'matrix_cycles', 'vector_cycles', 'dram_cycles', 'noc_cycles',
+             'matrix_bubble_dram_cycles', 'matrix_bubble_noc_cycles', 'matrix_bubble_dram_noc_cycles')
 
 
 def dump(path, value):
@@ -135,11 +139,17 @@ def worker(chip, out):
     # per-operator e2e includes waiting for slower cores of the previous one.
     # ``span`` is the operator's share of the critical path: latest finish
     # minus latest start. Spans sum exactly to the whole-graph cycles.
+    # ATLAS takes each statistic's maximum over cores separately, so busy and
+    # exposed times of different cores mix. ``critical`` holds them all from
+    # one core, the one that finishes last, for a consistent time breakdown.
+    pick = lambda cores: max(range(len(cores)), key=lambda c: cores[c].e2e_cycles)
+    result['critical'] = {k: getattr(perf.core_stats[pick(perf.core_stats)], k) for k in BREAKDOWN}
     finish = None
     for name, stats in perf.operator_stats_per_core:
         start = finish or [0]*len(stats)
         finish = [s+x.e2e_cycles for s, x in zip(start, stats)]
         result['operators'][name]['span'] = max(finish)-max(start)
+        result['operators'][name]['critical'] = {k: getattr(stats[pick(stats)], k) for k in BREAKDOWN}
     dump(out/'result.json', result)
 
 

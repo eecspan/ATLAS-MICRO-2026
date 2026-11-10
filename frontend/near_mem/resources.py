@@ -6,10 +6,16 @@ MACs, vector ops, SRAM and DRAM bytes, NoC bytes and byte-hops (XY routes on
 the square mesh: Manhattan distance). DRAM bytes are logical (accessed
 elements); row-buffer effects stay inside the simulated cycles.
 
-``report`` adds utilization against chip peaks over the simulated cycles and
-an event-energy estimate: per-event energy times counts, plus static power
-times time. The coefficients follow published values (``ENERGY``); the
-estimate is reported only and never used by search.
+``report`` adds utilization against chip peaks over the simulated cycles, a
+time breakdown and an event-energy estimate (per-event energy times counts,
+plus static power times time; published coefficients in ``ENERGY``, reported
+only, never used by search).
+
+Time breakdown (``breakdown``), per the simulator's per-cycle counts on the
+critical core: in a cycle the core either still runs its on-chip work
+(compute, possibly overlapping DRAM and NoC transfers), or waits only for
+DRAM, only for the NoC, or for both; ``busy`` gives each resource's total
+busy time, overlapped or not.
 """
 from math import isqrt, prod
 
@@ -68,6 +74,16 @@ def count(raw, communication, tensors, flit, side):
             size = prod(d['access_extent'])*tensors[core][d['name']]['element_size']*d.get('total_iter', 1)
             out['dram_write_bytes' if d['is_write'] else 'dram_read_bytes'] += size
     return out
+
+
+def breakdown(result):
+    """Time of a simulator ``result`` on its critical core: on-chip work, then waits
+    for DRAM only, the NoC only, or both; ``busy`` per resource, overlapped or not."""
+    c = result['critical']
+    dram, noc, both = (c[f'matrix_bubble_{k}_cycles'] for k in ('dram', 'noc', 'dram_noc'))
+    return dict(cycles=c['e2e_cycles'], on_chip=c['e2e_cycles']-dram-noc-both, exposed_dram=dram,
+                exposed_noc=noc, exposed_dram_noc=both,
+                busy=dict(matrix=c['matrix_cycles'], vector=c['vector_cycles'], dram=c['dram_cycles'], noc=c['noc_cycles']))
 
 
 def report(resources, cycles, chip, energy=ENERGY):

@@ -54,7 +54,8 @@ def main():
         result[phase] = dict(workload=asdict(workload), layer_cycles=s['cycles'], steps=steps,
                              cycles=s['cycles']*scale, hit_deadline=s['hit_deadline'],
                              resources={k: v*scale for k, v in s['resources'].items()},
-                             utilization=s['utilization'], energy_j={k: v*scale for k, v in s['energy_j'].items()})
+                             utilization=s['utilization'], energy_j={k: v*scale for k, v in s['energy_j'].items()},
+                             breakdown=s['breakdown']['total'])  # per representative layer
     summary = dict(experiment='inference', method=s['method'], chip=str(a.chip.resolve()),
                    workload=dict(batch=a.batch, input=a.input, generate=a.generate, chunk=a.chunk,
                                  layers=a.layers, phases=list(phases), **shape),

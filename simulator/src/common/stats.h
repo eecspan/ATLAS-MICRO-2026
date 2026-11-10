@@ -42,6 +42,8 @@ struct Stats {
     uint64_t compute_non_overlap_cycles = 0;
     uint64_t matrix_bubble_on_chip_cycles = 0;
     uint64_t matrix_bubble_dram_cycles = 0;
+    uint64_t matrix_bubble_noc_cycles = 0;
+    uint64_t matrix_bubble_dram_noc_cycles = 0;
 
     double matrix_util() const { 
         return matrix_cycles*1.0 / e2e_cycles;
@@ -99,6 +101,8 @@ struct Stats {
         compute_non_overlap_cycles += s.compute_non_overlap_cycles;
         matrix_bubble_on_chip_cycles += s.matrix_bubble_on_chip_cycles;
         matrix_bubble_dram_cycles += s.matrix_bubble_dram_cycles;
+        matrix_bubble_noc_cycles += s.matrix_bubble_noc_cycles;
+        matrix_bubble_dram_noc_cycles += s.matrix_bubble_dram_noc_cycles;
 
         e2e_energy += s.e2e_energy;
         controller_energy += s.controller_energy;
@@ -139,6 +143,8 @@ struct Stats {
         os << std::setw(indent+4) << "" << "Compute Non-Overlap Ratio: " << compute_non_overlap_ratio() << std::endl;
         os << std::setw(indent+4) << "" << "Matrix Bubble On-Chip Cycles: " << matrix_bubble_on_chip_cycles << std::endl;
         os << std::setw(indent+4) << "" << "Matrix Bubble DRAM Cycles: " << matrix_bubble_dram_cycles << std::endl;
+        os << std::setw(indent+4) << "" << "Matrix Bubble NoC Cycles: " << matrix_bubble_noc_cycles << std::endl;
+        os << std::setw(indent+4) << "" << "Matrix Bubble DRAM+NoC Cycles: " << matrix_bubble_dram_noc_cycles << std::endl;
 
         os << std::setw(indent) << "" << "(5) Utilization Statistics:" << std::endl;
         os << std::setw(indent+4) << "" << "Matrix Cycle Utilization: " << matrix_util() << std::endl;

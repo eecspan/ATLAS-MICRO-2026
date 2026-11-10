@@ -114,6 +114,8 @@ Stats CoreArray::get_e2e_stats() {
         e2e_stats.compute_non_overlap_cycles = std::max(e2e_stats.compute_non_overlap_cycles, core->get_e2e_stats().compute_non_overlap_cycles);
         e2e_stats.matrix_bubble_on_chip_cycles = std::max(e2e_stats.matrix_bubble_on_chip_cycles, core->get_e2e_stats().matrix_bubble_on_chip_cycles);
         e2e_stats.matrix_bubble_dram_cycles = std::max(e2e_stats.matrix_bubble_dram_cycles, core->get_e2e_stats().matrix_bubble_dram_cycles);
+        e2e_stats.matrix_bubble_noc_cycles = std::max(e2e_stats.matrix_bubble_noc_cycles, core->get_e2e_stats().matrix_bubble_noc_cycles);
+        e2e_stats.matrix_bubble_dram_noc_cycles = std::max(e2e_stats.matrix_bubble_dram_noc_cycles, core->get_e2e_stats().matrix_bubble_dram_noc_cycles);
 
         e2e_stats.flop_count += core->get_e2e_stats().flop_count;
         e2e_stats.memory_access_bytes += core->get_e2e_stats().memory_access_bytes;
@@ -147,6 +149,8 @@ OperatorStatsCollection CoreArray::get_all_op_stats() {
             cur_stats.compute_non_overlap_cycles = std::max(cur_stats.compute_non_overlap_cycles, core_stats.compute_non_overlap_cycles);
             cur_stats.matrix_bubble_on_chip_cycles = std::max(cur_stats.matrix_bubble_on_chip_cycles, core_stats.matrix_bubble_on_chip_cycles);
             cur_stats.matrix_bubble_dram_cycles = std::max(cur_stats.matrix_bubble_dram_cycles, core_stats.matrix_bubble_dram_cycles);
+            cur_stats.matrix_bubble_noc_cycles = std::max(cur_stats.matrix_bubble_noc_cycles, core_stats.matrix_bubble_noc_cycles);
+            cur_stats.matrix_bubble_dram_noc_cycles = std::max(cur_stats.matrix_bubble_dram_noc_cycles, core_stats.matrix_bubble_dram_noc_cycles);
 
             cur_stats.flop_count += core_stats.flop_count;
             cur_stats.memory_access_bytes += core_stats.memory_access_bytes;

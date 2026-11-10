@@ -54,9 +54,11 @@ def distribute(problem, plan, chip, out, deadline=None):
 
 
 def charge(kernel, distribution):
-    """Distribution precedes the kernel, so their cycles and resources add."""
+    """Distribution precedes the kernel, so their cycles, time breakdowns and resources add."""
     result = dict(kernel, kernel_cycles=kernel['e2e_cycles'], distribution_cycles=distribution['e2e_cycles'])
     result['e2e_cycles'] += distribution['e2e_cycles']
+    if 'critical' in kernel:  # distribution then kernel, each on its own critical core
+        result['critical'] = {k: v+distribution.get('critical', {}).get(k, 0) for k, v in kernel['critical'].items()}
     if 'resources' in kernel:
         result['resources'] = add(add(empty(), kernel['resources']), distribution.get('resources', {}))
     return result
