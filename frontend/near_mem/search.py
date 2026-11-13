@@ -70,6 +70,12 @@ def diverse(space, score, budget, family, per=1, bound=None):
     ``budget`` best seen so far. Exact when every family arrives contiguously
     and its first prefix bounds all of it (``gemm.space.structure``).
     """
+    chosen, count = _diverse(space, score, budget, family, per, bound)
+    return [(c, v) for c, (v, _) in chosen.items()], count
+
+
+def _diverse(space, score, budget, family, per, bound):
+    """``diverse`` with each chosen candidate's arrival position: ``{c: (value, position)}``."""
     tables = []; finished = []; count = 0; family_bound = {}
     tup = lambda v: v if isinstance(v, tuple) else (v,)
 
@@ -106,9 +112,39 @@ def diverse(space, score, budget, family, per=1, bound=None):
         families = sorted((sorted(((-v, -i, c) for v, i, c in heap), key=lambda x: x[:2]) for heap in table.values()),
                           key=lambda x: x[0][:2])
         for group in families[:budget]:
-            for v, _, c in group:
-                chosen.setdefault(c, v)
-    return list(chosen.items()), count
+            for v, i, c in group:
+                chosen.setdefault(c, (v, i))
+    return chosen, count
+
+
+def diverse_part(space, score, budget, family, per=1, bound=None, part=0, parts=1):
+    """One of ``parts`` independent pieces of a ``diverse`` scan.
+
+    Families are dealt round-robin in arrival order, so a piece scans whole
+    families only and prunes with its own bound. Returns ``(rows, scanned)``
+    with rows ``(candidate, tag)``; ``merge_diverse`` over every piece's rows
+    gives exactly the result of the single scan, ties included: a family
+    lives in one piece, so each of a piece's ``budget`` best families keeps
+    its ``per`` best candidates, and a family in the global ``budget`` best
+    is also in its piece's. ``tag`` orders candidates as the single scan
+    would see them.
+    """
+    order = {}
+    def mine(key):
+        return order.setdefault(key, len(order)) % parts == part
+    def piece(skip):
+        # Every prefix is asked about (so families are numbered identically
+        # in every piece); prefixes of another piece are skipped unscored.
+        inner = (lambda prefix: not mine(family(prefix)) or bool(skip and skip(prefix)))
+        return (c for c in space(inner) if mine(family(c)))
+    chosen, count = _diverse(piece, score, budget, family, per, bound)
+    return [(c, (order[family(c)], i)) for c, (_, i) in chosen.items()], count
+
+
+def merge_diverse(rows, score, budget, family, per=1):
+    """Combine ``diverse_part`` pieces: ``(candidates and values, as diverse returns them)``."""
+    ordered = [c for c, _ in sorted(rows, key=lambda r: r[1])]
+    return diverse(lambda skip=None: iter(ordered), score, budget, family, per)[0]
 
 
 def beam(decisions, cost, width=64, keep=8):

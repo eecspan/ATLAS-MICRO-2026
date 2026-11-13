@@ -9,11 +9,15 @@ from frontend.near_mem.search import shortlist
 
 def test_enumerated_space_is_legal_and_keeps_major_families():
     problem=Problem(8,8,8)
-    plans=list(candidates(problem,4,8192,4,'all','all'))
+    plans=list(candidates(problem,4,8192,4,'all','all',distinct=False))
     assert len(plans)==len(set(plans))==702
     for p in plans:
         p.validate(problem)
-        assert compile_plan(problem,p,8192,1024**2).sram_bytes==resident_bytes(p)
+        # ``resident_bytes`` is the baseline (waiting C) footprint; ``auto``
+        # adds the deferred third C panel only when it fits.
+        program=compile_plan(problem,p,8192,1024**2)
+        assert program.sram_bytes==p.sram_bytes(2,True,program.defer)
+        assert resident_bytes(p)<=program.sram_bytes<=8192
     assert {p.loop for p in plans}=={'mnk','mkn','nmk','nkm','kmn','knm'}
     assert any(p.a[1]!=p.b[0] for p in plans)
     assert any(p.c!=(1,1) for p in plans)
@@ -29,9 +33,31 @@ def test_no_shift_group_canonicalization_preserves_exact_ir():
             assert compile_plan(problem,replace(p,group=g),8192,1024**2).phases==reference
 
 
+def test_distinct_space_keeps_one_plan_per_compiled_program(tmp_path):
+    # Loop orders that differ only in where one-iteration loops sit compile to
+    # the same program and score; ``distinct`` keeps the first of them only.
+    from frontend.near_mem.gemm.space import Proxy,schedule_key
+    from frontend.near_mem.sim import make_hardware
+    proxy=Proxy(make_hardware(tmp_path/'hw',4,64))
+    for problem,receive in ((Problem(8,8,8),'sram_consume'),(Problem(16,32,16),'sram_consume'),
+                            (Problem(16,16,16),'dram_land')):
+        args=(problem,4,1<<20,4,'all','elk',1<<30,True)
+        kept=list(candidates(*args,receive=receive))
+        every=list(candidates(*args,receive=receive,distinct=False))
+        assert len(set(kept))==len(kept)<len(every) and set(kept)<=set(every)
+        counts=lambda p:tuple(n//(s*q*t) for n,s,q,t in zip(problem.shape,p.ps,p.periods,p.tile))
+        identity=lambda p:(replace(p,loop='mnk'),schedule_key(p,counts(p)))
+        index={identity(p):p for p in kept}
+        assert len(index)==len(kept)
+        program=lambda p:compile_plan(problem,p,1<<20,1<<30).phases
+        for p in every:
+            twin=index[identity(p)]
+            assert program(p)==program(twin) and proxy.kernel(problem,p)==proxy.kernel(problem,twin),p
+
+
 def test_shortlist_is_reproducible_and_preserves_distinct_families():
     problem=Problem(8,8,8)
-    plans=list(candidates(problem,4,8192,4,'all','all'))
+    plans=list(candidates(problem,4,8192,4,'all','all',distinct=False))
     score=lambda p:sum(p.tile)
     first,count=shortlist(lambda skip:iter(plans),score,8,family)
     second,_=shortlist(lambda skip:iter(plans),score,8,family)
@@ -148,3 +174,23 @@ def test_proxy_split_k_finalization_counts_the_busiest_rank():
             tiles=(problem.m//p.ps[0]//p.tile[0])*(problem.n//p.ps[1]//p.tile[1])//prod(p.c)
             final=tiles if p.output!='sharded' else ceil(tiles/residual)
             assert (max(c['load'] for c in per),max(c['store'] for c in per))==(loads+tiles,stores+final),p
+
+
+def test_split_diverse_scan_is_exact(tmp_path):
+    # A scan split into pieces of whole families, each pruned by its own
+    # bound, merges into exactly the single scan's proposals and order.
+    from frontend.near_mem.gemm.space import Proxy,structure
+    from frontend.near_mem.methods import METHODS
+    from frontend.near_mem.search import diverse,diverse_part,merge_diverse
+    from frontend.near_mem.sim import make_hardware
+    proxy=Proxy(make_hardware(tmp_path/'hw',4,64));problem=Problem(64,64,128);hw=dict(cores=4,sram=64*1024,dram=2**30,tile_min=8)
+    pair=lambda p:(k:=proxy.kernel(problem,p),k+proxy.distribution(problem,p))
+    low=lambda q:(k:=proxy.lower(problem,q),k+proxy.distribution(problem,q))
+    for m in [m for m in METHODS.values() if not m.native]:
+        space=lambda skip=None:m.space(problem,skip=skip,**hw)
+        whole,count=diverse(space,pair,2,structure,2,low)
+        for parts in (1,3,7):
+            pieces=[diverse_part(space,pair,2,structure,2,low,i,parts) for i in range(parts)]
+            merged=merge_diverse([r for rows,_ in pieces for r in rows],pair,2,structure,2)
+            assert merged==whole,(m.name,parts)
+            assert parts>1 or pieces[0][1]==count

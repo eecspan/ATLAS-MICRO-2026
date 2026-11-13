@@ -107,9 +107,9 @@ class Method:
         work = Problem(*execution, problem.dtype_bytes)
         # Both mesh orientations of a partition: the TP grid's transposed
         # numbering is a point of our space, not a separate method. With
-        # ``orient=False`` only the row-major numbering is enumerated; the
-        # proxy ignores the orientation, so callers add twins after ranking
-        # (``oriented``).
+        # ``orient=False`` only the row-major numbering is enumerated and
+        # callers add twins after ranking (``oriented``); the proxy's XY
+        # channel loads (``gemm.noc``) do tell the orientations apart.
         plans = (p for t in ((False, True) if orient and self.oriented(cores) else (False,)) for p in candidates(
             work, cores, sram, tile_min, tile_policy, layer_policy, dram, self.rotation, adapted_skip, single_b,
             self.receive, self.layout, self.loops, transpose=t))

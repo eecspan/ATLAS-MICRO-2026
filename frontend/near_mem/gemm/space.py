@@ -6,8 +6,12 @@ and exact duplicates are removed, and a selector may ``skip`` whole subtrees.
 overhead, input replication), never a cycle count: final choices are always
 measured by ATLAS. Its DRAM term charges the compiler's exact tile loads and
 stores (``transfers``) through a calibrated channel model of the backend
-(bursts and opened rows of the busiest channel, ``Proxy.access``). ``Proxy.lower`` bounds that score from below over every
-completion of a partial plan, so selectors prune without changing their result.
+(bursts and opened rows of the busiest channel, ``Proxy.access``). Its NoC
+term is the maximum channel load of the compiler's transfers under BookSim's
+XY routing (busiest injection/ejection port or directed link, ``gemm.noc``),
+so ring hops that span several mesh links and colliding routes are charged.
+``Proxy.lower`` bounds that score from below over every completion of a
+partial plan, so selectors prune without changing their result.
 """
 from dataclasses import replace
 from functools import lru_cache
@@ -20,6 +24,7 @@ import yaml
 from ..sim import hardware, strides
 
 from .plan import Plan, Problem, DEPENDENCIES, execution_problem
+from . import noc as channel
 
 
 LOOPS=tuple(''.join(o) for o in permutations('mnk'))
@@ -61,9 +66,26 @@ def tile_values(n,low,policy='all'):
     return values if policy=='all' else [v for v in values if v&(v-1)==0 or v==n]
 
 
+def nest(loop,extents):
+    """The loop order restricted to axes of more than one iteration."""
+    return ''.join(a for a in loop if extents['mnk'.index(a)]>1)
+
+
+def schedule_key(plan,counts):
+    """What the compiler's loop nests depend on, given the per-axis tile counts
+    ``counts`` of one epoch-group block: the group, and the order of the epoch
+    and micro loops that iterate more than once. ``loop`` is used only to order
+    those nests (``compiler.loop_points``, ``transfers``); a one-iteration loop
+    contributes a single index wherever it is placed, so plans with equal keys
+    compile to the same program."""
+    group=counts if plan.land else plan.group  # DRAM landing: one epoch
+    epochs=tuple(n//g for n,g in zip(counts,group))
+    return plan.group,nest(plan.loop,epochs),nest(plan.loop,group)
+
+
 def candidates(problem,cores,capacity,tile_min=8,tile_policy='all',layer_policy='elk',dram_capacity=float('inf'),
                rotation=True,skip=None,single_b=False,receive='sram_consume',layout='local',loops=LOOPS,parts=None,
-               transpose=False):
+               transpose=False,distinct=True):
     """Yields immutable Plans, one ``(ps,a,b,c)`` shell at a time.
 
     ``single_b`` keeps one DRAM copy of B (a graph's weights): an M split
@@ -78,6 +100,10 @@ def candidates(problem,cores,capacity,tile_min=8,tile_policy='all',layer_policy=
     ``skip(prefix)`` is asked for every shell (``tile=None``) and every tile
     before loops, groups and layer orders are expanded; ``True`` drops all
     completions of that prefix.
+
+    With ``distinct`` loop orders that differ only in where one-iteration
+    loops sit are yielded once (the first in ``loops`` order): they compile
+    to the same program (``schedule_key``). ``distinct=False`` yields them all.
     """
     low=tile_min if isinstance(tile_min,tuple) else (tile_min,)*3
     for ps in parts or spatial_parts(cores):
@@ -102,10 +128,17 @@ def candidates(problem,cores,capacity,tile_min=8,tile_policy='all',layer_policy=
                 if resident_bytes(basic,problem.dtype_bytes)>capacity:continue
                 if skip and skip(basic):continue
                 counts=tuple(n//t for n,t in zip(base,tile))
+                seen=set();fits={}
                 for loop in loops:
                     for group in (groups(counts,loop) if shell.layers and not shell.land and len(loops)>1 else [(1,1,1)]):
                         p=replace(basic,loop=loop,group=group)
-                        if resident_bytes(p,problem.dtype_bytes)>capacity:continue
+                        if distinct:
+                            key=schedule_key(p,counts)
+                            if key in seen:continue
+                            seen.add(key)
+                        # Live SRAM depends on the group, not on the loop order.
+                        if group not in fits:fits[group]=resident_bytes(p,problem.dtype_bytes)<=capacity
+                        if not fits[group]:continue
                         if layer_policy=='all':orders=p.orders()
                         else:
                             sizes={v:n*prod(p.tile[d] for d in DEPENDENCIES[v]) for v,n in zip(DEPENDENCIES,p.payload_tiles)}
@@ -245,21 +278,31 @@ class Proxy:
         """Proxy cycles of one DRAM tile access per tensor of a plan with a tile
         (``problem`` already the execution problem): windows of the per-core
         A/C (row-major) and B (column-major) tensors; T10 reads windows of its
-        fixed global blocks, one piece per home block a tile spans."""
-        local=[n//s for n,s in zip(problem.shape,p.ps)]
-        if p.layout=='global':
+        fixed global blocks, one piece per home block a tile spans. Depends
+        only on the tensor windows, so loop orders, groups and layer orders of
+        one tile share one evaluation."""
+        return self._costs(problem,p.ps,p.tile,p.a,p.b,p.c,p.layout)
+
+    @lru_cache(maxsize=1<<16)
+    def _costs(self,problem,ps,tile,a,b,c,layout):
+        local=[n//s for n,s in zip(problem.shape,ps)];temporal={'A':a,'B':b,'C':c}
+        if layout=='global':
             from .layout import GlobalLayout
-            shapes={v:GlobalLayout(problem,p.cores).block(v) for v in DEPENDENCIES}
+            shapes={v:GlobalLayout(problem,prod(ps)).block(v) for v in DEPENDENCIES}
         else:
-            shapes={v:tuple(local[d]//parts[i] for i,d in enumerate(DEPENDENCIES[v])) for v,parts in p.temporal.items()}
-        return {v:prod(ceil(p.tile[d]/n) for d,n in zip(axes,shapes[v]))
-                  *self.tile(*(min(p.tile[d],n) for d,n in zip(axes,shapes[v])),shapes[v],v=='B',problem.dtype_bytes)
+            shapes={v:tuple(local[d]//parts[i] for i,d in enumerate(DEPENDENCIES[v])) for v,parts in temporal.items()}
+        return {v:prod(ceil(tile[d]/n) for d,n in zip(axes,shapes[v]))
+                  *self.tile(*(min(tile[d],n) for d,n in zip(axes,shapes[v])),shapes[v],v=='B',problem.dtype_bytes)
                 for v,axes in DEPENDENCIES.items()}
 
     def __call__(self,problem,p):
         """Standalone score: the kernel plus single-copy input replication."""
         problem=execution_problem(problem,p)
         return self.kernel(problem,p)+self.distribution(problem,p)
+
+    @property
+    def sram(self):
+        return self.arch['core']['buffer']['buffer_size']*1024
 
     @property
     def mac(self):
@@ -279,16 +322,18 @@ class Proxy:
     def hotspot(problem,shell):
         """Per input of a global-layout plan, the busiest home core's remote
         reads over the mean (>= 1), for the first compute state's tiles: when
-        many readers want blocks of one home, its NoC port serializes them."""
+        many readers want blocks of one home, its NoC port serializes them,
+        and XY routes from the homes to their readers share mesh links."""
         from .layout import GlobalLayout
         from .ownership import Ownership
         own=Ownership(problem,shell);layout=GlobalLayout(problem,shell.cores);state=(0,)*len(own.layers);out={}
         for v in 'AB':
-            axes=DEPENDENCIES[v];load={};total=0
+            axes=DEPENDENCIES[v];flows=[]
             for core in range(shell.cores):
                 block=own.block(core,state)
                 for home,_,extent in layout.pieces(v,*(block[d]*own.base[d] for d in axes),*(shell.tile[d] for d in axes)):
-                    if home!=core:load[home]=load.get(home,0)+prod(extent);total+=prod(extent)
+                    if home!=core:flows.append((home,core,prod(extent)))
+            total=sum(n for _,_,n in flows);load=channel.load(flows,channel.mesh(shell.cores))
             out[v]=max(load.values())*shell.cores/total if total else 1
         return out
 
@@ -304,7 +349,13 @@ class Proxy:
         if getattr(p,'kind',None)=='flash' or p.layout=='global':return 0
         lm,ln,lk=(n//s for n,s in zip(problem.shape,p.ps))
         received=(lm*lk/prod(p.a)*(1-prod(p.a)/p.ps[1])+lk*ln/prod(p.b)*(1-prod(p.b)/p.ps[0]))*problem.dtype_bytes
-        return max(received/self.arch['noc']['flit_size'],2*received/self.dram_bw)
+        if not received:return 0
+        # The linear all-gather's busiest port or link, hop by hop (a middle
+        # replica receives from both sides); the receive volume if the groups
+        # are no mesh sub-grids.
+        busiest=channel.gather(problem,channel.shell(p))
+        busiest=received if busiest is None else max(received,busiest*problem.dtype_bytes)
+        return max(busiest/self.arch['noc']['flit_size'],2*received/self.dram_bw)
 
     def kernel(self,problem,p):
         """Kernel score with inputs already in place (graph edges are scored apart)."""
@@ -327,30 +378,48 @@ class Proxy:
         moved={v:n*prod(p.tile[d] for d in DEPENDENCIES[v])*dtype for v,n in accesses.items()}
         payload={v:n*prod(p.tile[d] for d in DEPENDENCIES[v])*dtype for v,n in zip(DEPENDENCIES,p.payload_tiles)}
         epochs=prod(n//(s*t*g*period) for n,s,t,g,period in zip(problem.shape,p.ps,p.tile,p.group,p.periods))
-        # A/B shifts are prefetched under compute by the compiler's pipeline.
-        # A C shift waits for the panel's last update and the next compute
-        # waits for it, and residual split-K runs after all compute: both are
-        # serial, so they are added rather than overlapped.
-        volume=0;serial=0;outer=1;events=0
-        for i in (p.layer_order or tuple(range(len(p.layers)))):
-            layer=p.layers[i]
-            volume+=outer*(layer.radix-1)*sum(payload[v] for v in layer.tensors if v!='C')
-            serial+=outer*(layer.radix-1)*payload['C']*('C' in layer.tensors)
-            events+=outer*(layer.radix-1)
+        # NoC volumes are bytes on the busiest port or XY link of each shift
+        # phase (``gemm.noc``); ``sent``/``rotated_c`` are the bytes every core sends.
+        # The compiler moves a layer's A/B and C in separate phases. An A/B
+        # shift leaves in equal shares with every micro-step of the state
+        # before it: it overlaps the state's compute and the rest of it
+        # (``exposed``) stalls the next; a phase of ATLAS lasts until its
+        # slowest core and packet finish. A waiting C shift (``c_accumulate``)
+        # leaves after the panel's last update and the next compute waits for
+        # it: serial. A deferred one travels with the next state's first
+        # micro-step, like an A/B shift. DRAM landing forwards A/B blocks
+        # under compute; only C copies serialize.
+        step=ceil(prod(p.tile)/self.arch['core']['matrix']['mac_num'])
+        flit=self.arch['noc']['flit_size'];defer=p.defers(self.sram,dtype)
+        volume=0;serial=0;outer=1;events=0;sent=0;rotated_c=0;exposed=0
+        order=p.layer_order or tuple(range(len(p.layers)))
+        shape=channel.shell(p);loads=channel.rotation(shape,channel.head(p.layers,order)) if p.layers else ()
+        for i in order:
+            layer=p.layers[i];shifts=outer*(layer.radix-1);front=loads[i][0]
+            ab=channel.peak(front,dict(payload,C=0));c=channel.peak(front,dict(payload,A=0,B=0))
+            volume+=shifts*ab
+            # Spread over the state's micro-steps when there are several (``compiler``).
+            if not p.land:exposed+=shifts*max(0,ab/flit-step*prod(p.group))
+            if defer:
+                volume+=shifts*c;exposed+=shifts*max(0,c/flit-step)
+            else:serial+=shifts*c
+            sent+=shifts*sum(payload[v] for v in layer.tensors if v!='C')
+            rotated_c+=shifts*payload['C']*('C' in layer.tensors)
+            events+=shifts
             outer*=layer.radix
-        volume*=epochs;serial*=epochs;rotated_c=serial
+        volume*=epochs;serial*=epochs;rotated_c*=epochs;sent*=epochs;exposed*=epochs
         # Residual split-K: a line reduce-scatter per wave of ``residual`` C
-        # tiles, r-1 tile hops each (both directions in parallel), r+1 phases.
+        # tiles, r-1 tile steps each at the busiest port/link load of a step
+        # (a middle rank sends to and receives from both neighbours), r+1 phases.
         waves=ceil(max(1,nm*nn//prod(p.c))/residual)*(residual>1)
-        serial+=waves*(residual-1)*tm*tn*dtype
+        serial+=waves*(residual-1)*tm*tn*dtype*(channel.reduction(shape) if residual>1 else 0)
         # DRAM-landing copies overlap compute and add no exchange phase.
         events=(0 if p.land else events*epochs)+waves*(residual+1)
         micro_steps=nm*nn*nk
-        step=ceil(prod(p.tile)/self.arch['core']['matrix']['mac_num'])
         mac=micro_steps*step
         # DRAM landing: every forwarded block is read by its sender and
         # written by its receiver, overlapped with compute (no shift phases).
-        landed=2*(volume+rotated_c) if p.land else 0
+        landed=2*(sent+rotated_c) if p.land else 0
         # Global layout: non-home tile reads and final writes cross the NoC.
         remote=self.remote(p)*(moved['A']+moved['B']+lm*ln*dtype/prod(p.c))
         if p.layout=='global':
@@ -359,11 +428,11 @@ class Proxy:
             hot=self.hotspot(problem,replace(p,loop='mnk',group=(1,1,1),layer_order=()))
             remote=self.remote(p)*(moved['A']*hot['A']+moved['B']*hot['B']+lm*ln*dtype/prod(p.c))
         dram=memory+landed/self.dram_bw
-        noc=(volume+remote)/self.arch['noc']['flit_size'];serial/=self.arch['noc']['flit_size']
+        noc=(volume+remote)/flit;serial/=flit
         # Native tasks cannot issue fractional micro-iterations. Count their
         # phase overhead and one phase per shift or reduction step.
         # This is a ranking heuristic, never a safe latency lower bound.
-        return max(mac,dram,noc)+serial+micro_steps+events
+        return max(mac+exposed,dram,noc)+serial+micro_steps+events
 
 
     def lower(self,problem,p):
@@ -383,10 +452,28 @@ class Proxy:
             total=0;outer=1
             for layer in sorted(p.layers,key=w,reverse=True):total+=outer*(layer.radix-1)*w(layer);outer*=layer.radix
             return total
-        volume=least(lambda l:sum(weight[v] for v in l.tensors if v!='C'))
-        serial=least(lambda l:weight['C']*('C' in l.tensors));rotated_c=serial
+        sent=least(lambda l:sum(weight[v] for v in l.tensors if v!='C'))
+        rotated_c=least(lambda l:weight['C']*('C' in l.tensors))
+        # Channel loads depend on the layer order only through its head
+        # (``noc.head``); the least volume over every possible head bounds all
+        # orders, and ``noc.peak`` is monotone and homogeneous in the per-core
+        # volumes. Stalls of shifts beyond their step (>= 0) are omitted. A C
+        # shift counts as overlapped unless the plan cannot defer it (a
+        # prefix without tiles may still defer; overlapping never costs more).
+        shape=channel.shell(p);volume=serial=float('inf')
+        defer=(p.defers(self.sram,dtype) if p.tile is not None else
+               prod(p.c)>1 and not p.land and p.c_accumulate!='wait')
+        for pair in channel.heads(p.layers):
+            loads=channel.rotation(shape,pair) if p.layers else ()
+            # Per layer: (overlapped, serial) busiest volumes, as ``kernel`` splits them.
+            def split(front,l):
+                ab=channel.peak(front,dict(weight,C=0));c=channel.peak(front,dict(weight,A=0,B=0))
+                return (ab+c,0) if defer else (ab,c)
+            row={l:split(loads[i][0],l) for i,l in enumerate(p.layers)}
+            volume=min(volume,least(lambda l:row[l][0]))
+            serial=min(serial,least(lambda l:row[l][1]))
         residual=p.ps[2]//prod(p.c)
-        serial+=lm*ln/prod(p.c)*dtype*(residual-1)/residual
+        if residual>1:serial+=lm*ln/prod(p.c)*dtype*(residual-1)/residual*channel.reduction(shape)
         if p.tile is None:
             micro_steps=rows=1;mac=lm*ln*lk/self.arch['core']['matrix']['mac_num']
         else:
@@ -403,7 +490,7 @@ class Proxy:
             # each at its channel cost (never below its bytes at peak bandwidth).
             cost=self.costs(problem,p);tm,tn,tk=p.tile
             memory=a/(tm*tk)*cost['A']+b/(tk*tn)*cost['B']+c/(tm*tn)*cost['C']
-        dram=memory+2*(volume+rotated_c)*p.land/self.dram_bw  # volumes are in bytes
+        dram=memory+2*(sent+rotated_c)*p.land/self.dram_bw  # volumes are in bytes
         remote=self.remote(p)*(lm*lk/prod(p.a)+lk*ln/prod(p.b)+lm*ln/prod(p.c))*dtype
         flit=self.arch['noc']['flit_size']
         return max(mac,dram,(volume+remote)/flit)+serial/flit+micro_steps+events
