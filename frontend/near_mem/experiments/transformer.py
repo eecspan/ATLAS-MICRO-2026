@@ -44,10 +44,11 @@ from ..methods import METHODS, target
 from ..output import variants as output_variants
 from ..model.attention import AttentionPlan, KVLayout
 from ..model.attention_proxy import AttentionProxy
+from ..model.schedule_proxy import ScheduleProxy
 from ..model.kernels import Gemm
 from ..model.transformer import (Workload, build, configuration, decode_configuration, edge_regions, edges,
                                  port, roles, tune_native)
-from ..search import beam, diverse, measure_all
+from ..search import beam, diverse, diverse_part, measure_all, merge_diverse
 from ..resources import breakdown, report as resource_report
 from ..sim import WORKERS, dump, fingerprint
 from ..tasks import Graph, traffic
@@ -68,13 +69,19 @@ def simulate_operator(workload, chip, hw, out, name, choice, deadline=None):
         return standalone_attention.measure(workload.attention, chip, out/'attention', choice, placed=True,
                                             deadline=deadline)['result']['e2e_cycles']
     key = hashlib.sha256(json.dumps([name, choice], sort_keys=True).encode()).hexdigest()[:20]
+    graph = operator_graph(workload, chip, hw, name, choice)
+    return graph.simulate(out/'operators'/key, deadline=deadline)['result']['e2e_cycles']
+
+
+def operator_graph(workload, chip, hw, name, choice):
+    """The same placed-input GEMM, including fused work, for scoring and measurement."""
     graph = Graph(chip); kernel = bind_kernel(workload, hw, name, choice).prepare(graph, name)
     regions, tensors = kernel.input_layout(graph.cores)
     for core, t in enumerate(tensors):
         graph.tensor(core, 'x', t['shape'], t['strides'])
     kernel.compile(graph, [replace(r, name='x') for r in regions],
                    rope_width=workload.attention.hidden if workload.rope and name == 'qkv' else 0)
-    return graph.simulate(out/'operators'/key, deadline=deadline)['result']['e2e_cycles']
+    return graph
 
 
 def bind_kernel(workload, hw, name, entry):
@@ -332,24 +339,76 @@ class Chain:
 
 ORDER = ('qkv', 'attention', 'output', 'expand', 'contract')
 
+# Expand both coarse structural-family and within-family budgets, not simulator
+# budgets. Two scoring channels can nominate up to 2 * factor**2 * budget * tiles.
+GEMM_COARSE_FACTOR = 4
 
-def propose_gemm(workload, chip, method, hw, budget, tiles, name):
-    """Proxy proposals of one graph GEMM, in proxy order; ``(entries, scanned)``.
 
-    Graph inputs arrive through layout edges whose cost depends on the
-    neighbours. Rank by the kernel alone and, in the same scan, by kernel
-    plus single-copy distribution, so plans that need no input replication
-    (the ones that make edges cheap) are always proposed too. The proxy does
-    not see the mesh orientation, so one orientation is scanned and each
-    proposal is followed by its transposed twin; only edges and the
-    simulator tell them apart.
-    """
+def _gemm_scoring(workload, chip, method, hw, name):
     problem = workload.problems[name]; proxy = Proxy(chip); m = METHODS[method]
     score = lambda p: (k := proxy.kernel(problem, p), k+proxy.distribution(problem, p))
     bound = lambda q: (k := proxy.lower(problem, q), k+proxy.distribution(problem, q))
     space = lambda skip=None: m.space(problem, skip=skip, direction=roles(workload, name)['direction'], orient=False, **hw)
-    chosen, scanned = diverse(space, score, budget, structure, tiles, bound)
-    ranked = sorted((p for p, _ in chosen), key=lambda p: proxy.kernel(problem, p))
+    return problem, proxy, m, score, bound, space
+
+
+def scan_gemm(workload, chip, method, hw, budget, tiles, name, part=0, parts=1):
+    """One piece of the expanded cheap scan; bounds apply only to this coarse score."""
+    _, _, _, score, bound, space = _gemm_scoring(workload, chip, method, hw, name)
+    return diverse_part(space, score, budget*GEMM_COARSE_FACTOR, structure,
+                        tiles*GEMM_COARSE_FACTOR, bound, part, parts)
+
+
+def _scan_job(workload, chip, method, hw, budget, tiles, parts, job):
+    return scan_gemm(workload, chip, method, hw, budget, tiles, *job, parts)
+
+
+def _schedule_score(workload, chip, hw, name, plan):
+    started = time.monotonic()
+    entry = dict(plan=asdict(plan), native=False, **roles(workload, name))
+    graph = operator_graph(workload, chip, hw, name, entry)
+    compiled = time.monotonic()
+    proxy = ScheduleProxy(chip)
+    value = sum(proxy.tasks(op['raw'], graph.tensors) for op in graph.operations)
+    return dict(kernel=value, compile_seconds=compiled-started, proxy_seconds=time.monotonic()-compiled)
+
+
+def propose_gemm(workload, chip, method, hw, budget, tiles, name, pieces=None, *, workers=1, report=None):
+    """Proxy proposals of one graph GEMM, in proxy order; ``(entries, scanned)``.
+
+    Graph inputs arrive through layout edges whose cost depends on the
+    neighbours. Rank by the kernel alone and, in the same scan, by kernel
+    plus single-copy distribution, to retain alternatives with cheap edges.
+    A cheap scan retains an expanded pool, then compiled schedule scores select
+    the original number of families/tiles. No coarse bound prunes fine scores.
+    One orientation is scanned and each proposal is followed by its transposed twin, so
+    edges and the simulator decide between them (the proxy's XY channel
+    loads could rank them too).
+    ``pieces`` are the ``scan_gemm`` results of a scan split over processes
+    (default: one piece scanned here); merging them is exact.
+    """
+    started = time.monotonic()
+    problem, proxy, m, coarse_score, _, _ = _gemm_scoring(workload, chip, method, hw, name)
+    pieces = pieces or [scan_gemm(workload, chip, method, hw, budget, tiles, name)]
+    pool = merge_diverse([row for rows, _ in pieces for row in rows], coarse_score,
+                         budget*GEMM_COARSE_FACTOR, structure, tiles*GEMM_COARSE_FACTOR)
+    plans = [p for p, _ in pool]
+    job = partial(_schedule_score, workload, chip, hw, name)
+    if workers > 1 and len(plans) > 1:
+        with ProcessPoolExecutor(min(workers, len(plans))) as executor:
+            values = list(executor.map(job, plans))
+    else:
+        values = list(map(job, plans))
+    scores = {p: (v['kernel'], v['kernel']+proxy.distribution(problem, p)) for p, v in zip(plans, values)}
+    chosen = diverse(lambda skip=None: iter(plans), scores.__getitem__, budget, structure, tiles)[0]
+    scanned = sum(n for _, n in pieces)
+    ranked = sorted((p for p, _ in chosen), key=lambda p: scores[p][0])
+    if report is not None:
+        selected = set(ranked)
+        report.update(coarse_factor=GEMM_COARSE_FACTOR, coarse_pool=len(plans), fine_scored=len(values),
+                      selected_before_twins=len(ranked), seconds=time.monotonic()-started,
+                      candidates=[dict(plan=asdict(p), coarse=list(coarse_score(p)), fine=list(scores[p]),
+                                       selected=p in selected, **v) for p, v in zip(plans, values)])
     if m.oriented(hw['cores']):
         ranked = [q for p in ranked for q in (p, replace(p, transpose=True))]
     return [dict(plan=asdict(p), native=False, **roles(workload, name)) for p in ranked], scanned
@@ -372,13 +431,24 @@ def run(workload, chip, out, method='ours', budget=4, workers=WORKERS, tile_min=
         kernels = tune_native(workload, chip, exp.out/'native_tuning', workers)
         options.update({k: [v] for k, v in configuration(kernels, options['attention'][0])['kernels'].items()})
     else:
-        # The GEMM scans are independent: one process each.
+        # The GEMM scans are independent, and each splits exactly into pieces
+        # of whole structural families (``search.diverse_part``): run them all
+        # in one pool of ``workers`` processes and merge per GEMM.
         names = list(workload.problems)
-        with ProcessPoolExecutor(max(1, min(workers, len(names)))) as pool:
-            found = pool.map(partial(propose_gemm, workload, chip, method, hw, budget, tiles), names)
-            for name, (entries, scanned) in zip(names, found):
-                options[name] = entries  # in proxy order, so a deadline cuts the tail
-                report[name] = dict(scanned=scanned, chosen=[e['plan'] for e in entries])
+        parts = max(1, workers//len(names))
+        jobs = [(name, part) for name in names for part in range(parts)]
+        with ProcessPoolExecutor(max(1, min(workers, len(jobs)))) as pool:
+            found = list(pool.map(partial(_scan_job, workload, chip, method, hw, budget, tiles, parts), jobs))
+        for name in names:
+            pieces = [piece for (n, _), piece in zip(jobs, found) if n == name]
+            nomination = {}
+            entries, scanned = propose_gemm(workload, chip, method, hw, budget, tiles, name, pieces,
+                                            workers=workers, report=nomination)
+            options[name] = entries  # in proxy order, so a deadline cuts the tail
+            report[name] = dict(scanned=scanned, chosen=[e['plan'] for e in entries], nomination=nomination)
+            print(f'{name}: {nomination["fine_scored"]} compiled proxy scores -> '
+                  f'{len(entries)} GEMM proposals', flush=True)
+        dump(exp.out/'nomination.json', report)
     chain = Chain(exp, hw, proxy, workers, attention_budget, stop and started+deadline/2, joint)
     options, proposals, configs = chain.propose({k: options[k] for k in ORDER}, width, keep)
     best = min(exp.measure_many(configs, label+('_joint' if joint else '_graph'), workers, stop, abort=False), key=cycles)
