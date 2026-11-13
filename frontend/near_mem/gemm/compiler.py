@@ -38,7 +38,11 @@ def compile_plan(problem, plan, sram_bytes, dram_bytes, overlap=True):
         raise ValueError('Partial-panel spilling requires a separate explicit spill schedule')
     tile_shapes={v:tuple(p.tile[d] for d in axes) for v,axes in DEPENDENCIES.items()}
     tile_bytes={v:prod(shape)*problem.dtype_bytes for v,shape in tile_shapes.items()}
-    needed=p.sram_bytes(problem.dtype_bytes,overlap)
+    # Deferred C accumulation (``Plan.c_accumulate``): a rotating C panel is
+    # sent while the next state already computes into a fresh panel; the
+    # received partial sums are added at the next shift (or before homing).
+    defer=p.defers(sram_bytes,problem.dtype_bytes,overlap)
+    needed=p.sram_bytes(problem.dtype_bytes,overlap,defer)
     if needed>sram_bytes:
         raise ValueError(f'SRAM capacity exceeded: {needed} > {sram_bytes}')
     glob=GlobalLayout(problem,core_count) if p.layout=='global' else None
@@ -82,6 +86,15 @@ def compile_plan(problem, plan, sram_bytes, dram_bytes, overlap=True):
     c_moves=sum(n+h for n,h,l in zip(shifts,home,own.layers) if 'C' in l.tensors)
     holder=[{v:('C1' if v=='C' and c_moves%2 else v,core) for v in DEPENDENCIES} for core in range(core_count)]
     forwards=[]
+    carry=[[] for _ in range(core_count)]  # deferred C shift ops, issued with the next compute
+    pending=[set() for _ in range(core_count)]  # received partial C tiles not yet added
+    settle=[[] for _ in range(core_count)]  # their adds, issued before C leaves after the last state
+    # A/B shift spreading: with several micro-steps per state, a shift's panel
+    # leaves in equal byte shares with each compute of the state before it,
+    # into the receiver's second bank (``stage``); it becomes current (``swap``)
+    # at the next state. Panels are read-only within a state.
+    spread=overlap and not p.land and prod(group)>1
+    state_rows=[]
 
     def done(core):
         """C tiles already materialized in the DRAM block ``core`` now holds."""
@@ -118,9 +131,13 @@ def compile_plan(problem, plan, sram_bytes, dram_bytes, overlap=True):
                 row[core].append(dict(op='zero',tensor='C',key=key,shape=tile_shapes[v]))
             else:row[core].append(access(core,v,key,step=step))
 
-    def exchange(layer_id, tensors, direction=-1, step=None):
+    def exchange(layer_id, tensors, direction=-1, step=None, together=False):
         # Like native ATLAS collectives, the arrival of a step's data is the
         # neighbour synchronisation; no separate ready-credit phase is issued.
+        # Between states, a layer's A/B and C move in separate phases: read-only
+        # A/B panels can leave with the last compute of the state (``pipeline``),
+        # C only after its last update. Homing shifts (``together``) have no
+        # compute to overlap and move all tensors in one phase.
         if land['C'] and 'C' in tensors:
             # A landed C is copied from DRAM: write back its live tiles first.
             flush=phase()
@@ -138,9 +155,41 @@ def compile_plan(problem, plan, sram_bytes, dram_bytes, overlap=True):
                 forwards.append((step,v,forward(layer_id,v,direction)))
                 continue
             old=[dict(c) for c in cache]
+            if v!='C' and spread and not together and state_rows:
+                for src in range(core_count):
+                    dst=own.neighbor(src,layer_id,v,direction);keys=sorted(old[src][v])
+                    total=len(keys)*tile_bytes[v];n=len(state_rows);shares=[total*(j+1)//n-total*j//n for j in range(n)]
+                    first=next(j for j,x in enumerate(shares) if x)
+                    for j,(row,share) in enumerate(zip(state_rows,shares)):
+                        if share:row[src].append(dict(op='send',dst=dst,tensor=v,target='stage',byte_count=share,
+                                                       keys=keys if j==first else []))
+                    carry[dst].append(dict(op='swap',tensor=v))
+                    cache[dst][v]=old[src][v]
+                continue
+            if v=='C' and defer and not together:
+                # Add the partial sums received at the previous shift, send the
+                # panel as a partial and compute the next state into zeroed
+                # tiles; the ops run with that state's first compute.
+                for src in range(core_count):
+                    dst=own.neighbor(src,layer_id,v,direction)
+                    carry[src].extend(dict(op='add',key=key,byte_count=tile_bytes['C']) for key in sorted(pending[src]))
+                    carry[src].append(dict(op='send',dst=dst,tensor='C',target='partial',
+                                           byte_count=len(old[src]['C'])*tile_bytes['C']))
+                    carry[src].append(dict(op='clear',tensor='C'))
+                for src in range(core_count):
+                    dst=own.neighbor(src,layer_id,v,direction)
+                    cache[dst]['C']=old[src]['C'];pending[dst]=set(old[src]['C'])
+                for core in range(core_count):
+                    carry[core].extend(dict(op='zero',tensor='C',key=key,shape=tile_shapes['C'])
+                                       for key in sorted(cache[core]['C']))
+                continue
+            row=phase() if v=='C' and not together and len(tensors)>1 else data
+            if v=='C' and together and any(settle):
+                # A row's adds precede its sends (as in ``reduce_scatter``).
+                for core in range(core_count):row[core][:0]=settle[core];settle[core]=[]
             for src in range(core_count):
                 dst=own.neighbor(src,layer_id,v,direction)
-                data[src].append(dict(op='send',dst=dst,tensor=v,byte_count=len(old[src][v])*tile_bytes[v]))
+                row[src].append(dict(op='send',dst=dst,tensor=v,byte_count=len(old[src][v])*tile_bytes[v]))
                 cache[dst][v]=old[src][v]
 
     def forward(layer_id,v,direction):
@@ -215,7 +264,7 @@ def compile_plan(problem, plan, sram_bytes, dram_bytes, overlap=True):
             if event=='shift':
                 exchange(arg,own.layers[arg].tensors,step=step-1)
                 continue
-            state=arg
+            state=arg;state_rows=[]
             for micro in loop_points(group):
                 triples=[]
                 for core in range(core_count):
@@ -227,10 +276,15 @@ def compile_plan(problem, plan, sram_bytes, dram_bytes, overlap=True):
                     for v,key in (('A',(m,k)),('B',(k,n)),('C',(m,n))):
                         if not shifted[v] or land[v]:prepare(loads,core,v,[key],step)
                         elif key not in cache[core][v]:raise AssertionError(f'Missing resident {v} tile {key}')
-                compute=phase()
+                compute=phase();state_rows.append(compute)
                 for core,index in enumerate(triples):
+                    compute[core].extend(carry[core]);carry[core]=[]
                     compute[core].append(dict(op='gemm',index=index,**({'step':step} if p.land else {})))
             step+=1
+        # The last state's received partial sums complete the panels before
+        # they move home or are stored: the adds lead the next C row.
+        settle=[[dict(op='add',key=key,byte_count=tile_bytes['C']) for key in sorted(keys)] for keys in pending]
+        pending=[set() for _ in range(core_count)]
         next_epoch=epochs[epoch_index+1] if epoch_index+1<len(epochs) else None
         # Restore only live panels. Others will load the next epoch from local
         # homes. C must return to its declared owner before materialization.
@@ -239,7 +293,10 @@ def compile_plan(problem, plan, sram_bytes, dram_bytes, overlap=True):
         for i,count in enumerate(own.homing(state)):
             tensors=tuple(v for v in own.layers[i].tensors if reuse[v])
             for _ in range(count):
-                if tensors:exchange(i,tensors)
+                if tensors:exchange(i,tensors,together=True)
+        if any(settle):
+            row=phase()
+            for core in range(core_count):row[core].extend(settle[core]);settle[core]=[]
         flush=phase()
         for core in range(core_count):
             for v,axes in DEPENDENCIES.items():
@@ -314,11 +371,11 @@ def compile_plan(problem, plan, sram_bytes, dram_bytes, overlap=True):
         phases=pipeline(phases)
     if forwards:
         phases=place_forwards(phases,forwards)
-    return Program(problem,plan,phases,placements,needed,overlap)
+    return Program(problem,plan,phases,placements,needed,overlap,defer)
 
 
 def timed(row):
-    return any(a['op'] not in ('clear','zero','drop') for ops in row for a in ops)
+    return any(a['op'] not in ('clear','zero','drop','swap') for ops in row for a in ops)
 
 
 def place_forwards(phases,forwards):
@@ -349,7 +406,14 @@ def place_forwards(phases,forwards):
 def pipeline(phases):
     """Local, dependency-checked overlap using the allocated second A/B banks."""
     def only(row,kinds):return all(a['op'] in kinds for ops in row for a in ops)
-    def compute(row):return only(row,{'gemm','store','drop'}) and any(a['op']=='gemm' for ops in row for a in ops)
+    # A compute row may carry spread A/B shift shares (``send`` into a stage,
+    # ``swap``); they touch neither C nor the tiles being loaded.
+    def compute(row):return only(row,{'gemm','store','drop','send','swap'}) and any(a['op']=='gemm' for ops in row for a in ops)
+    # A compute row may also carry a deferred C shift (``exchange``): C's adds,
+    # send and fresh zeroed panel, never an A/B send (that bank is in flight).
+    def computing(row):
+        return (only(row,{'gemm','store','drop','add','send','clear','zero'}) and any(a['op']=='gemm' for ops in row for a in ops)
+                and all(a.get('tensor','C')=='C' for ops in row for a in ops if a['op'] in ('send','clear','zero')))
     # Coalesce independent initial panel/operand loads into one native batch.
     work=[]
     for row in phases:
@@ -359,7 +423,7 @@ def pipeline(phases):
     phases=[];i=0
     while i<len(work):
         row=work[i]
-        if i+3<len(work) and compute(row) and only(work[i+1],{'store'}) and only(work[i+2],{'clear','zero','load'}) and only(work[i+3],{'gemm'}):
+        if i+3<len(work) and compute(row) and only(work[i+1],{'store'}) and only(work[i+2],{'clear','zero','load'}) and only(work[i+3],{'gemm','send','swap'}):
             stores,loads,next_compute=work[i+1:i+4]
             valid=True
             for current,save,load in zip(row,stores,loads):
@@ -379,7 +443,7 @@ def pipeline(phases):
     out=[];i=0
     while i<len(phases):
         row=phases[i]
-        if compute(row) and i+1<len(phases):
+        if computing(row) and i+1<len(phases):
             following=phases[i+1]
             if only(following,{'clear','load'}) and all(a.get('tensor') in ('A','B') for ops in following for a in ops):
                 out.append([a+b for a,b in zip(row,following)]);i+=2;continue
@@ -392,9 +456,11 @@ def pipeline(phases):
     merged=[];i=0
     while i<len(out):
         row=out[i]
-        if i+1<len(out) and only(row,{'gemm','send','store','drop'}) and only(out[i+1],{'clear','load'}):
+        if i+1<len(out) and only(row,{'gemm','send','store','drop','add','clear','zero','swap'}) and only(out[i+1],{'clear','load'}):
             incoming={a['tensor'] for ops in row for a in ops if a['op']=='send'}
             loads={a['tensor'] for ops in out[i+1] for a in ops}
+            # A row's own clears are C's (deferred shift); a merged load clears its bank itself.
+            if any(a['op']=='clear' and a['tensor']!='C' for ops in row for a in ops):loads.add('C')
             if loads<= {'A','B'} and not loads & incoming:
                 merged.append([a+b for a,b in zip(row,out[i+1])]);i+=2;continue
         merged.append(row);i+=1

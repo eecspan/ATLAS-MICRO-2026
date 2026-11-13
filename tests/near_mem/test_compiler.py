@@ -1,6 +1,7 @@
 from dataclasses import replace
 from itertools import permutations
 
+from math import prod
 import numpy as np
 import pytest
 
@@ -317,3 +318,45 @@ def test_split_k_reduce_scatter_and_landed_c(plan):
     np.testing.assert_allclose(program.replay(a,b),a@b,atol=1e-11)
     _,manifest=lower_tasks(program,64)
     assert manifest['macs']==16**3
+
+
+@pytest.mark.parametrize('plan',[Plan((1,4,4),(2,2,2),c=(1,4)),Plan((1,4,4),(2,2,2),a=(2,2),c=(2,2)),
+                                Plan((2,2,2),(2,2,2),a=(2,1),b=(1,2),c=(2,1)),
+                                Plan((1,2,4),(2,2,2),c=(1,2),group=(1,2,1),loop='mkn')])
+def test_deferred_c_accumulation_overlaps_the_shift_with_compute(plan):
+    # A deferred C shift leaves with the next state's compute; the received
+    # partial sums are added later. Values match; a waiting C stalls instead.
+    from frontend.near_mem.gemm.lower import lower_tasks
+    problem=Problem(*(s*q*t*2 for s,q,t in zip(plan.ps,plan.periods,plan.tile)))
+    rng=np.random.default_rng(3)
+    a,b=rng.normal(size=(problem.m,problem.k)),rng.normal(size=(problem.k,problem.n))
+    programs={m:compile_plan(problem,replace(plan,c_accumulate=m),1024**2,1024**3) for m in ('wait','defer','auto')}
+    assert programs['auto'].defer and programs['defer'].defer and not programs['wait'].defer
+    assert programs['defer'].sram_bytes>programs['wait'].sram_bytes
+    for m,program in programs.items():
+        np.testing.assert_allclose(program.replay(a,b),a@b,atol=1e-11)
+        assert lower_tasks(program,64)[1]['macs']==prod(problem.shape)
+    together=lambda p:any(any(x['op']=='gemm' for x in ops) and any(x['op']=='send' and x['tensor']=='C' for x in ops)
+                          for row in p.phases for ops in row)
+    assert together(programs['defer']) and not together(programs['wait'])
+    # No room for the third panel: ``auto`` falls back to waiting.
+    tight=replace(plan,c_accumulate='wait').sram_bytes()
+    assert not compile_plan(problem,plan,tight,1024**3).defer
+
+
+@pytest.mark.parametrize('plan',[Plan((1,4,1),(2,2,2),a=(1,4),group=(1,2,1),loop='mkn'),
+                                Plan((2,2,1),(2,2,2),a=(1,2),b=(2,1),group=(2,1,1),loop='nkm'),
+                                Plan((1,4,4),(2,2,2),a=(1,2),c=(1,4),group=(1,2,1),loop='mkn')])
+def test_ab_shift_is_spread_over_the_state_micro_steps(plan):
+    # With several micro-steps per state, an A/B shift leaves in shares with
+    # every compute of the state (into the receiver's stage bank).
+    problem=Problem(*(s*q*t*g*2 for s,q,t,g in zip(plan.ps,plan.periods,plan.tile,plan.group)))
+    program=compile_plan(problem,plan,1024**2,1024**3)
+    rng=np.random.default_rng(5)
+    a,b=rng.normal(size=(problem.m,problem.k)),rng.normal(size=(problem.k,problem.n))
+    np.testing.assert_allclose(program.replay(a,b),a@b,atol=1e-11)
+    shares=[x for row in program.phases for x in row[0] if x['op']=='send' and x.get('target')=='stage']
+    with_compute=[row for row in program.phases if any(x.get('target')=='stage' for x in row[0])
+                  and any(x['op']=='gemm' for x in row[0])]
+    assert shares and len(with_compute)==len([r for r in program.phases if any(x.get('target')=='stage' for x in r[0])])
+    assert any(x['op']=='swap' for row in program.phases for x in row[0])

@@ -14,6 +14,7 @@ class Program:
     placements: list
     sram_bytes: int
     overlap: bool = True
+    defer: bool = False  # deferred C accumulation (``Plan.c_accumulate``)
 
     @property
     def suffix(self):
@@ -75,7 +76,7 @@ class Program:
             padded_a=np.zeros((p.m,p.k),dtype=a.dtype);padded_a[:logical[0],:logical[2]]=a
             padded_b=np.zeros((p.k,p.n),dtype=b.dtype);padded_b[:logical[2],:logical[1]]=b
             a,b=padded_a,padded_b
-        sram=[{v:{} for v in ('A','B','C','partial')} for _ in range(plan.cores)]
+        sram=[{v:{} for v in ('A','B','C','partial','stageA','stageB')} for _ in range(plan.cores)]
         dram=[{} for _ in range(plan.cores)]
         output=np.zeros((p.m,p.n));written=np.zeros((p.m,p.n),dtype=int)
         macs=0
@@ -100,6 +101,10 @@ class Program:
                         m,n,k=op['index']
                         sram[core]['C'][m,n]+=sram[core]['A'][m,k]@sram[core]['B'][k,n]
                         macs+=prod(plan.tile)
+                    elif kind=='swap':  # a spread shift's staged panel becomes current
+                        sram[core][v]=sram[core]['stage'+v];sram[core]['stage'+v]={}
+                    elif kind=='send' and op.get('target')=='stage':
+                        incoming.append((op['dst'],'stage'+v,{tuple(k):sram[core][v][tuple(k)].copy() for k in op['keys']}))
                     elif kind=='send':
                         keys=[tuple(op['key'])] if 'key' in op else list(sram[core][v])
                         incoming.append((op['dst'],op.get('target',v),{k:sram[core][v][k].copy() for k in keys}))
@@ -130,6 +135,7 @@ class Program:
             for core,v,value in incoming:
                 if v=='replica':
                     sram[core]['C'].update(value)
+                elif v.startswith('stage'):sram[core][v].update(value)
                 elif v=='partial':  # received partial sums accumulate per tile
                     for k,x in value.items():sram[core][v][k]=sram[core][v].get(k,0)+x
                 else:sram[core][v]=value

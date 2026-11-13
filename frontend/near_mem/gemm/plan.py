@@ -57,6 +57,11 @@ class Plan:
     # (a TP partition's mesh direction, see ``Ownership``).
     transpose: bool = False
     output: str = 'sharded'
+    # A rotating C panel: 'defer' sends it while the next state computes into a
+    # fresh panel and adds the received partial sums later (a third C panel);
+    # 'wait' stalls the next state until it arrives; 'auto' defers whenever
+    # the third panel fits in SRAM (``defers``).
+    c_accumulate: str = 'auto'
     # Optional zero-padded GEMM extent used by a baseline whose regular mesh
     # mapping cannot cover the logical shape. The padded work is simulated;
     # replay pads A/B with zeros and crops C back to ``logical_shape``.
@@ -133,6 +138,8 @@ class Plan:
         layers=self.layers
         if self.layer_order and sorted(self.layer_order)!=list(range(len(layers))):
             raise ValueError('Layer order must be a permutation of all gcd layers')
+        if self.c_accumulate not in ('auto','defer','wait'):
+            raise ValueError('Unknown C accumulation mode')
         if self.receive not in ('sram_consume','dram_land'):
             raise ValueError('Unknown receive endpoint')
         if self.layout not in ('local','global'):
@@ -151,19 +158,23 @@ class Plan:
                 if type(n) is not int or n<1 or n>(payload if prod(parts)>1 else 1):
                     raise ValueError(f'Invalid {v} panel capacity')
 
-    def sram_bytes(self, dtype=2, overlap=True):
+    def sram_bytes(self, dtype=2, overlap=True, defer=None):
         """Live SRAM: resident panels, double buffers and transit buffers.
 
         C's partial-result scratch is reused as its receive bank. A/B two-bank
         allocation admits prefetch or computation/shift overlap, never both
-        future payloads in one bank.
+        future payloads in one bank. A deferred C rotation (``defer``, default:
+        ``c_accumulate == 'defer'``) holds three C panels: the one sent, the
+        one received and the one being computed.
         """
+        if defer is None:defer=self.c_accumulate=='defer'
         tile={v:prod(self.tile[d] for d in axes)*dtype for v,axes in DEPENDENCIES.items()}
         total=0
         for (v,parts),payload in zip(self.temporal.items(),self.payload_tiles):
             shifted=prod(parts)>1;landed=shifted and self.land
             resident=shifted and not landed
-            total+=(payload if resident else 1)*tile[v]*(2 if overlap or resident or v=='C' else 1)
+            banks=3 if v=='C' and resident and defer and overlap else 2 if overlap or resident or v=='C' else 1
+            total+=(payload if resident else 1)*tile[v]*banks
             total+=3*tile[v]*landed  # a forwarded tile being read, sent and landed
         if overlap and prod(self.c)==1:
             total+=2*tile['C']  # Native double-buffered partial and running outputs.
@@ -174,6 +185,12 @@ class Plan:
             # rank holds the tile it sends, the one it accumulates and the next.
             total=max(total,6*tile['C'])
         return total
+
+    def defers(self, capacity, dtype=2, overlap=True):
+        """Whether the compiler defers C's accumulation (see ``c_accumulate``):
+        only for a C rotated through SRAM by the overlapped pipeline."""
+        if prod(self.c)==1 or self.land or not overlap or self.c_accumulate=='wait':return False
+        return self.c_accumulate=='defer' or self.sram_bytes(dtype,overlap,True)<=capacity
 
     def orders(self):
         """Lazy exact layer orders; a search policy may rank, but must not rename, them."""

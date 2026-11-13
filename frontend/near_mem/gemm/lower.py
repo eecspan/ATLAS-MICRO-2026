@@ -75,7 +75,7 @@ def lower_tasks(program, flit_size, final_ops=None):
     # add separate SRAM-port accesses; this is a shared DMA abstraction, not
     # a claim that Ramulator already charges those accesses. Capacity still
     # includes the staging banks, and implicit accumulator clear is omitted.
-    phases=[row for row in program.phases if any(a['op'] not in ('clear','zero','drop') for ops in row for a in ops)]
+    phases=[row for row in program.phases if any(a['op'] not in ('clear','zero','drop','swap') for ops in row for a in ops)]
     if glob:phases.insert(0,[[] for _ in range(p.cores)])  # room for the first remote reads
     windows = prefetch_windows(phases) if program.overlap and not glob and not p.land else {}
     length=len(phases)+1
@@ -159,7 +159,7 @@ def lower_tasks(program, flit_size, final_ops=None):
                     if op=='copy' and a['key'] in finalized:
                         count=prod(finalized[a['key']]['extent'])*dtype
                     send(i,core,a['dst'],a['tensor'],count)
-                elif op not in ('clear','zero','drop','nop'):raise ValueError(f'Unknown IR operation: {op}')
+                elif op not in ('clear','zero','drop','nop','swap'):raise ValueError(f'Unknown IR operation: {op}')
     while not any(any(x[-1].values()) for x in raw):
         for x in raw:x.pop()
     assert macs==prod(program.problem.shape)
