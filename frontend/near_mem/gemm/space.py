@@ -6,11 +6,15 @@ and exact duplicates are removed, and a selector may ``skip`` whole subtrees.
 overhead, input replication), never a cycle count: final choices are always
 measured by ATLAS. Its DRAM term charges the compiler's exact tile loads and
 stores (``transfers``) through a calibrated channel model of the backend
-(bursts and opened rows of the busiest channel, ``Proxy.access``). Its NoC
+(bursts and opened rows of the busiest channel, ``Proxy.access``), each tile
+at the burst offsets where the compiler places it. Its NoC
 term is the maximum channel load of the compiler's transfers under BookSim's
 XY routing (busiest injection/ejection port or directed link, ``gemm.noc``),
 so ring hops that span several mesh links and colliding routes are charged.
-``Proxy.lower`` bounds that score from below over every completion of a
+Overlap is per step where the compiler fixes it: each shift against the
+micro-steps that hide it, and the pipeline's first loads and last store,
+which nothing hides. ``model.schedule_proxy`` re-ranks a shortlist on the
+compiled schedule. ``Proxy.lower`` bounds that score from below over every completion of a
 partial plan, so selectors prune without changing their result.
 """
 from dataclasses import replace
@@ -195,6 +199,22 @@ def transfers(problem,p):
 
 
 @lru_cache(None)
+def offsets(rows,row_step,cols,col_step,burst):
+    """``((offset, count), ...)``: offsets within a burst of the windows
+    ``i*row_step + j*col_step`` (bytes) for ``i < rows``, ``j < cols``."""
+    def residues(n,step):
+        period=burst//gcd(step,burst);counts={}
+        for i in range(min(n,period)):
+            r=i*step%burst;counts[r]=counts.get(r,0)+n//period+(i<n%period)
+        return counts
+    out={}
+    for a,x in residues(rows,row_step).items():
+        for b,y in residues(cols,col_step).items():
+            out[(a+b)%burst]=out.get((a+b)%burst,0)+x*y
+    return tuple(sorted(out.items()))
+
+
+@lru_cache(None)
 def hbdram_columns(preset):
     """Bursts per DRAM row of an HBDRAM organization preset, read from the
     simulator's own preset table (names do not always encode it)."""
@@ -249,9 +269,10 @@ class Proxy:
     CALIBRATION={'HBDRAM_500Mbps':(37.1,17.2)}
 
     @lru_cache(None)
-    def access(self,run,lines,pitch):
+    def access(self,run,lines,pitch,start=0):
         """Proxy cycles of one batched DRAM access: ``lines`` runs of ``run``
-        contiguous bytes, ``pitch`` bytes apart, from an interleave-aligned base.
+        contiguous bytes, ``pitch`` bytes apart, from ``start`` bytes past an
+        interleave-aligned base.
 
         Requests are bursts; the busiest channel serves its bursts at the
         channel's share of the bandwidth and pays ``row_cost`` per opened row
@@ -260,19 +281,24 @@ class Proxy:
         """
         bits=self.channels.bit_length()-1;low=self.interleave;bursts={};rows={}
         for line in range(lines):
-            start=line*pitch
-            for t in range(start//self.burst,(start+run+self.burst-1)//self.burst):
+            line_start=start+line*pitch
+            for t in range(line_start//self.burst,(line_start+run+self.burst-1)//self.burst):
                 channel=(t>>low)%self.channels;row=(((t>>(low+bits))<<low)|(t&((1<<low)-1)))//self.columns
                 bursts[channel]=bursts.get(channel,0)+1;rows.setdefault(channel,set()).add(row)
         busiest=max(bursts[c]*self.burst/self.channel_bw+self.row_cost*len(rows[c]) for c in bursts)
         return max(run*lines/self.dram_bw,busiest-self.overlap)
 
     def tile(self,rows,cols,shape,column,dtype=2):
-        """Proxy cycles of one ``rows x cols`` window of a 2-D DRAM tensor ``shape``
-        stored row-major (column-major if ``column``) with the shared pitch rule."""
+        """Mean proxy cycles of a ``rows x cols`` window of a 2-D DRAM tensor
+        ``shape`` stored row-major (column-major if ``column``) with the shared
+        pitch rule, over every window position of the tensor: a window whose
+        byte offset is not a burst multiple touches one more burst per line,
+        so each position is charged from its offset within a burst."""
         pitch=max(strides(list(shape),dtype,column));run,lines=(rows,cols) if column else (cols,rows)
-        if run==pitch:run,lines=run*lines,1  # whole rows of an unpadded tensor are one run
-        return self.access(run*dtype,lines,pitch*dtype)
+        extent,depth=(shape[0],shape[1]) if column else (shape[1],shape[0])
+        if run==pitch:return self.access(run*lines*dtype,1,pitch*dtype)  # whole rows of an unpadded tensor are one run
+        starts=offsets(max(1,depth//lines),lines*pitch*dtype,max(1,extent//run),run*dtype,self.burst)
+        return sum(n*self.access(run*dtype,lines,pitch*dtype,s) for s,n in starts)/sum(n for _,n in starts)
 
     def costs(self,problem,p):
         """Proxy cycles of one DRAM tile access per tensor of a plan with a tile
@@ -429,10 +455,18 @@ class Proxy:
             remote=self.remote(p)*(moved['A']*hot['A']+moved['B']*hot['B']+lm*ln*dtype/prod(p.c))
         dram=memory+landed/self.dram_bw
         noc=(volume+remote)/flit;serial/=flit
+        # Pipeline prologue and epilogue: the first compute waits for its
+        # operands (a rotating tensor's resident panel, else one tile; C
+        # starts zeroed) and the last C write follows the last compute, so
+        # neither hides under compute; a DRAM-bound pipeline ends one step
+        # after its last access.
+        shifted={v:prod(parts)>1 and not p.land for v,parts in p.temporal.items()}
+        resident={v:(n if shifted[v] else 1)*cost[v] for v,n in zip(DEPENDENCIES,p.payload_tiles)}
+        ends=resident['A']+resident['B']+resident['C']
         # Native tasks cannot issue fractional micro-iterations. Count their
         # phase overhead and one phase per shift or reduction step.
         # This is a ranking heuristic, never a safe latency lower bound.
-        return max(mac+exposed,dram,noc)+serial+micro_steps+events
+        return max(mac+exposed+ends,dram+step,noc)+serial+micro_steps+events
 
 
     def lower(self,problem,p):
@@ -493,7 +527,15 @@ class Proxy:
         dram=memory+2*(sent+rotated_c)*p.land/self.dram_bw  # volumes are in bytes
         remote=self.remote(p)*(lm*lk/prod(p.a)+lk*ln/prod(p.b)+lm*ln/prod(p.c))*dtype
         flit=self.arch['noc']['flit_size']
-        return max(mac,dram,(volume+remote)/flit)+serial/flit+micro_steps+events
+        ends=step=0
+        if p.tile is not None:
+            # The prologue/epilogue of ``kernel`` at the least resident panels
+            # (groups only enlarge them) and the DRAM-bound pipeline's last step.
+            step=ceil(prod(p.tile)/self.arch['core']['matrix']['mac_num'])
+            cost=self.costs(problem,p)
+            ends=sum((prod(per//parts[i] for i,per in enumerate(p.periods[d] for d in DEPENDENCIES[v]))
+                      if prod(parts)>1 and not p.land else 1)*cost[v] for v,parts in p.temporal.items())
+        return max(mac+ends,dram+step,(volume+remote)/flit)+serial/flit+micro_steps+events
 
 
 def family(p):

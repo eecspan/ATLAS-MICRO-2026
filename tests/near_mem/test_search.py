@@ -194,3 +194,26 @@ def test_split_diverse_scan_is_exact(tmp_path):
             merged=merge_diverse([r for rows,_ in pieces for r in rows],pair,2,structure,2)
             assert merged==whole,(m.name,parts)
             assert parts>1 or pieces[0][1]==count
+
+
+def test_tile_cost_averages_every_window_offset(tmp_path):
+    # A window whose byte offset is not a burst multiple touches one more
+    # burst per line; the mean over the tensor's windows charges that.
+    from frontend.near_mem.gemm.space import Proxy,offsets
+    from frontend.near_mem.sim import make_hardware
+    assert offsets(3,1000,5,224,128)==tuple(sorted(__import__('collections').Counter(
+        (i*1000+j*224)%128 for i in range(3) for j in range(5)).items()))
+    proxy=Proxy(make_hardware(tmp_path/'hw',4,64))
+    aligned=proxy.tile(64,128,(64,1024),False);unaligned=proxy.tile(64,112,(64,1792),False)
+    assert unaligned>proxy.access(224,64,3584)  # half its windows start mid-burst
+    assert aligned==proxy.access(256,64,2048)
+
+
+def test_kernel_charges_pipeline_fill_and_drain(tmp_path):
+    from frontend.near_mem.gemm.space import Proxy
+    from frontend.near_mem.sim import make_hardware
+    proxy=Proxy(make_hardware(tmp_path/'hw',4,64));problem=Problem(64,64,512)
+    plan=Plan((1,1,4),(64,64,128));cost=proxy.costs(problem,plan)
+    step=-(-64*64*128//proxy.mac)
+    # Compute-bound: one k-step per core, so its operands and output are exposed.
+    assert proxy.kernel(problem,plan)>=step+cost['A']+cost['B']+cost['C']
