@@ -90,24 +90,48 @@ def unique(regions):
     return result
 
 
-def transfers(source, target):
-    """Partition destination exactly once; prefer a local replica when present."""
+def transfers(source, target, order=None):
+    """Partition destination exactly once; prefer a local replica when present.
+
+    ``order`` (``sources_by_core(source)``) may be shared by repeated calls
+    over one source."""
+    order = order or sources_by_core(source)
     result = []
     for dst in target:
         missing = [dst]
-        for src in sorted(source, key=lambda x: (x.core != dst.core, abs(x.core-dst.core), x.core)):
+        top, bottom, left, right = dst.row, dst.row+dst.rows, dst.col, dst.col+dst.cols
+        for src in order(dst.core):
+            sr, sc = src.row, src.col; er, ec = sr+src.rows, sc+src.cols
+            if sr >= bottom or er <= top or sc >= right or ec <= left:
+                continue  # misses the destination, hence every missing piece
             remaining = []
             for part in missing:
-                overlap = part.intersect(src)
-                if overlap is not None:
-                    result.append((src.crop(overlap.row, overlap.col, overlap.rows, overlap.cols), overlap))
-                remaining.extend(part.subtract(src))
+                r, c = max(part.row, sr), max(part.col, sc)
+                nr, nc = min(part.row+part.rows, er)-r, min(part.col+part.cols, ec)-c
+                if min(nr, nc) <= 0:
+                    remaining.append(part)
+                    continue
+                overlap = part.crop(r, c, nr, nc)
+                result.append((src.crop(r, c, nr, nc), overlap))
+                pr, pc, h, w = part.row, part.col, part.rows, part.cols
+                pieces = [(pr, pc, r-pr, w), (r+nr, pc, pr+h-r-nr, w), (r, pc, nr, c-pc), (r, c+nc, nr, pc+w-c-nc)]
+                remaining.extend(part.crop(*p) for p in pieces if min(p[2:]) > 0)
             missing = remaining
             if not missing:
                 break
         if missing:
             raise ValueError(f'Uncovered graph input: {missing[0]}')
     return result
+
+
+def sources_by_core(source):
+    """``core -> sources`` in ``transfers`` preference: local first, then by core distance."""
+    cache = {}
+    def order(core):
+        if core not in cache:
+            cache[core] = sorted(source, key=lambda x: (x.core != core, abs(x.core-core), x.core))
+        return cache[core]
+    return order
 
 
 def traffic(source, target, alias='bind', side=None):
@@ -205,9 +229,9 @@ def conversion(source, target, side):
     one slab by unicast and the linear all-gather completes the block. All
     other targets are unicast from their nearest copy.
     """
-    pairs = []; pending = defaultdict(list); groups = []
+    pairs = []; pending = defaultdict(list); groups = []; order = sources_by_core(source)
     for t in target:
-        own = transfers(source, [t])
+        own = transfers(source, [t], order)
         if all(s.core == t.core for s, _ in own):
             pairs += own
         else:
@@ -216,10 +240,10 @@ def conversion(source, target, side):
         if len(members) > 1 and side and subgrid(members, side) and max(members[0].rows, members[0].cols) >= len(members):
             groups.append(members)
         else:
-            pairs += transfers(source, members)
+            pairs += transfers(source, members, order)
     for lines in gather_lines(groups, side)[:1]:
         for members, slabs in lines:
-            pairs += transfers(source, [m.crop(*box) for m, box in zip(members, slabs)])
+            pairs += transfers(source, [m.crop(*box) for m, box in zip(members, slabs)], order)
     return pairs, groups
 
 

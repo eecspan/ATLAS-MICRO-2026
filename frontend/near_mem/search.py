@@ -147,17 +147,21 @@ def merge_diverse(rows, score, budget, family, per=1):
     return diverse(lambda skip=None: iter(ordered), score, budget, family, per)[0]
 
 
-def beam(decisions, cost, width=64, keep=8):
+def beam(decisions, cost, width=64, keep=8, before=None):
     """Beam search over a sequence of discrete decisions.
 
     ``decisions`` lists ``(name, options)``; ``cost(name, option, partial)``
     is the incremental cost of choosing ``option`` given the earlier choices
     in ``partial`` (so pairwise terms are charged once, at the later one).
+    ``before(name, options, partials)``, if given, sees every pair a step
+    will cost first (e.g. to evaluate them in parallel).
     Exact when ``width`` covers every partial assignment. Returns the
     ``keep`` cheapest complete assignments as ``[(cost, {name: option})]``.
     """
     states = [(0.0, {})]
     for name, options in decisions:
+        if before:
+            before(name, options, [s for _, s in states])
         states = heapq.nsmallest(width, ((c+cost(name, o, s), {**s, name: o}) for c, s in states for o in options),
                                  key=lambda x: x[0])
     return states[:keep]

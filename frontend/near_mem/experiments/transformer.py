@@ -33,7 +33,6 @@ from dataclasses import asdict, replace
 from functools import partial
 import hashlib
 import json
-from math import isqrt
 from subprocess import TimeoutExpired
 from pathlib import Path
 import time
@@ -42,16 +41,16 @@ from ..gemm.plan import load
 from ..gemm.space import Proxy, structure
 from ..methods import METHODS, target
 from ..output import variants as output_variants
-from ..model.attention import AttentionPlan, KVLayout
+from ..model.attention import AttentionPlan, KVLayout, build_attention
 from ..model.attention_proxy import AttentionProxy
 from ..model.schedule_proxy import ScheduleProxy
 from ..model.kernels import Gemm
-from ..model.transformer import (Workload, build, configuration, decode_configuration, edge_regions, edges,
-                                 port, roles, tune_native)
+from ..model.transformer import (Workload, build, configuration, edges, norm_score, norms, port, relayout,
+                                 roles, tune_native)
 from ..search import beam, diverse, diverse_part, measure_all, merge_diverse
 from ..resources import breakdown, report as resource_report
 from ..sim import WORKERS, dump, fingerprint
-from ..tasks import Graph, traffic
+from ..tasks import Graph
 from . import attention as standalone_attention
 
 cycles = lambda row: row['result']['e2e_cycles']
@@ -75,13 +74,18 @@ def simulate_operator(workload, chip, hw, out, name, choice, deadline=None):
 
 def operator_graph(workload, chip, hw, name, choice):
     """The same placed-input GEMM, including fused work, for scoring and measurement."""
+    return compiled_operator(workload, chip, hw, name, choice)[0]
+
+
+def compiled_operator(workload, chip, hw, name, choice):
+    """``(graph, kernel)`` of ``operator_graph``; the kernel knows its boundary layouts."""
     graph = Graph(chip); kernel = bind_kernel(workload, hw, name, choice).prepare(graph, name)
     regions, tensors = kernel.input_layout(graph.cores)
     for core, t in enumerate(tensors):
         graph.tensor(core, 'x', t['shape'], t['strides'])
     kernel.compile(graph, [replace(r, name='x') for r in regions],
                    rope_width=workload.attention.hidden if workload.rope and name == 'qkv' else 0)
-    return graph
+    return graph, kernel
 
 
 def bind_kernel(workload, hw, name, entry):
@@ -192,19 +196,91 @@ def token(choice):
     return json.dumps(asdict(choice) if isinstance(choice, AttentionPlan) else choice, sort_keys=True)
 
 
+def _relayout_job(workload, chip, request):
+    if request[0] == 'norm':
+        return norm_score(workload, chip, request[3])
+    return relayout(workload, chip, *request)
+
+
+class Edges:
+    """Compiled-schedule scores of layout edges, one per distinct ``(target
+    port, alias, source layout, target layout)``, and of RMSNorms
+    ``('norm', operator, None, layout)``; ``prepare`` scores many in
+    parallel. Port layouts are interned once per list object (ports are cached
+    lists), so lookups do not rehash thousands of regions."""
+    def __init__(self, workload, chip, workers):
+        self.workload = workload; self.chip = chip; self.workers = workers; self.scores = {}
+        self.ids = {}; self.layouts = {}
+
+    def layout(self, regions):
+        found = self.ids.get(id(regions))
+        if found is None or found[0] is not regions:
+            found = (regions, self.layouts.setdefault(tuple(regions), len(self.layouts)))
+            self.ids[id(regions)] = found  # holds ``regions``, so its id stays unique
+        return found[1]
+
+    def key(self, dst, alias, source, target):
+        return dst, alias, None if source is None else self.layout(source), self.layout(target)
+
+    def prepare(self, requests):
+        todo = list({self.key(*r): r for r in requests if self.key(*r) not in self.scores}.items())
+        if not todo:
+            return
+        job = partial(_relayout_job, self.workload, self.chip)
+        if self.workers > 1 and len(todo) > 1:
+            with ProcessPoolExecutor(min(self.workers, len(todo))) as pool:
+                # Costs vary by orders of magnitude between edge kinds: small chunks balance them.
+                values = list(pool.map(job, [r for _, r in todo], chunksize=max(1, min(8, len(todo)//(16*self.workers)))))
+        else:
+            values = [job(r) for _, r in todo]
+        self.scores.update(zip((k for k, _ in todo), values))
+
+    def __call__(self, dst, alias, source, target):
+        key = self.key(dst, alias, source, target)
+        if key not in self.scores:
+            self.prepare([(dst, alias, source, target)])
+        return self.scores[key]
+
+
+def joint_search(workload, options, node, port_of, edge_score, width, keep):
+    """Beam search over the layer's operator chain: ``node(name, choice)`` plus
+    the edges between chosen ports. The ``keep`` best ``(score, {name: choice})``.
+    Each step first scores, in parallel, the edges it will charge. An
+    RMSNorm (``norms``) is charged with the operator whose output it reads."""
+    graph_edges = [(s, d, alias, s.split('.')[0], d.split('.')[0]) for s, d, alias in edges(workload)]
+    def charged(name, chosen):
+        pick = lambda o: None if o == 'kv' else chosen.get(o, False)
+        # Charge each edge once, when its later endpoint is chosen.
+        found = [(dst, alias, port_of(src, pick(a)), port_of(dst, pick(b))) for src, dst, alias, a, b in graph_edges
+                 if name in (a, b) and pick(a) is not False and pick(b) is not False]
+        return found+[('norm', op, None, port_of(src, chosen[name])) for src, op in norms(workload)
+                      if src.split('.')[0] == name]
+    def cost(name, index, partial):
+        chosen = {**{o: options[o][i] for o, i in partial.items()}, name: options[name][index]}
+        return node(name, chosen[name])+sum(edge_score(*e) for e in charged(name, chosen))
+    def before(name, indices, partials):
+        edge_score.prepare([e for partial in partials for i in indices
+                            for e in charged(name, {**{o: options[o][j] for o, j in partial.items()},
+                                                    name: options[name][i]})])
+    ranked = beam([(name, range(len(choices))) for name, choices in options.items()], cost, width, keep,
+                  before if hasattr(edge_score, 'prepare') else None)
+    return [(score, {name: options[name][i] for name, i in chosen.items()}) for score, chosen in ranked]
+
+
 class Chain:
     """Joint proxy of a graph: standalone operator cycles plus layout-edge scores.
 
     Each option is simulated once with its inputs already in its own layout;
-    each layout edge is scored from its exact per-core traffic.
+    each layout edge is scored on its compiled conversion tasks (``Edges``).
     """
-    def __init__(self, exp, hw, proxy, workers, attention_budget=32, deadline=None, boundary=True):
-        self.exp = exp; self.hw = hw; self.proxy = proxy; self.workers = workers; self.deadline = deadline
+    def __init__(self, exp, hw, workers, attention_budget=32, deadline=None, boundary=True, edges=None):
+        self.exp = exp; self.hw = hw; self.workers = workers; self.deadline = deadline
         self.boundary = boundary
-        self.cycles = {}; self.ports = {}; self.edge_scores = {}
+        self.cycles = {}; self.ports = {}
+        self.edges = edges or Edges(exp.workload, exp.chip, workers)
         self.kernels = {}
         self.attention_proxy = AttentionProxy(exp.chip); self.attention_budget = attention_budget
-        self.attention_report = {}
+        self.attention_report = {}; self.attention_selected = None
 
     def kernel(self, name, entry):
         return bind_kernel(self.exp.workload, self.hw, name, entry)
@@ -236,29 +312,37 @@ class Chain:
         for i, value in rows:
             self.cycles[jobs[i][0], token(jobs[i][1])] = value
 
+    def boundaries(self, name, choice):
+        """The boundary variants of an option a joint search may choose from."""
+        if not self.boundary:
+            return [choice]  # the dataflow's own boundary
+        if name == 'attention':
+            return output_variants(choice)
+        if choice['native']:
+            return [choice]  # upstream checker retains its original collective
+        return [dict(choice,plan=asdict(p)) for p in output_variants(load(choice['plan']))]
+
+    def select_attention(self, plans):
+        """The method's attention plans with their boundary variants, cut by the
+        attention proxy to its budget; computed once per run."""
+        if self.attention_selected is None:
+            candidates = list({token(c): c for p in plans for c in self.boundaries('attention', p)}.values())
+            self.attention_selected = self.attention_proxy.select(self.exp.workload.attention, candidates,
+                                                                  self.attention_budget, placed=True,
+                                                                  workers=self.workers)
+            self.attention_report = dict(plans=len(candidates), measured=len(self.attention_selected),
+                                         proxy_budget=self.attention_budget)
+        return self.attention_selected
+
     def prepare(self, options):
         """Measure every distinct option once; drop illegal and behaviourally equal options."""
-        def boundaries(name, choice):
-            if not self.boundary:
-                return [choice]  # the dataflow's own boundary
-            if name == 'attention':
-                return output_variants(choice)
-            if choice['native']:
-                return [choice]  # upstream checker retains its original collective
-            return [dict(choice,plan=asdict(p)) for p in output_variants(load(choice['plan']))]
-        options = {name:[c for choice in choices for c in boundaries(name,choice)]
-                   for name,choices in options.items()}
+        options = {name: (self.select_attention(choices) if name == 'attention' else
+                          [c for choice in choices for c in self.boundaries(name, choice)])
+                   for name, choices in options.items()}
         self.compile(options)
         legal = lambda name, c: name == 'attention' or self.bound(name, c) is not None
         options = {name: list({token(c): c for c in choices if legal(name, c)}.values())
                    for name, choices in options.items()}
-        if 'attention' in options:
-            candidates = options['attention']
-            options['attention'] = self.attention_proxy.select(self.exp.workload.attention,candidates,
-                                                               self.attention_budget,placed=True,
-                                                               workers=self.workers)
-            self.attention_report = dict(plans=len(candidates),measured=len(options['attention']),
-                                         proxy_budget=self.attention_budget)
         # Options are in proxy order. Each operator's first option always
         # completes; the others are measured until the deadline, then dropped.
         # Interleave operators by rank so a deadline cuts every operator's tail.
@@ -287,30 +371,10 @@ class Chain:
                 self.ports[key] = self.bound(op, choice)[name.endswith('.C')]
         return self.ports[key]
 
-    def edge(self, src, dst, alias, a, b):
-        """Score of one layout edge; it depends only on the two port layouts,
-        so options sharing a layout share one ``traffic`` evaluation."""
-        source, target = self.port(src, a), self.port(dst, b)
-        key = (dst, alias, tuple(source), tuple(target))
-        if key not in self.edge_scores:
-            regions = edge_regions(self.exp.workload, self.hw['cores'], dst, source, target)
-            self.edge_scores[key] = self.proxy.edge(traffic(*regions, alias, isqrt(self.hw['cores'])))
-        return self.edge_scores[key]
-
     def search(self, options, width, keep):
         """The ``keep`` best distinct complete assignments ``{operator: choice}`` by joint proxy."""
-        graph_edges = [(s, d, alias, s.split('.')[0], d.split('.')[0]) for s, d, alias in edges(self.exp.workload)]
-        def cost(name, index, partial):
-            chosen = {**{o: options[o][i] for o, i in partial.items()}, name: options[name][index]}
-            pick = lambda o: None if o == 'kv' else chosen.get(o, False)
-            value = self.cycles[name, token(chosen[name])]
-            # Charge each edge once, when its later endpoint is chosen.
-            for src, dst, alias, a, b in graph_edges:
-                if name in (a, b) and pick(a) is not False and pick(b) is not False:
-                    value += self.edge(src, dst, alias, pick(a), pick(b))
-            return value
-        ranked = beam([(name, range(len(choices))) for name, choices in options.items()], cost, width, keep)
-        return [(score, {name: options[name][i] for name, i in chosen.items()}) for score, chosen in ranked]
+        return joint_search(self.exp.workload, options, lambda name, c: self.cycles[name, token(c)],
+                            self.port, self.edges, width, keep)
 
     def neighbours(self, options, count):
         """``row -> {decision: alternatives}``: per decision, the ``count`` options of
@@ -363,17 +427,39 @@ def _scan_job(workload, chip, method, hw, budget, tiles, parts, job):
     return scan_gemm(workload, chip, method, hw, budget, tiles, *job, parts)
 
 
-def _schedule_score(workload, chip, hw, name, plan):
+def _schedule_score(workload, chip, hw, name, plan, ports=False):
+    """Compiled schedule score of one GEMM plan; with ``ports`` also its
+    ``(A, C)`` boundary layouts; None if the plan does not compile."""
     started = time.monotonic()
     entry = dict(plan=asdict(plan), native=False, **roles(workload, name))
-    graph = operator_graph(workload, chip, hw, name, entry)
+    try:
+        graph, kernel = compiled_operator(workload, chip, hw, name, entry)
+    except ValueError:
+        if ports:
+            return None
+        raise
     compiled = time.monotonic()
     proxy = ScheduleProxy(chip)
     value = sum(proxy.tasks(op['raw'], graph.tensors) for op in graph.operations)
-    return dict(kernel=value, compile_seconds=compiled-started, proxy_seconds=time.monotonic()-compiled)
+    out = dict(kernel=value, compile_seconds=compiled-started, proxy_seconds=time.monotonic()-compiled)
+    if ports:
+        out['ports'] = (kernel.input_layout(graph.cores)[0], kernel.output_layout(graph.cores))
+    return out
 
 
-def propose_gemm(workload, chip, method, hw, budget, tiles, name, pieces=None, *, workers=1, report=None):
+def _attention_score(workload, chip, plan):
+    graph = build_attention(workload.attention, chip, plan, True); proxy = ScheduleProxy(chip)
+    return sum(proxy.tasks(op['raw'], graph.tensors) for op in graph.operations)
+
+
+def _pool_map(job, items, workers):
+    if workers > 1 and len(items) > 1:
+        with ProcessPoolExecutor(min(workers, len(items))) as executor:
+            return list(executor.map(job, items, chunksize=max(1, min(4, len(items)//(16*workers)))))
+    return list(map(job, items))
+
+
+def propose_gemm(workload, chip, method, hw, budget, tiles, name, pieces=None, *, workers=1, report=None, pool=None):
     """Proxy proposals of one graph GEMM, in proxy order; ``(entries, scanned)``.
 
     Graph inputs arrive through layout edges whose cost depends on the
@@ -382,36 +468,105 @@ def propose_gemm(workload, chip, method, hw, budget, tiles, name, pieces=None, *
     A cheap scan retains an expanded pool, then compiled schedule scores select
     the original number of families/tiles. No coarse bound prunes fine scores.
     One orientation is scanned and each proposal is followed by its transposed twin, so
-    edges and the simulator decide between them (the proxy's XY channel
-    loads could rank them too).
+    edges and the simulator decide between them.
     ``pieces`` are the ``scan_gemm`` results of a scan split over processes
-    (default: one piece scanned here); merging them is exact.
+    (default: one piece scanned here); merging them is exact. A ``pool`` list
+    receives every compiled ``(plan, score, (A, C) layouts)`` of the pool and
+    of the transposed twin of each family's best plan, for ``nominate_joint``.
     """
     started = time.monotonic()
     problem, proxy, m, coarse_score, _, _ = _gemm_scoring(workload, chip, method, hw, name)
     pieces = pieces or [scan_gemm(workload, chip, method, hw, budget, tiles, name)]
-    pool = merge_diverse([row for rows, _ in pieces for row in rows], coarse_score,
-                         budget*GEMM_COARSE_FACTOR, structure, tiles*GEMM_COARSE_FACTOR)
-    plans = [p for p, _ in pool]
-    job = partial(_schedule_score, workload, chip, hw, name)
-    if workers > 1 and len(plans) > 1:
-        with ProcessPoolExecutor(min(workers, len(plans))) as executor:
-            values = list(executor.map(job, plans))
-    else:
-        values = list(map(job, plans))
+    merged = merge_diverse([row for rows, _ in pieces for row in rows], coarse_score,
+                           budget*GEMM_COARSE_FACTOR, structure, tiles*GEMM_COARSE_FACTOR)
+    plans = [p for p, _ in merged]
+    job = partial(_schedule_score, workload, chip, hw, name, ports=pool is not None)
+    values = found = _pool_map(job, plans, workers)
+    plans, values = [p for p, v in zip(plans, values) if v is not None], [v for v in values if v is not None]
+    if pool is not None:
+        pool.extend((p, v['kernel'], v['ports']) for p, v in zip(plans, values))
+        if m.oriented(hw['cores']):
+            # A structural family fixes the boundary layouts up to tiles: the
+            # transposed twin of each family's best plan stands for its layouts.
+            best = {}
+            for p, v in zip(plans, values):
+                if structure(p) not in best or v['kernel'] < best[structure(p)][1]:
+                    best[structure(p)] = (p, v['kernel'])
+            twins = [replace(p, transpose=True) for p, _ in best.values()]
+            twin_values = _pool_map(job, twins, workers); found = values+twin_values
+            pool.extend((p, v['kernel'], v['ports']) for p, v in zip(twins, twin_values) if v is not None)
     scores = {p: (v['kernel'], v['kernel']+proxy.distribution(problem, p)) for p, v in zip(plans, values)}
     chosen = diverse(lambda skip=None: iter(plans), scores.__getitem__, budget, structure, tiles)[0]
     scanned = sum(n for _, n in pieces)
     ranked = sorted((p for p, _ in chosen), key=lambda p: scores[p][0])
     if report is not None:
         selected = set(ranked)
-        report.update(coarse_factor=GEMM_COARSE_FACTOR, coarse_pool=len(plans), fine_scored=len(values),
+        report.update(coarse_factor=GEMM_COARSE_FACTOR, coarse_pool=len(plans), fine_scored=len(found),
                       selected_before_twins=len(ranked), seconds=time.monotonic()-started,
                       candidates=[dict(plan=asdict(p), coarse=list(coarse_score(p)), fine=list(scores[p]),
-                                       selected=p in selected, **v) for p, v in zip(plans, values)])
+                                       selected=p in selected, **{k: x for k, x in v.items() if k != 'ports'})
+                                  for p, v in zip(plans, values)])
     if m.oriented(hw['cores']):
         ranked = [q for p in ranked for q in (p, replace(p, transpose=True))]
     return [dict(plan=asdict(p), native=False, **roles(workload, name)) for p in ranked], scanned
+
+
+def nominate_joint(chain, pools, attention, width, keep):
+    """GEMM options the joint proxy wants, beyond each GEMM's kernel-ranked proposals.
+
+    A GEMM affects its neighbours only through its boundary layouts, so among
+    pool plans with equal ``(A, C)`` layouts the one of least compiled score
+    is best in every graph; every distinct layout keeps its best plan (output
+    contracts of reductions included). A beam over the layer chain then
+    scores each graph by compiled operator scores plus compiled layout edges
+    (no simulation), and the GEMM options of its ``keep`` best graphs are
+    returned, in graph order, as ``{name: [entry]}`` with a report.
+    """
+    started = time.monotonic(); exp = chain.exp; workload = exp.workload; hw = chain.hw; workers = chain.workers
+    entry = lambda name, p: dict(plan=asdict(p), native=False, **roles(workload, name))
+    best = {}
+    def keep_best(name, plan, value, ports):
+        key = (name, tuple(ports[0]), tuple(ports[1]))
+        if key not in best or value < best[key][1]:
+            best[key] = (plan, value, ports)
+    for name, rows in pools.items():
+        for plan, value, ports in rows:
+            keep_best(name, plan, value, ports)
+    # Output contracts of each layout's best plan (reductions only).
+    variants = [(name, v) for (name, _, _), (p, _, _) in list(best.items())
+                for v in output_variants(p) if v != p]
+    for (name, v), found in zip(variants, _pool_map(partial(_variant_job, workload, exp.chip, hw), variants, workers)):
+        if found is not None:
+            keep_best(name, v, found['kernel'], found['ports'])
+    options = {name: [] for name in pools}; node = {}; ports = {}
+    for (name, _, _), (p, value, layout) in best.items():
+        e = entry(name, p); options[name].append(e); node[name, token(e)] = value; ports[name, token(e)] = layout
+    plans = chain.select_attention(attention)
+    for plan, value in zip(plans, _pool_map(partial(_attention_score, workload, exp.chip), plans, workers)):
+        node['attention', token(plan)] = value
+    options = {name: options[name] if name != 'attention' else plans for name in ORDER}
+    def port_of(name, choice):
+        op = name.split('.')[0]
+        if op in ('attention', 'kv'):
+            return chain.port(name, choice)
+        return ports[op, token(choice)][name.endswith('.C')]
+    graphs = joint_search(workload, options, lambda name, c: node[name, token(c)], port_of, chain.edges, width, keep)
+    picked = {name: [] for name in pools}
+    for _, chosen in graphs:
+        for name in pools:
+            base = dict(chosen[name], plan=asdict(replace(load(chosen[name]['plan']), output='sharded')))
+            if all(token(base) != token(e) for e in picked[name]):
+                picked[name].append(base)
+    report = dict(seconds=time.monotonic()-started, layouts={name: len(options[name]) for name in pools},
+                  attention=len(plans), edges=len(chain.edges.scores),
+                  graphs=[dict(score=s, configuration=dict(kernels={k: c[k] for k in pools}, attention=asdict(c['attention'])))
+                          for s, c in graphs])
+    return picked, report
+
+
+def _variant_job(workload, chip, hw, item):
+    name, plan = item
+    return _schedule_score(workload, chip, hw, name, plan, ports=True)
 
 
 def run(workload, chip, out, method='ours', budget=4, workers=WORKERS, tile_min=8, passes=2, width=64, keep=8, tiles=2,
@@ -426,7 +581,8 @@ def run(workload, chip, out, method='ours', budget=4, workers=WORKERS, tile_min=
     options = {'attention': METHODS[method].attention(layout, hw['sram'])}
     if not options['attention']:
         raise ValueError('No SRAM-feasible attention plan')
-    proxy = Proxy(chip); report = {}
+    report = {}
+    chain = Chain(exp, hw, workers, attention_budget, stop and started+deadline/2, joint)
     if METHODS[method].native:
         kernels = tune_native(workload, chip, exp.out/'native_tuning', workers)
         options.update({k: [v] for k, v in configuration(kernels, options['attention'][0])['kernels'].items()})
@@ -439,17 +595,27 @@ def run(workload, chip, out, method='ours', budget=4, workers=WORKERS, tile_min=
         jobs = [(name, part) for name in names for part in range(parts)]
         with ProcessPoolExecutor(max(1, min(workers, len(jobs)))) as pool:
             found = list(pool.map(partial(_scan_job, workload, chip, method, hw, budget, tiles, parts), jobs))
+        pools = {}
         for name in names:
             pieces = [piece for (n, _), piece in zip(jobs, found) if n == name]
-            nomination = {}
+            nomination = {}; pools[name] = [] if joint else None
             entries, scanned = propose_gemm(workload, chip, method, hw, budget, tiles, name, pieces,
-                                            workers=workers, report=nomination)
+                                            workers=workers, report=nomination, pool=pools[name])
             options[name] = entries  # in proxy order, so a deadline cuts the tail
             report[name] = dict(scanned=scanned, chosen=[e['plan'] for e in entries], nomination=nomination)
             print(f'{name}: {nomination["fine_scored"]} compiled proxy scores -> '
                   f'{len(entries)} GEMM proposals', flush=True)
+        if joint:
+            # Layouts that only pay off at the boundaries: the GEMM options of
+            # the best graphs under the compiled proxy join the proposals.
+            picked, report['joint'] = nominate_joint(chain, pools, options['attention'], width, keep)
+            for name, extra in picked.items():
+                known = {token(e) for e in options[name]}
+                added = [e for e in extra if token(e) not in known]
+                options[name] = options[name]+added; report[name]['joint_added'] = [e['plan'] for e in added]
+            print('joint proxy nomination: ' + ', '.join(f'{n} +{len(report[n]["joint_added"])}' for n in names)
+                  + f' ({report["joint"]["seconds"]:.0f} s, {report["joint"]["edges"]} edges)', flush=True)
         dump(exp.out/'nomination.json', report)
-    chain = Chain(exp, hw, proxy, workers, attention_budget, stop and started+deadline/2, joint)
     options, proposals, configs = chain.propose({k: options[k] for k in ORDER}, width, keep)
     best = min(exp.measure_many(configs, label+('_joint' if joint else '_graph'), workers, stop, abort=False), key=cycles)
     if joint:

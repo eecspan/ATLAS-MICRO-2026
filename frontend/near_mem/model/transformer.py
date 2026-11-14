@@ -88,11 +88,55 @@ def edges(workload):
             ('output.C', 'expand.A', 'bind'), ('expand.C', 'contract.A', 'bind'), ('output.C', 'contract.C', 'none')]
 
 
+def norms(workload):
+    """Layout-dependent work outside the GEMMs/attention: ``(port, operator)``.
+    Each RMSNorm keeps its producer's layout, so its cost follows that port."""
+    return [('contract.C', 'norm_attention'), ('output.C', 'norm_ffn')]
+
+
+def norm_score(workload, chip, source, proxy=None):
+    """Score of an RMSNorm over activations laid out as ``source``, on its compiled tasks."""
+    from .schedule_proxy import ScheduleProxy
+    graph = Graph(chip); p = workload.attention
+    rmsnorm(graph, 'norm', materialize(graph, 'source', source), workload.batch*workload.queries, p.hidden)
+    proxy = proxy or ScheduleProxy(chip)
+    return float(sum(proxy.tasks(op['raw'], graph.tensors) for op in graph.operations))
+
+
 def edge_regions(workload, cores, target, source, destination):
     """(source, target) regions of an edge; the KV append moves only new K/V columns."""
     if target == 'kv':
         return KVLayout(workload.attention, cores).appended(source, destination)
     return source, destination
+
+
+def relayout(workload, chip, target, alias, source, destination, proxy=None):
+    """Score of one layout edge on its compiled conversion tasks.
+
+    A two-tensor graph holds ``source`` and runs ``Graph.convert`` into the
+    ``destination`` pieces the consumer cannot read in place (``alias`` as in
+    ``tasks.traffic``); ``proxy`` (a ``ScheduleProxy``) scores its tasks.
+    """
+    from collections import defaultdict
+    from ..tasks import transfers
+    from .schedule_proxy import ScheduleProxy
+    graph = Graph(chip)
+    source, destination = edge_regions(workload, graph.cores, target, source, destination)
+    if alias == 'cover':
+        destination = [t for t in destination if not any(
+            r.core == t.core and (x := r.intersect(t)) is not None and x.area == t.area for r in source)]
+    elif alias == 'bind':
+        names = defaultdict(set)
+        for s, d in transfers(source, destination):
+            same = s.core == d.core and (s.local_row, s.local_col) == (d.local_row, d.local_col)
+            names[d.core].add(s.name if same else None)
+        bound = {core for core, n in names.items() if len(n) == 1 and None not in n}
+        destination = [t for t in destination if t.core not in bound]
+    if not destination:
+        return 0.0
+    graph.convert('edge', materialize(graph, 'source', source), materialize(graph, 'target', destination))
+    proxy = proxy or ScheduleProxy(chip)
+    return float(sum(proxy.tasks(op['raw'], graph.tensors) for op in graph.operations))
 
 
 def build(workload, chip, config):
