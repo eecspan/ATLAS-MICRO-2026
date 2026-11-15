@@ -164,6 +164,7 @@ class ScheduleProxy:
         stage = [-1]*cores; pending = [set() for _ in raw]
         finished = [0.0]*cores; local_ready = [0.0]*cores
         arrived = set(); link_free = defaultdict(float)
+        side = isqrt(cores); paths = {}
         banks = None
         if self.memory_factory is not None:
             if tensors is None:
@@ -200,7 +201,12 @@ class ScheduleProxy:
                 push(local_ready[core], 'work', core)
                 for task in sends[core][t]:
                     k = key(task)
-                    path = [('tx',task['src']),*route(task['src'],task['dst'],isqrt(cores)),('rx',task['dst'])]
+                    path_key = (task['src'], task['dst'])
+                    path = paths.get(path_key)
+                    if path is None:
+                        path = paths[path_key] = [('tx', task['src']),
+                                                   *route(task['src'], task['dst'], side),
+                                                   ('rx', task['dst'])]
                     push(at,'packet',(k,task['flit_num'],path,0))
             elif kind == 'work':
                 advance(data,at)

@@ -7,6 +7,7 @@ activations; all weights and KV allocations remain live through the graph.
 from collections import Counter, defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, replace
+from functools import lru_cache
 import json
 from math import isqrt, prod
 from pathlib import Path
@@ -247,6 +248,7 @@ def conversion(source, target, side):
     return pairs, groups
 
 
+@lru_cache(maxsize=4096)
 def route(src, dst, side):
     """Directed mesh links of BookSim's X-then-Y route."""
     (sy, sx), (dy, dx) = divmod(src, side), divmod(dst, side)

@@ -9,6 +9,7 @@ A/B/C in one plan-independent layout read remotely (T10 style).
 """
 from itertools import product
 from math import prod
+from functools import lru_cache
 
 from .layout import GlobalLayout
 from .ownership import Ownership
@@ -18,6 +19,7 @@ from ..sim import span, strides
 from ..output import reduce_steps, broadcast_steps, root_index
 
 
+@lru_cache(maxsize=4096)
 def compile_kernel(problem, plan, sram_bytes, dram_bytes):
     """The executable program of any GEMM plan: ``regions``, ``placements``, ``lower``."""
     if getattr(plan,'kind',None)=='flash':
