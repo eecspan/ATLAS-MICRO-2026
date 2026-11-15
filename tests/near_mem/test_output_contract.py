@@ -81,32 +81,31 @@ def test_output_contract_shared_by_gemm_and_attention_and_gated_epilogue(tmp_pat
 
 
 def test_transformer_search_includes_output_contracts(tmp_path):
-    from frontend.near_mem.experiments.transformer import Chain, Experiment
+    from frontend.near_mem.experiments.transformer import Experiment, Search, propose_gemm, _entry_score
     from frontend.near_mem.methods import target
     from frontend.near_mem.model.transformer import Workload
-    chip=make_hardware(tmp_path/'hw',4,64); w=Workload(1,8,8,4,1,8,32)
-    exp=Experiment(w,chip,tmp_path/'search'); chain=Chain(exp,target(chip),2)
-    option=dict(plan=asdict(Plan((1,2,2),(4,8,8))),native=False,direction=0,gated=False)
-    options=chain.prepare(dict(output=[option],attention=[AttentionPlan(1,4,2,2)]))
-    assert {c['plan']['output'] for c in options['output']}>= {'sharded','replicated'}
-    assert {c.output for c in options['attention']}>= {'sharded','first','replicated'}
-    assert any('output' in c['plan'] for c in options['output'])
+    chip=make_hardware(tmp_path/'hw',4,64); w=Workload(1,8,8,4,1,8,32); hw=dict(target(chip),single_b=True)
+    search=Search(Experiment(w,chip,tmp_path/'search'),hw,'ours',1,True)
+    pool=[]; proposals,_=propose_gemm(w,chip,'ours',hw,1,1,'output',pool=pool)
+    split=Plan((1,2,2),(4,8,8))  # a residual split-K reduction has output contracts
+    pool.append((split,*_entry_score(w,chip,hw,'output',dict(plan=asdict(split),native=False,direction=0,gated=False))))
+    options=search.gemm('output',proposals,pool)
+    assert {c['plan']['output'] for c in options}>={'sharded','replicated'}
+    layouts=[tuple(map(tuple,search.ports['output',json.dumps(c,sort_keys=True)])) for c in options]
+    assert len(layouts)==len(set(layouts))  # one option per boundary layout
+    chosen=search.attention([AttentionPlan(1,4,2,2)])
+    kept=chosen+[a for c in chosen for a in search.alternates.get(('attention',json.dumps(asdict(c),sort_keys=True)),[])]
+    assert {c.output for c in kept}>={'sharded','first','replicated'}  # equal layouts share one option
 
 
-def test_baseline_boundary_keeps_its_contract_and_one_graph(tmp_path):
-    from frontend.near_mem.experiments.transformer import Chain, Experiment
+def test_baseline_boundary_keeps_its_contract(tmp_path):
+    from frontend.near_mem.experiments.transformer import Experiment, Search, propose_gemm
     from frontend.near_mem.methods import METHODS, target
     from frontend.near_mem.model.transformer import Workload
     assert {m for m, x in METHODS.items() if x.boundary} == {'ours', 'local', 'dram'}
-    chip=make_hardware(tmp_path/'hw',4,64); w=Workload(1,8,8,4,1,8,32)
-    exp=Experiment(w,chip,tmp_path/'search'); chain=Chain(exp,target(chip),2,boundary=False)
-    gemm=lambda ps,tile,gated=False: dict(plan=asdict(Plan(ps,tile)),native=False,direction=0,gated=gated)
-    options=dict(qkv=[gemm((1,2,2),(8,24,8)),gemm((1,4,1),(8,12,32))],attention=[AttentionPlan(1,4,2,2)],
-                 output=[gemm((1,2,2),(4,8,8))],expand=[gemm((1,2,2),(8,32,8),True)],
-                 contract=[gemm((1,2,2),(8,16,16))])
-    options,proposals,configs=chain.propose(options,64,8)
-    assert {c['plan']['output'] for c in options['output']}=={'sharded'}
-    assert {c.output for c in options['attention']}=={'sharded'}
-    assert len(proposals)==len(configs)==1
-    fastest=min(options['qkv'],key=lambda c:chain.cycles['qkv',json.dumps(c,sort_keys=True)])
-    assert configs[0]['kernels']['qkv']==fastest
+    chip=make_hardware(tmp_path/'hw',4,64); w=Workload(1,8,8,4,1,8,32); hw=dict(target(chip),single_b=True)
+    search=Search(Experiment(w,chip,tmp_path/'search'),hw,'t10',1,False)
+    proposals,_=propose_gemm(w,chip,'t10',hw,1,1,'output')
+    assert {json.dumps(c,sort_keys=True) for c in search.gemm('output',proposals,None)}<={json.dumps(c,sort_keys=True) for c in proposals}
+    assert {c['plan']['output'] for c in proposals}=={'sharded'}
+    assert {c.output for c in search.attention([AttentionPlan(1,4,2,2)])}=={'sharded'}

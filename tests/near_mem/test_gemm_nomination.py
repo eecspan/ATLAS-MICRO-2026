@@ -87,28 +87,52 @@ def test_shared_nomination_supports_general_compiler_methods(tmp_path, method):
     assert all(r['kernel'] > 0 for r in report['candidates'])
 
 
-def test_joint_nomination_keeps_one_plan_per_layout_and_never_simulates(tmp_path, monkeypatch):
-    from frontend.near_mem.experiments.transformer import Chain, Experiment, nominate_joint, ORDER
+@pytest.mark.parametrize('method', ['ours', 'tp', 't10', 'flash'])
+def test_search_proposes_distinct_graphs_without_simulation(tmp_path, monkeypatch, method):
+    from frontend.near_mem.experiments.transformer import Experiment, Search, signature, token, ORDER
     from frontend.near_mem.methods import METHODS
-    from frontend.near_mem.model.attention import KVLayout
+    from frontend.near_mem.model.attention import AttentionPlan, KVLayout
     chip = make_hardware(tmp_path/'hw', 4, 64)
     w = Workload(1, 8, 8, 4, 1, 8, 32); hw = dict(target(chip), single_b=True)
     def forbidden(*a, **kw):
-        pytest.fail('Proxy nomination must not invoke the simulator')
+        pytest.fail('Proposal must not invoke the simulator')
     monkeypatch.setattr(search.Graph, 'simulate', forbidden)
-    pools = {}; kernel = {}
+    joint = METHODS[method].boundary
+    s = search.Search(Experiment(w, chip, tmp_path/'out'), hw, method, 1, joint)
+    options = {'attention': s.attention(METHODS[method].attention(KVLayout(w.attention, hw['cores']), hw['sram']))}
     for name in w.problems:
-        pools[name] = []
-        kernel[name], _ = search.propose_gemm(w, chip, 'ours', hw, 1, 1, name, pool=pools[name])
-        layouts = [(tuple(a), tuple(c)) for _, _, (a, c) in pools[name]]
-        assert len(pools[name]) > len(kernel[name])//2 and len(set(layouts)) > 1
-    chain = Chain(Experiment(w, chip, tmp_path/'out'), hw, 1)
-    attention = METHODS['ours'].attention(KVLayout(w.attention, hw['cores']), hw['sram'])
-    picked, report = nominate_joint(chain, pools, attention, 16, 4)
-    assert set(picked) == set(w.problems) and all(picked[n] for n in picked)
-    assert 1 <= len(report['graphs']) <= 4 and report['edges'] > 0
-    scores = [g['score'] for g in report['graphs']]
-    assert scores == sorted(scores)
+        pool = [] if joint else None
+        proposals, _ = search.propose_gemm(w, chip, method, hw, 1, 1, name, pool=pool)
+        options[name] = s.gemm(name, proposals, pool)
+    configs = s.propose(options, 16, 8, 3)
+    graphs = s.report['graphs']
+    assert 1 <= len(configs) <= 3 and len(graphs) <= 8+3*5*2
+    # Alternates share their option's boundary layouts and rank below it.
+    for (name, key), others in s.alternates.items():
+        for other in others:
+            assert s.ports[name, token(other)] == s.ports[name, key]
+            assert s.scores[name, token(other)] >= s.scores[name, key]
+    assert [g['whole'] for g in graphs] == sorted(g['whole'] for g in graphs)
+    assert sum(g['simulated'] for g in graphs) == len(configs)
+    picked = [g['program'] for g in graphs if g['simulated']]
+    assert len(picked) == len(set(picked))  # never two graphs of one program
+    # Picks prefer structurally different graphs over near-duplicates.
+    def sig(cfg):
+        return signature({**cfg['kernels'], 'attention': AttentionPlan(**cfg['attention'])})
+    distinct = len({sig(g['configuration']) for g in graphs})
+    assert len({sig(c) for c in configs}) == min(len(configs), distinct)
+
+
+def test_whole_graph_score_chains_operators_per_core(tmp_path):
+    from frontend.near_mem.model.schedule_proxy import ScheduleProxy
+    from frontend.near_mem.tasks import Timeline
+    proxy = ScheduleProxy(make_hardware(tmp_path/'hw', 4))
+    def op(core):
+        t = Timeline(4, 64); t.work(core, 1, macs=100*1024); return t.finish()
+    one = proxy.tasks(op(0))
+    # Two operators on one core run back to back; on two cores they overlap.
+    assert proxy.run([op(0), op(0)]) >= 2*one-4
+    assert proxy.run([op(0), op(1)]) < 2*one-4
 
 
 def test_compiled_edge_score_is_zero_for_a_bound_layout_and_positive_otherwise(tmp_path):
@@ -129,3 +153,13 @@ def test_norm_score_follows_the_producer_layout(tmp_path):
     cols = [Region(c, 'y', 0, 8*c, 8, 8) for c in range(4)]
     # Column shards reduce row statistics across cores; row shards do not.
     assert 0 < norm_score(w, chip, rows) < norm_score(w, chip, cols)
+
+
+def test_pick_skips_graphs_of_an_equal_program():
+    from frontend.near_mem.experiments.transformer import pick
+    from frontend.near_mem.model.attention import AttentionPlan
+    entry = lambda ps: dict(plan=asdict(Plan(ps, (8, 8, 8))), native=False, direction=0, gated=False)
+    graph = lambda ps: {**{n: entry(ps) for n in ('qkv', 'output', 'expand', 'contract')}, 'attention': AttentionPlan()}
+    ranked = [(1, graph((1, 2, 2)), 'a'), (2, graph((1, 4, 1)), 'a'), (3, graph((1, 1, 4)), 'b')]
+    assert [x[0] for x in pick(ranked, 2, lambda x: x[2])] == [1, 3]
+    assert [x[0] for x in pick(ranked, 2)] == [1, 2]

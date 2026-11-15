@@ -108,33 +108,58 @@ class ScheduleProxy:
         Without placements, DRAM falls back to the older peak-bandwidth model.
         Neither mode is a safe lower bound for pruning candidates.
         """
-        if not raw or not raw[0]:
+        return self.run([raw], tensors, channel_memory=channel_memory, network=network)
+
+    def graph(self, graph, **kwargs):
+        """Score a whole graph: its operators run back to back on every core.
+
+        A core starts an operator when it has finished its part of the
+        previous one, as on the backend; cores meet only through their
+        messages, and link/port and DRAM occupancy carry across operators,
+        so a fast core's next operator contends with a slow core's tail.
+        """
+        return self.run([op['raw'] for op in graph.operations], graph.tensors, **kwargs)
+
+    def run(self, raws, tensors=None, *, channel_memory=True, network=True):
+        if not raws or not raws[0] or not raws[0][0]:
             raise ValueError('Schedule must contain at least one core and phase')
-        cores = len(raw); length = len(raw[0])+2
-        if isqrt(cores)**2 != cores or any(len(row)+2 != length for row in raw):
-            raise ValueError('Schedule requires a square mesh and equal-length core rows')
-        work = [[1.0]*length for _ in raw]
-        memory = [[[] for _ in range(length)] for _ in raw]
-        deadline = [[length]*length for _ in raw]
-        sends = [[[] for _ in range(length)] for _ in raw]
-        receives = [[[] for _ in range(length)] for _ in raw]
-        arch = self.arch; buffer = arch['core']['buffer']
-        for core, row in enumerate(raw):
-            for t, phase in enumerate(row):
-                work[core][t+1] = max(1,
-                    ceil(sum(x['mac_count'] for x in phase['matrix'])/arch['core']['matrix']['mac_num']),
-                    ceil(sum(x['vec_count'] for x in phase['vector'])/arch['core']['vector']['vec_num']),
-                    ceil(sum(x['byte_count'] for x in phase['buffer_load'])/buffer['read_bw']),
-                    ceil(sum(x['byte_count'] for x in phase['buffer_store'])/buffer['write_bw']))
-                for task in phase['dram']:
-                    at = t+2 if task['is_write'] else t
-                    memory[core][at].append(task)
-                    due = task.get('ready_iter',at+1)
-                    if not at < due <= length:
-                        raise ValueError('DRAM deadline must follow issue and stay within the operator')
-                    deadline[core][at] = min(deadline[core][at],due)
-                sends[core][t+1] = phase['noc_tx']
-                receives[core][t+1] = phase['noc_rx']
+        cores = len(raws[0])
+        if isqrt(cores)**2 != cores or any(len(raw) != cores for raw in raws):
+            raise ValueError('Schedule requires a square mesh and one row per core')
+        # Each operator occupies its own window of phases: reads at its phase
+        # t, compute at t+1, writes at t+2 (as ``Timeline``), deadlines inside it.
+        spans = [max(map(len, raw))+2 for raw in raws]
+        length = sum(spans)
+        if length == len(raws)*2:
+            raise ValueError('Schedule must contain at least one core and phase')
+        work = [[1.0]*length for _ in range(cores)]
+        memory = [[[] for _ in range(length)] for _ in range(cores)]
+        deadline = [[length]*length for _ in range(cores)]
+        sends = [[[] for _ in range(length)] for _ in range(cores)]
+        receives = [[[] for _ in range(length)] for _ in range(cores)]
+        arch = self.arch; buffer = arch['core']['buffer']; base = 0
+        for raw, span in zip(raws, spans):
+            if len(raws) == 1 and any(len(row)+2 != span for row in raw):
+                raise ValueError('Schedule requires a square mesh and equal-length core rows')
+            for core, row in enumerate(raw):
+                for t, phase in enumerate(row):
+                    at = base+t
+                    work[core][at+1] = max(1,
+                        ceil(sum(x['mac_count'] for x in phase['matrix'])/arch['core']['matrix']['mac_num']),
+                        ceil(sum(x['vec_count'] for x in phase['vector'])/arch['core']['vector']['vec_num']),
+                        ceil(sum(x['byte_count'] for x in phase['buffer_load'])/buffer['read_bw']),
+                        ceil(sum(x['byte_count'] for x in phase['buffer_store'])/buffer['write_bw']))
+                    for task in phase['dram']:
+                        issue = t+2 if task['is_write'] else t
+                        due = task.get('ready_iter', issue+1)
+                        if not issue < due <= span:
+                            raise ValueError('DRAM deadline must follow issue and stay within the operator')
+                        memory[core][base+issue].append(task)
+                        deadline[core][base+issue] = min(deadline[core][base+issue], base+due)
+                    sends[core][at+1] = phase['noc_tx']
+                    receives[core][at+1] = phase['noc_rx']
+            base += span
+        raw = range(cores)
         busy = [0.0]*cores; ready = [[0.0]*(length+1) for _ in raw]
         stage = [-1]*cores; pending = [set() for _ in raw]
         finished = [0.0]*cores; local_ready = [0.0]*cores

@@ -34,8 +34,8 @@ def main():
     ap.add_argument('--phase', choices=('prefill', 'decode', 'both'), default='both')
     for name, value in [('batch', 1), ('input', 2048), ('generate', 256), ('chunk', 512), ('layers', 32),
                         ('query-heads', 32), ('kv-heads', 8), ('head-dim', 128), ('ffn', 14336),
-                        ('budget', 4), ('workers', WORKERS), ('tile-min', 8), ('passes', 2), ('width', 64),
-                        ('keep', 8), ('tiles', 2), ('refine', 3), ('attention-budget', 32)]:
+                        ('budget', 4), ('workers', WORKERS), ('tile-min', 8), ('width', 64),
+                        ('keep', 8), ('tiles', 2), ('candidates', 32)]:
         ap.add_argument('--'+name, type=int, default=value)
     ap.add_argument('--deadline', type=float, help='common wall-clock cap per phase in seconds')
     ap.add_argument('--no-joint', action='store_true', help='ablation: no joint boundary search')
@@ -48,8 +48,8 @@ def main():
     for phase in phases:
         point, steps = points(a.batch, a.input, a.generate, a.chunk)[phase]
         workload = Workload(**point, **shape)
-        s = transformer.run(workload, a.chip, a.output/phase, a.method, a.budget, a.workers, a.tile_min, a.passes,
-                            a.width, a.keep, a.tiles, a.refine, a.deadline, a.attention_budget, not a.no_joint)
+        s = transformer.run(workload, a.chip, a.output/phase, a.method, a.budget, a.workers, a.tile_min, a.width,
+                            a.keep, a.tiles, a.deadline, not a.no_joint, a.candidates)
         scale = steps*a.layers  # every step repeats the representative layer
         result[phase] = dict(workload=asdict(workload), layer_cycles=s['cycles'], steps=steps,
                              cycles=s['cycles']*scale, hit_deadline=s['hit_deadline'],
