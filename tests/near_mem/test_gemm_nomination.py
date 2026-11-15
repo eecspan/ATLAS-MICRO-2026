@@ -163,3 +163,12 @@ def test_pick_skips_graphs_of_an_equal_program():
     ranked = [(1, graph((1, 2, 2)), 'a'), (2, graph((1, 4, 1)), 'a'), (3, graph((1, 1, 4)), 'b')]
     assert [x[0] for x in pick(ranked, 2, lambda x: x[2])] == [1, 3]
     assert [x[0] for x in pick(ranked, 2)] == [1, 2]
+
+
+def test_native_checker_follows_the_protocol(tmp_path):
+    # Upstream native GEMMs (iteration-coded tasks) take a constant node score,
+    # their real boundary layouts, and the additive graph score.
+    from frontend.near_mem.experiments.transformer import run
+    chip = make_hardware(tmp_path/'hw', 4, 64); w = Workload(1, 1, 8, 4, 1, 8, 32)
+    s = run(w, chip, tmp_path/'atlas', 'atlas', workers=2, keep=2, candidates=4)
+    assert s['cycles'] > 0 and s['method'] == 'atlas'

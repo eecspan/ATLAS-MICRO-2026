@@ -18,7 +18,7 @@ stored once for every method: an M split must rotate B. Each run writes only
 its own cycles; ``experiments.compare`` turns separate runs into speedups.
 """
 import argparse
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import asdict, replace
 from functools import partial
 import hashlib
@@ -260,6 +260,9 @@ def _attention_score(workload, chip, plan):
 
 
 def _pool_map(job, items, workers):
+    """``map`` over ``workers`` processes, or over a shared process pool."""
+    if isinstance(workers, ProcessPoolExecutor):
+        return list(workers.map(job, items)) if items else []
     if workers > 1 and len(items) > 1:
         with ProcessPoolExecutor(min(workers, len(items))) as executor:
             return list(executor.map(job, items, chunksize=max(1, min(4, len(items)//(16*workers)))))
@@ -319,7 +322,14 @@ def propose_gemm(workload, chip, method, hw, budget, tiles, name, pieces=None, *
 
 
 def _entry_score(workload, chip, hw, name, entry):
-    """``(compiled score, (A, C) layouts)`` of a GEMM option; None if it does not compile."""
+    """``(compiled score, (A, C) layouts)`` of a GEMM option; None if it does not compile.
+
+    Upstream native kernels (``atlas``, a check of ``tp``) are one fixed option
+    per GEMM in upstream's iteration-coded task format: their score is a
+    constant (equal in every graph) and only their layouts matter."""
+    if entry['native']:
+        k = bind_kernel(workload, hw, name, entry)
+        return 0.0, (k.input_layout(hw['cores'])[0], k.output_layout(hw['cores']))
     try:
         graph, kernel = compiled_operator(workload, chip, hw, name, entry)
     except ValueError:
@@ -345,9 +355,11 @@ def program_digest(graph):
     return h.hexdigest()
 
 
-def _whole_job(workload, chip, config):
+def _whole_job(workload, chip, config, schedule=True):
+    """``(whole-graph score or None, program digest)``; ``schedule=False`` for graphs
+    the schedule proxy cannot read (upstream native kernels)."""
     graph = build(workload, chip, config)
-    return ScheduleProxy(chip).graph(graph), program_digest(graph)
+    return (ScheduleProxy(chip).graph(graph) if schedule else None), program_digest(graph)
 
 
 def signature(chosen):
@@ -407,6 +419,7 @@ class Search:
         self.joint = joint; self.per = per
         self.edges = Edges(exp.workload, exp.chip, workers)
         self.scores = {}; self.ports = {}; self.alternates = {}; self.programs = {}; self.report = {}
+        self.executor = None  # a shared process pool, while one is open
 
     def group(self, name, scored):
         """Beam options from ``[(choice, score, (in, out) layouts)]``: the best of every
@@ -423,13 +436,19 @@ class Search:
             self.alternates[name, kept[0][1]] = [c for _, _, c, _ in kept[1:]]
         return sorted(options, key=lambda c: self.scores[name, token(c)])
 
-    def attention(self, plans):
-        """Every attention plan (with output contracts for joint boundaries), compiled and scored."""
+    def attention(self, plans, executor=None):
+        """Every attention plan (with output contracts for joint boundaries),
+        compiled and scored, grouped by (Q, O) layout. ``executor`` (a process
+        pool) may be shared with concurrent work."""
         started = time.monotonic(); workload = self.exp.workload; cores = self.hw['cores']
         if self.joint:
             plans = [c for p in plans for c in output_variants(p)]
         plans = list({token(c): c for c in plans}.values())
-        values = _pool_map(partial(_attention_score, workload, self.exp.chip), plans, self.workers)
+        job = partial(_attention_score, workload, self.exp.chip)
+        if executor is None:
+            values = _pool_map(job, plans, self.workers)
+        else:
+            values = list(executor.map(job, plans))
         options = self.group('attention', [(p, v, (port(workload, cores, 'attention.Q', p),
                                                    port(workload, cores, 'attention.O', p)))
                                           for p, v in zip(plans, values)])
@@ -442,7 +461,7 @@ class Search:
         workload = self.exp.workload; job = partial(_entry_job, workload, self.exp.chip, self.hw)
         entry = lambda p: dict(plan=asdict(p), native=False, **roles(workload, name))
         if not self.joint or pool is None:
-            found = _pool_map(job, [(name, e) for e in proposals], self.workers)
+            found = _pool_map(job, [(name, e) for e in proposals], self.executor or self.workers)
             return self.group(name, [(e, *f) for e, f in zip(proposals, found) if f is not None])
         scored = [(entry(p), value, ports) for p, value, ports in pool]
         best = {}
@@ -451,7 +470,7 @@ class Search:
             if key not in best or value < best[key][1]:
                 best[key] = (p, value)
         variants = [entry(v) for p, _ in best.values() for v in output_variants(p) if v != p]
-        scored += [(e, *f) for e, f in zip(variants, _pool_map(job, [(name, e) for e in variants], self.workers))
+        scored += [(e, *f) for e, f in zip(variants, _pool_map(job, [(name, e) for e in variants], self.executor or self.workers))
                    if f is not None]
         return self.group(name, scored)
 
@@ -470,10 +489,12 @@ class Search:
     def whole(self, graphs):
         """``(whole score, chosen, configuration, additive score)`` of ``(additive, chosen)`` graphs."""
         configs = [self.config(c) for _, c in graphs]
-        values = _pool_map(partial(_whole_job, self.exp.workload, self.exp.chip), configs, self.workers)
+        schedule = not self.method.native
+        values = _pool_map(partial(_whole_job, self.exp.workload, self.exp.chip, schedule=schedule), configs, self.workers)
         for cfg, (_, digest) in zip(configs, values):
             self.programs[Experiment.key(cfg)] = digest
-        return [(w, c, cfg, s) for (w, _), (s, c), cfg in zip(values, graphs, configs)]
+        # Without a whole-graph score (native kernels) graphs keep their additive one.
+        return [(s if w is None else w, c, cfg, s) for (w, _), (s, c), cfg in zip(values, graphs, configs)]
 
     def propose(self, options, width, candidates, keep):
         """Configurations of the ``keep`` graphs to simulate, with the search record."""
@@ -519,30 +540,45 @@ def run(workload, chip, out, method='ours', budget=4, workers=WORKERS, tile_min=
     if not plans:
         raise ValueError('No SRAM-feasible attention plan')
     search = Search(exp, hw, method, workers, joint, tiles); report = {}; clock = {}
-    options = {'attention': search.attention(plans)}
-    clock['attention'] = time.monotonic()-started
+    # The attention search and the GEMM scans are independent: they share one
+    # pool, so attention plans fill workers that finished their scan pieces.
+    executor = ProcessPoolExecutor(max(1, workers))
+    try:
+        if METHODS[method].native:
+            options = {'attention': search.attention(plans, executor)}
+        else:
+            names = list(workload.problems)
+            parts = max(1, workers//len(names))
+            jobs = [(name, part) for name in names for part in range(parts)]
+            scans = [executor.submit(_scan_job, workload, chip, method, hw, budget, tiles, parts, job) for job in jobs]
+            options = {'attention': search.attention(plans, executor)}
+            clock['attention'] = time.monotonic()-started
+            found = [f.result() for f in scans]
+    finally:
+        executor.shutdown()
+    clock.setdefault('attention', time.monotonic()-started)
     if METHODS[method].native:
         kernels = tune_native(workload, chip, exp.out/'native_tuning', workers)
         options.update({k: search.gemm(k, [v], None) for k, v in configuration(kernels, plans[0])['kernels'].items()})
     else:
-        # The GEMM scans are independent, and each splits exactly into pieces
-        # of whole structural families (``search.diverse_part``): run them all
-        # in one pool of ``workers`` processes and merge per GEMM.
-        names = list(workload.problems)
-        parts = max(1, workers//len(names))
-        jobs = [(name, part) for name in names for part in range(parts)]
-        with ProcessPoolExecutor(max(1, min(workers, len(jobs)))) as pool:
-            found = list(pool.map(partial(_scan_job, workload, chip, method, hw, budget, tiles, parts), jobs))
-        clock['scan'] = time.monotonic()-started-clock['attention']
-        for name in names:
+        # Each GEMM scan splits exactly into pieces of whole structural
+        # families (``search.diverse_part``), merged per GEMM below.
+        clock['scan'] = time.monotonic()-started-clock['attention']  # its tail after attention
+        # The four GEMMs compile concurrently into one pool (no per-GEMM tails).
+        def nominate(name):
             pieces = [piece for (n, _), piece in zip(jobs, found) if n == name]
             nomination = {}; pool = [] if joint else None
             proposals, scanned = propose_gemm(workload, chip, method, hw, budget, tiles, name, pieces,
-                                              workers=workers, report=nomination, pool=pool)
-            options[name] = search.gemm(name, proposals, pool)
-            report[name] = dict(scanned=scanned, proposals=[e['plan'] for e in proposals], nomination=nomination,
-                                options=len(options[name]))
-            print(f'{name}: {nomination["fine_scored"]} compiled scores -> {len(options[name])} options', flush=True)
+                                              workers=search.executor, report=nomination, pool=pool)
+            return name, search.gemm(name, proposals, pool), dict(
+                scanned=scanned, proposals=[e['plan'] for e in proposals], nomination=nomination)
+        with ProcessPoolExecutor(max(1, workers)) as shared, ThreadPoolExecutor(len(names)) as threads:
+            search.executor = shared
+            for name, chosen, record in threads.map(nominate, names):
+                options[name] = chosen; report[name] = dict(record, options=len(chosen))
+                print(f'{name}: {record["nomination"]["fine_scored"]} compiled scores -> {len(chosen)} options',
+                      flush=True)
+        search.executor = None
         clock['nominate'] = time.monotonic()-started-clock['scan']-clock['attention']
         dump(exp.out/'nomination.json', report)
     configs = search.propose(options, width, candidates, keep)

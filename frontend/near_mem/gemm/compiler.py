@@ -9,7 +9,6 @@ A/B/C in one plan-independent layout read remotely (T10 style).
 """
 from itertools import product
 from math import prod
-from copy import deepcopy
 
 from .layout import GlobalLayout
 from .ownership import Ownership
@@ -419,7 +418,9 @@ def pipeline(phases):
     for row in phases:
         if work and only(row,{'clear','zero','load'}) and only(work[-1],{'clear','zero','load'}):
             work[-1]=[a+b for a,b in zip(work[-1],row)]
-        else:work.append(deepcopy(row))
+        # Rows and their action dicts are edited below (merged lists, a C
+        # clear's ``keep``); nested values are never edited, so share them.
+        else:work.append([[dict(a) for a in ops] for ops in row])
     phases=[];i=0
     while i<len(work):
         row=work[i]

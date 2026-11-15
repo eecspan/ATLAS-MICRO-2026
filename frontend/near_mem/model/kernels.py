@@ -45,7 +45,9 @@ class Gemm:
     gated: bool = False
 
     def bind(self, cores, sram, capacity):
-        """Compile the mapping for a chip; touches no graph state."""
+        """Compile the mapping for a chip once; touches no graph state."""
+        if getattr(self, '_bound', None) == (cores, sram, capacity):
+            return self
         self.execution_problem = execution_problem(self.problem,self.plan)
         if self.gated and self.problem.n % 2:
             raise ValueError('Gated projection needs equal gate/up widths')
@@ -62,6 +64,7 @@ class Gemm:
             # gate/up halves. All partial sums retain the ordinary GEMM layout.
             self.fused_gate = (self.gated and self.program.gate_tile % 2 == 0
                                and self.execution_problem.n == self.problem.n)
+        self._bound = (cores, sram, capacity)
         return self
 
     def prepare(self, graph, name):
