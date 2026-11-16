@@ -133,10 +133,12 @@ class ScheduleProxy:
         if length == len(raws)*2:
             raise ValueError('Schedule must contain at least one core and phase')
         work = [[1.0]*length for _ in range(cores)]
-        memory = [[[] for _ in range(length)] for _ in range(cores)]
-        deadline = [[length]*length for _ in range(cores)]
-        sends = [[[] for _ in range(length)] for _ in range(cores)]
-        receives = [[[] for _ in range(length)] for _ in range(cores)]
+        # Most phase slots have no DMA or packet.  Sparse slots avoid creating
+        # four empty Python lists per core and phase for every proxy run.
+        memory = [[None]*length for _ in range(cores)]
+        deadline = [{} for _ in range(cores)]
+        sends = [[None]*length for _ in range(cores)]
+        receives = [[None]*length for _ in range(cores)]
         arch = self.arch; buffer = arch['core']['buffer']; base = 0
         for raw, span in zip(raws, spans):
             if len(raws) == 1 and any(len(row)+2 != span for row in raw):
@@ -154,10 +156,13 @@ class ScheduleProxy:
                         due = task.get('ready_iter', issue+1)
                         if not issue < due <= span:
                             raise ValueError('DRAM deadline must follow issue and stay within the operator')
-                        memory[core][base+issue].append(task)
-                        deadline[core][base+issue] = min(deadline[core][base+issue], base+due)
-                    sends[core][at+1] = phase['noc_tx']
-                    receives[core][at+1] = phase['noc_rx']
+                        slot = base+issue
+                        if memory[core][slot] is None:
+                            memory[core][slot] = []
+                        memory[core][slot].append(task)
+                        deadline[core][slot] = min(deadline[core].get(slot, length), base+due)
+                    sends[core][at+1] = phase['noc_tx'] or None
+                    receives[core][at+1] = phase['noc_rx'] or None
             base += span
         raw = range(cores)
         busy = [0.0]*cores; ready = [[0.0]*(length+1) for _ in raw]
@@ -190,16 +195,18 @@ class ScheduleProxy:
                 stage[core] = t
                 if t == length:
                     finished[core] = max(at,busy[core]); continue
-                duration = (banks[core].service(self.transactions(memory[core][t],tensors[core])) if banks else
-                            self.memory(memory[core][t],tensors[core] if tensors is not None and channel_memory else None))
+                mem_tasks = memory[core][t]
+                duration = (banks[core].service(self.transactions(mem_tasks,tensors[core])) if banks and mem_tasks else
+                            self.memory(mem_tasks,tensors[core] if tensors is not None and channel_memory else None)
+                            if mem_tasks else 0.0)
                 if duration:
                     busy[core] = max(at,busy[core])+duration
-                    due = deadline[core][t]
+                    due = deadline[core].get(t, length)
                     ready[core][due] = max(ready[core][due],busy[core])
                 local_ready[core] = max(at+work[core][t],ready[core][t+1])
-                pending[core] = {key(x) for x in receives[core][t]}-arrived
+                pending[core] = {key(x) for x in (receives[core][t] or ())}-arrived
                 push(local_ready[core], 'work', core)
-                for task in sends[core][t]:
+                for task in sends[core][t] or ():
                     k = key(task)
                     path_key = (task['src'], task['dst'])
                     path = paths.get(path_key)

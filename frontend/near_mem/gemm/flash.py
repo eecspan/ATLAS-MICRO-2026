@@ -188,6 +188,16 @@ class FlashProgram:
         return ([q*g.ms, x*g.ks], [g.ms, g.ks]), ([x*g.ks, j*g.nt], [g.ks, g.nt])
 
     def lower(self, flit, final_ops=None):
+        if final_ops is None:
+            cache = getattr(self, '_lower_cache', None)
+            if cache is None:
+                cache = self._lower_cache = {}
+            if flit not in cache:
+                cache[flit] = self._lower_uncached(flit)
+            return cache[flit]
+        return self._lower_uncached(flit, final_ops)
+
+    def _lower_uncached(self, flit, final_ops=None):
         p = self.plan; g = self.g; s = g.side; t = g.dtype; R = g.round
         tl = Timeline(p.cores, flit); mt, kt, nt = p.m_tile, p.k_tile, g.nt
         row = lambda r: [r*s+x for x in range(s)]; col = lambda c: [y*s+c for y in range(s)]

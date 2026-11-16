@@ -399,23 +399,25 @@ class Graph:
         packet dictionaries are copied; other tasks are shared, read-only.
         """
         largest = -1; offset = self.next_flit
-        def copy(obj):
+        def copy_packet(packet):
             nonlocal largest
-            if isinstance(obj, dict):
-                if 'init_flit_id' in obj:
-                    largest = max(largest, obj['init_flit_id']+obj['flit_num']-1)
-                    return dict(obj, init_flit_id=obj['init_flit_id']+offset)
-                return {k: copy(v) for k, v in obj.items()}
-            if isinstance(obj, list):
-                return [copy(v) for v in obj]
-            return obj
+            largest = max(largest, packet['init_flit_id']+packet['flit_num']-1)
+            return dict(packet, init_flit_id=packet['init_flit_id']+offset)
         if kind in ('mpmd-general','spmd-general'):
             # General tasks have a fixed shallow schema. Only packets need
             # renumbering; traversing every scalar in compute/DRAM tasks is
             # expensive when a fused schedule has thousands of iterations.
-            raw = [[dict(phase,noc_tx=[copy(p) for p in phase['noc_tx']],
-                               noc_rx=[copy(p) for p in phase['noc_rx']]) for phase in row] for row in raw]
+            raw = [[dict(phase,noc_tx=[copy_packet(p) for p in phase['noc_tx']],
+                               noc_rx=[copy_packet(p) for p in phase['noc_rx']]) for phase in row] for row in raw]
         else:
+            def copy(obj):
+                if isinstance(obj, dict):
+                    if 'init_flit_id' in obj:
+                        return copy_packet(obj)
+                    return {k: copy(v) for k, v in obj.items()}
+                if isinstance(obj, list):
+                    return [copy(v) for v in obj]
+                return obj
             raw = copy(raw)
         self.next_flit += largest+1
         if self.next_flit >= 2**31:

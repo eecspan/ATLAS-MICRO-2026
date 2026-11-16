@@ -160,10 +160,14 @@ class Gemm:
             count = action['shape'][0]*max(0,min(action['shape'][1],rope_width-column))
             return action,6*count,2*count,2*count
         raw, manifest = p.lower(graph.flit,epilogue if rope_width or self.fused_gate else None)
-        for core, phases in enumerate(raw):
-            for phase in phases:
-                for task in phase['dram']:
-                    task['name'] = names[core] if task['name'] == 'A' else self.name+'_'+task['name']
+        # ``Program.lower`` may return a worker-local cached template. Copy
+        # only DRAM task dictionaries whose tensor names are graph-specific;
+        # compute and NoC tasks remain shared read-only.
+        if names:
+            raw = [[dict(phase, dram=[dict(task, name=names[core] if task['name'] == 'A'
+                                           else self.name+'_'+task['name'])
+                                  for task in phase['dram']])
+                    for phase in phases] for core, phases in enumerate(raw)]
         graph.add(self.name, raw, dict(manifest, category='gemm', native=False,
                   fused_gate=self.fused_gate,weight_columns='gate/up halves per N tile' if self.fused_gate else 'logical'))
         for core, name in scratch:

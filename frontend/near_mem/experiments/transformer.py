@@ -23,6 +23,7 @@ from dataclasses import asdict, replace
 from functools import partial
 import hashlib
 import json
+import pickle
 from subprocess import TimeoutExpired
 from pathlib import Path
 import time
@@ -349,9 +350,12 @@ def _entry_job(workload, chip, hw, item):
 def program_digest(graph):
     """Digest of a graph's executable content: its tensors and every operator's
     tasks. Configurations that compile to equal digests run identically."""
-    h = hashlib.sha256(json.dumps(graph.tensors, sort_keys=True).encode())
+    # The digest is an in-process identity used while selecting whole graphs.
+    # Pickle preserves the generated task structure and is several times faster
+    # than sorting and encoding hundreds of megabytes of JSON here.
+    h = hashlib.sha256(pickle.dumps(graph.tensors, protocol=5))
     for op in graph.operations:
-        h.update(json.dumps(op['raw'], sort_keys=True).encode())
+        h.update(pickle.dumps(op['raw'], protocol=5))
     return h.hexdigest()
 
 

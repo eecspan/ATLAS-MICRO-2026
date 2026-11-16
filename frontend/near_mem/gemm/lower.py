@@ -82,6 +82,10 @@ def lower_tasks(program, flit_size, final_ops=None):
     raw=[[{k:[] for k in KEYS} for _ in range(length)] for _ in range(p.cores)]
     fid=macs=vectors=reads=writes=0
     finalized={}
+    # Every matrix action in this program uses the same tile dimensions.  The
+    # component accounting is read-only while lowering; materialize it once
+    # instead of rebuilding the same six task lists for every GEMM tile.
+    tile_work = gemm_work(p.tile,dtype)
     def cell(core,slot):
         if slot<0:raise ValueError('Program starts before its operands can arrive')
         return raw[core][slot]
@@ -142,7 +146,7 @@ def lower_tasks(program, flit_size, final_ops=None):
                     dram(a['dst'],i,name,base,extent,True)
                 elif op=='gemm':
                     m,n,k=p.tile;count=m*n*k
-                    for key,tasks in gemm_work(p.tile,dtype).items():cell(core,i)[key].extend(tasks)
+                    for key,tasks in tile_work.items():cell(core,i)[key].extend(tasks)
                     macs+=count;vectors+=m*n
                 elif op=='add':
                     count=a['byte_count']//dtype;vectors+=count

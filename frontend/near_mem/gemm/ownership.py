@@ -34,6 +34,8 @@ class Ownership:
         self.ids={c:i for i,c in enumerate(self.coords)}
         self.uniform=self._uniform()
         self.base=tuple(n//(sp*tp) for n,sp,tp in zip(problem.shape,plan.ps,plan.periods))
+        self._block_cache={}
+        self._tensor_blocks_cache={}
         self.strides={v:{} for v in DEPENDENCIES}
         for v in DEPENDENCIES:
             stride=1
@@ -71,6 +73,10 @@ class Ownership:
         return value
 
     def block(self, core, state):
+        key=(core,state)
+        found=self._block_cache.get(key)
+        if found is not None:
+            return found
         ds=self.digits(core,state)
         index=[self.axis_index(ds,d) for d in range(3)]
         if self.uniform:
@@ -78,7 +84,9 @@ class Ownership:
             i,j,long,short,p,q=self.uniform
             step=state[i]*q+(state[j]+state[i])%q
             index[self.layers[i].axis]=(self.ring(core,long)+q*self.digit(core,i,short)+step)%(p*q)
-        return tuple(c*p+x for c,p,x in zip(self.coords[core],self.plan.periods,index))
+        found=tuple(c*p+x for c,p,x in zip(self.coords[core],self.plan.periods,index))
+        self._block_cache[key]=found
+        return found
 
     def neighbor(self, core, layer, tensor, delta):
         """Move only this tensor's replica position (its layer digit, or its whole
@@ -104,9 +112,15 @@ class Ownership:
 
     def tensor_blocks(self, core, tensor):
         """Blocks a core holds initially: layers moving ``tensor`` at state 0, all states of the others."""
+        key=(core,tensor)
+        found=self._tensor_blocks_cache.get(key)
+        if found is not None:
+            return found
         choices=[(0,) if tensor in layer.tensors else range(layer.radix) for layer in self.layers]
         axes=DEPENDENCIES[tensor]
-        return sorted({tuple(self.block(core,state)[d] for d in axes) for state in product(*choices)})
+        found=sorted({tuple(self.block(core,state)[d] for d in axes) for state in product(*choices)})
+        self._tensor_blocks_cache[key]=found
+        return found
 
     def events(self):
         """No implicit bring-back: retain inner-layer phase after each outer step."""

@@ -64,6 +64,13 @@ class Program:
 
     def lower(self, flit, final_ops=None):
         from .lower import lower_tasks
+        if final_ops is None:
+            cache = getattr(self, '_lower_cache', None)
+            if cache is None:
+                cache = self._lower_cache = {}
+            if flit not in cache:
+                cache[flit] = lower_tasks(self, flit)
+            return cache[flit]
         return lower_tasks(self,flit,final_ops)
 
     def replay(self, a, b):
