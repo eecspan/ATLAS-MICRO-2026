@@ -6,7 +6,9 @@ differ only in what they may choose. Every method runs on its own and writes
 its own cycles; ``experiments.compare`` computes speedups over ``tp``.
 
 ``tp`` is the tensor-parallel baseline: inputs replicated, no rotation, the
-native ``mnk`` kernel and ATLAS's native tile rule. A single GEMM may split M
+native ``mnk`` kernel and the shared tile minimum of every method (ATLAS's
+native K minimum of 512 suits its 4 MiB SRAM and would starve M/N tiles on
+smaller cores; only the ``atlas`` check keeps it). A single GEMM may split M
 or N; in a graph every GEMM uses the fixed K/N mesh grid of ATLAS's TP
 deployment along its ``direction``. ``atlas`` runs the unmodified upstream
 GEMM generator and tile explorer (``gemm.native``); it only checks that
@@ -86,7 +88,7 @@ class Method:
                 raise ValueError('The TP grid needs a square mesh')
             adapted_skip = _padding_skip(skip, problem.shape, execution)
             work = Problem(*execution, problem.dtype_bytes)
-            plans = candidates(work, cores, sram, TP_TILE_MIN, 'all', layer_policy, dram, False, adapted_skip,
+            plans = candidates(work, cores, sram, tile_min, 'all', layer_policy, dram, False, adapted_skip,
                                loops=('mnk',), parts=parts, transpose=transpose)
             if execution == problem.shape:
                 return plans
@@ -128,9 +130,6 @@ class Method:
         if self.attention_mode == 'native':
             return list(attention_plans(layout, sram, False))
         raise ValueError(f'Unknown attention mode: {self.attention_mode}')
-
-
-TP_TILE_MIN = (8, 8, 512)  # ATLAS's native minimum tile (m, n, k)
 
 
 def _padding_metadata(plan, logical, execution):
