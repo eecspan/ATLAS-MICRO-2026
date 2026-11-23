@@ -304,3 +304,89 @@ def test_edge_traffic_model_matches_built_graph(tmp_path):
             regions = edge_regions(w,16,dst,port(w,16,src,choice.get(src.split('.')[0])),
                                    port(w,16,dst,choice.get(dst.split('.')[0])))
             assert 2*sum(x[1] for load in traffic(*regions,alias) for x in load.values()) == written[names[src,dst]]
+
+
+def _stored_columns(kernel):
+    """Logical column of every stored QKV output column."""
+    return np.concatenate([np.arange(logical,logical+width) for _,logical,width in kernel.column_blocks()])
+
+
+@pytest.mark.parametrize('plan',[Plan((1,1,4),(4,4,8),c=(1,4)),Plan((1,4,1),(8,16,32)),Plan((1,2,2),(8,16,16))])
+def test_grouped_qkv_columns_reach_query_and_cache_by_logical_head(chip,plan):
+    p = Attention(2,4,9,4,2,8); spec = Problem(8,64,32)
+    graph = Graph(chip); kernel = Gemm(spec,plan,heads=(4,2,8)).prepare(graph,'qkv')
+    assert [b[:2] for b in kernel.column_blocks()] == [(0,0),(16,32),(24,48),(32,16),(48,40),(56,56)]
+    layout = KVLayout(p,4); cache = layout.allocate(graph)
+    graph.tensor(0,'input',[8,32]); source = [Region(0,'input',0,0,8,32)]
+    query,output = kernel.qkv(graph,source,layout,cache)
+    rng = np.random.default_rng(3); a,w = rng.normal(size=(8,32)),rng.normal(size=(32,64))
+    logical = a@w; perm = _stored_columns(kernel)
+    stored = kernel.program.replay(a,w[:,perm])
+    np.testing.assert_allclose(stored,logical[:,perm],atol=1e-11)
+    arrays = {(c,t['name']):np.full(t['shape'],np.nan) for c,ts in enumerate(graph.tensors) for t in ts.values()}
+    tm,tn,_ = plan.tile; name = output[0].name
+    for phase in kernel.program.phases:
+        for core,actions in enumerate(phase):
+            for action in actions:
+                if action['op'] == 'store' and action.get('final'):
+                    (row,col),(r,c) = action['key'],action['base']
+                    arrays[core,name][r:r+tm,c:c+tn] = stored[row*tm:(row+1)*tm,col*tn:(col+1)*tn]
+    coverage = np.zeros(logical.shape,dtype=int)
+    for r in output:
+        np.testing.assert_allclose(arrays[r.core,r.name][r.local_row:r.local_row+r.rows,r.local_col:r.local_col+r.cols],
+                                   logical[r.row:r.row+r.rows,r.col:r.col+r.cols],atol=1e-11)
+        coverage[r.row:r.row+r.rows,r.col:r.col+r.cols] += 1
+    np.testing.assert_array_equal(coverage,1)
+    assert sum(r.area for r in unique(query)) == 8*p.hidden and all(r.col+r.cols <= p.hidden for r in query)
+    replay_copy(next(op for op in graph.operations if op['name']=='qkv_kv_append')['raw'],arrays)
+    for r in cache:
+        request = r.row//p.context; head = r.col//(2*p.head_dim)
+        for j in range(r.rows):
+            token = r.row+j-request*p.context
+            if token < p.context-p.queries:
+                continue
+            row = request*p.queries+token-(p.context-p.queries)
+            k = logical[row,p.hidden+head*p.head_dim:p.hidden+(head+1)*p.head_dim]
+            v = logical[row,p.hidden+(p.kv_heads+head)*p.head_dim:p.hidden+(p.kv_heads+head+1)*p.head_dim]
+            np.testing.assert_allclose(arrays[r.core,r.name][r.local_row+j],np.concatenate([k,v]),atol=1e-11)
+
+
+def test_grouped_qkv_fuses_rope_on_query_columns_only(chip):
+    p = Attention(2,4,19,4,2,8); spec = Problem(8,64,32)
+    work = []
+    for rope in (False,True):
+        graph = Graph(chip); kernel = Gemm(spec,Plan((1,1,4),(4,4,8),c=(1,4)),heads=(4,2,8)).prepare(graph,'qkv')
+        layout = KVLayout(p,4); cache = layout.allocate(graph)
+        graph.tensor(0,'input',[8,32]); kernel.qkv(graph,[Region(0,'input',0,0,8,32)],layout,cache,rope=rope)
+        work.append(sum(t['vec_count'] for op in graph.operations if op['kind']=='mpmd-general'
+                        for core in op['raw'] for phase in core for t in phase['vector']))
+    assert work[1]-work[0] == 6*p.batch*p.queries*p.hidden
+
+
+def test_grouped_qkv_edge_traffic_matches_built_graph(tmp_path):
+    from frontend.near_mem.model.transformer import decode_configuration, edge_regions, edges, materialize, port, roles
+    from frontend.near_mem.tasks import traffic
+    chip = make_hardware(tmp_path/'hardware',16,64)
+    names = {('qkv.C','kv'):'qkv_kv_append',('qkv.C','attention.Q'):'attention_query_layout'}
+    w = Workload(2,1,32,4,2,16,64); plan = lambda n: Plan((1,4,4),(2,8,16),transpose=n!='qkv')
+    # A TP grid splitting N over mesh rows: each row then stores one KV head group.
+    kernels = {n:Gemm(p,plan(n),**roles(w,n)) for n,p in w.problems.items()}
+    config = configuration(kernels,AttentionPlan(1,8,1))
+    graph = build(w,chip,config)
+    written = {e['name']:e['dram_write_bytes'] for e in graph.edges}
+    bound,_ = decode_configuration(w,config)
+    assert bound['qkv'].heads == (4,2,16) and bound['output'].heads is None
+    choice = {k:v.bind(16,graph.sram,graph.capacity) for k,v in bound.items()}; choice['attention'] = AttentionPlan(1,8,1)
+    for src,dst,alias in edges(w):
+        if (src,dst) not in names:
+            continue
+        regions = edge_regions(w,16,dst,port(w,16,src,choice.get(src.split('.')[0])),
+                               port(w,16,dst,choice.get(dst.split('.')[0])))
+        assert 2*sum(x[1] for load in traffic(*regions,alias) for x in load.values()) == written[names[src,dst]]
+    def append_noc(kernel):
+        g = Graph(chip); source = materialize(g,'source',kernel.bind(16,g.sram,g.capacity).output_layout(16))
+        g.convert('append',*edge_regions(w,16,'kv',source,materialize(g,'kv',port(w,16,'kv'))))
+        return g.edges[-1]['noc_data_bytes']
+    grouped = append_noc(Gemm(w.problems['qkv'],plan('qkv'),**roles(w,'qkv'),heads=(4,2,16)))
+    assert grouped == sum(e['noc_data_bytes'] for e in graph.edges if e['name']=='qkv_kv_append')
+    assert grouped < append_noc(Gemm(w.problems['qkv'],plan('qkv'),**roles(w,'qkv')))

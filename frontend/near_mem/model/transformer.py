@@ -49,7 +49,8 @@ def configuration(kernels, attention):
 
 
 def decode_configuration(workload, data):
-    kernels = {k:Gemm(workload.problems[k],load(v['plan']),v['native'],v['direction'],v['gated'])
+    kernels = {k:Gemm(workload.problems[k],load(v['plan']),v['native'],v['direction'],v['gated'],
+                      column_groups(workload,k))
                for k,v in data['kernels'].items()}
     return kernels,AttentionPlan(**data['attention'])
 
@@ -204,10 +205,17 @@ def tune_native(workload, chip, out, workers=WORKERS):
         plan=Plan((1,side,side),(tm,tn,tk))
         if execution!=problem.shape:
             plan=Plan((1,side,side),(tm,tn,tk),logical_shape=problem.shape,execution_shape=execution)
-        kernels[name] = Gemm(problem,plan,True,**roles(workload,name))
+        kernels[name] = Gemm(problem,plan,True,**roles(workload,name),heads=column_groups(workload,name))
     return kernels
 
 
 def roles(workload, name):
     """Fixed graph roles of a GEMM: its native TP axis and whether it is the gated FFN."""
     return dict(direction=dict(expand=1, qkv=int(workload.kv_heads > 1)).get(name, 0), gated=name == 'expand')
+
+
+def column_groups(workload, name):
+    """``Gemm.heads`` of a graph GEMM. Every method stores the QKV weight
+    columns per KV head as [its Q heads, K, V] (Megatron-LM's GQA layout), so
+    a contiguous N block of the projection is one KV head group."""
+    return (workload.query_heads, workload.kv_heads, workload.head_dim) if name == 'qkv' else None

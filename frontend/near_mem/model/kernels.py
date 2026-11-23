@@ -43,6 +43,9 @@ class Gemm:
     native: bool = False
     direction: int = 0
     gated: bool = False
+    # (query_heads, kv_heads, head_dim): the QKV weight columns are stored per
+    # KV head as [its Q heads, K, V]; ports and RoPE use logical columns.
+    heads: tuple = None
 
     def bind(self, cores, sram, capacity):
         """Compile the mapping for a chip once; touches no graph state."""
@@ -51,6 +54,10 @@ class Gemm:
         self.execution_problem = execution_problem(self.problem,self.plan)
         if self.gated and self.problem.n % 2:
             raise ValueError('Gated projection needs equal gate/up widths')
+        if self.heads:
+            q,kv,d = self.heads
+            if self.gated or q % kv or self.problem.n != (q+2*kv)*d:
+                raise ValueError('Grouped QKV columns need the fused Q/K/V width')
         if self.native:
             self.side = isqrt(cores)
             if self.side*self.side != cores or self.side < 2:
@@ -94,8 +101,41 @@ class Gemm:
                 regions.append(Region(core, 'A', 0, start, self.problem.m, width))
         return regions, [dict(shape=[m,local_k], strides=strides([m,local_k]))]*cores
 
+    def column_blocks(self):
+        """``(physical, logical, width)`` column blocks of the stored output."""
+        if not self.heads:
+            return [(0, 0, self.problem.n)]
+        q,kv,d = self.heads; g = q//kv; blocks = []
+        for h in range(kv):
+            base = h*(g+2)*d
+            blocks += [(base, h*g*d, g*d), (base+g*d, q*d+h*d, d), (base+(g+1)*d, (q+kv+h)*d, d)]
+        return blocks
+
+    def _logical(self, regions):
+        if not self.heads:
+            return regions
+        out = []
+        for r in regions:
+            for start, logical, width in self.column_blocks():
+                lo, hi = max(r.col, start), min(r.col+r.cols, start+width)
+                if lo < hi:
+                    out.append(replace(r, col=logical+lo-start, cols=hi-lo, local_col=r.local_col+lo-r.col))
+        return coalesce(out)
+
+    def _rope_count(self, column, width, rope_width):
+        """Stored columns in ``[column, column+width)`` whose logical column is below ``rope_width``."""
+        total = 0
+        for start, logical, extent in self.column_blocks():
+            lo, hi = max(column, start), min(column+width, start+extent)
+            if lo < hi:
+                total += max(0, min(hi-start+logical, rope_width)-(lo-start+logical))
+        return total
+
     def output_layout(self, cores):
-        """Final output regions (after any gate), as returned by ``compile``."""
+        """Final output regions (after any gate), as returned by ``compile``, in logical columns."""
+        return self._logical(self._stored_output_layout(cores))
+
+    def _stored_output_layout(self, cores):
         m,n,_ = self.problem.shape
         if self.native:
             _,execution_n,_ = self.execution_problem.shape
@@ -157,7 +197,7 @@ class Gemm:
                                                 for key in ('base','extent','shape')})
                 return final,5*count,4*count,2*count
             column = action['key'][1]*action['shape'][1]
-            count = action['shape'][0]*max(0,min(action['shape'][1],rope_width-column))
+            count = action['shape'][0]*self._rope_count(column,action['shape'][1],rope_width)
             return action,6*count,2*count,2*count
         raw, manifest = p.lower(graph.flit,epilogue if rope_width or self.fused_gate else None)
         # ``Program.lower`` may return a worker-local cached template. Copy

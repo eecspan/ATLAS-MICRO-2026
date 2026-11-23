@@ -27,6 +27,8 @@ Attention 和 GEMM 共用两阶段评估：proxy 排序，ATLAS 模拟器复核�
 
 算子边界：只有我们的空间（`ours`、`local`、`dram`，`Method.boundary`）会按计划改变 DRAM 驻留，所以只有它们展开归约输出方式（分片、汇聚到组端点、组内复制），并与相邻算子联合搜索（beam + 坐标下降）。TP 用其原生 collective 与方向对齐，T10/FlashGEMM 用固定二维分块，都保持自身数据流规定的边界：每个算子取单独模拟最快的计划，整图跑一次，边界不一致处照实计 relayout。`--no-joint` 让 `ours` 也这样做，作为边界协同的消融。论文中可把“归约终点结合下游需求选择”作为整图编译的一个小点。
 
+QKV 权重列按 KV head 分组存放为 `[该组的 Q heads, K, V]`（Megatron-LM 的 GQA 布局），所有方法相同：投影输出中连续的 N 块就是一个 KV head 组，与按 head 组划分的 KV 放置对齐。权重在部署时一次重排，GEMM 本身不变；`Gemm.heads` 只在输出端口把存储列映射回逻辑列，KV 追加、attention 取 Q 与融合 RoPE 都按逻辑 head 取数。
+
 FlashGEMM 尽量按原文：每步持有整段本地 M/N，只搜 K tile；放不下 SRAM 时只把 M 最小程度地切小（WS 下能放下就让 B 常驻），仍放不下才切 N panel；OS 与 WS 都交给模拟器选择。
 
 DRAM 搬运生成源 DRAM 读、NoC 发送/接收、目标 DRAM 写；与 ATLAS 一致，SRAM 计发送读和接收写，不额外计源端 staging 写及目标端 staging 读。搬运仍占 SRAM 缓冲，临时 DRAM 副本仍占容量；此 DMA 中转抽象可统一修订。历史 KV 的 owner 和内容不因轮转改变。

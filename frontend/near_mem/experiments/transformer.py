@@ -36,7 +36,7 @@ from ..model.attention import AttentionPlan, KVLayout, build_attention
 from ..model.schedule_proxy import ScheduleProxy
 from ..model.kernels import Gemm
 from ..model.transformer import (Workload, build, configuration, edges, norm_score, norms, port, relayout,
-                                 roles, tune_native)
+                                 column_groups, roles, tune_native)
 from ..search import beam, diverse, diverse_part, measure_all, merge_diverse
 from ..resources import breakdown, report as resource_report
 from ..sim import WORKERS, dump, fingerprint
@@ -79,7 +79,8 @@ def compiled_operator(workload, chip, hw, name, choice):
 
 
 def bind_kernel(workload, hw, name, entry):
-    k = Gemm(workload.problems[name], load(entry['plan']), entry['native'], entry['direction'], entry['gated'])
+    k = Gemm(workload.problems[name], load(entry['plan']), entry['native'], entry['direction'], entry['gated'],
+             column_groups(workload, name))
     return k.bind(hw['cores'], hw['sram'], hw['dram'])
 
 
@@ -237,15 +238,14 @@ def _scan_job(workload, chip, method, hw, budget, tiles, parts, job):
 
 def _schedule_score(workload, chip, hw, name, plan, ports=False):
     """Compiled schedule score of one GEMM plan; with ``ports`` also its
-    ``(A, C)`` boundary layouts; None if the plan does not compile."""
+    ``(A, C)`` boundary layouts; None if the plan does not compile (for every
+    method, so a baseline drops an illegal tile like our spaces do)."""
     started = time.monotonic()
     entry = dict(plan=asdict(plan), native=False, **roles(workload, name))
     try:
         graph, kernel = compiled_operator(workload, chip, hw, name, entry)
     except ValueError:
-        if ports:
-            return None
-        raise
+        return None
     compiled = time.monotonic()
     proxy = ScheduleProxy(chip)
     value = sum(proxy.tasks(op['raw'], graph.tensors) for op in graph.operations)
